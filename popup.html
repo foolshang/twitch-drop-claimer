@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<style>
+  :root {
+    --bg: #18181b;        /* Twitch dark */
+    --panel: #1f1f23;
+    --accent: #a970ff;    /* Twitch purple */
+    --text: #efeff1;
+    --muted: #adadb8;
+    --ok: #00f593;
+    --off: #6d6d75;
+    --warn: #f0932b;
+    --err: #ff5c5c;
+  }
+  body {
+    width: 320px;
+    margin: 0;
+    padding: 14px;
+    background: var(--bg);
+    color: var(--text);
+    font: 13px/1.5 "Segoe UI", system-ui, sans-serif;
+  }
+  h1 {
+    font-size: 14px;
+    margin: 0 0 10px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  h1::before { content: "🎁"; }
+  h2 {
+    font-size: 12px;
+    color: var(--muted);
+    margin: 0 0 6px;
+    font-weight: 600;
+  }
+  label {
+    display: block;
+    color: var(--muted);
+    margin-bottom: 4px;
+    font-size: 12px;
+  }
+  input[type="text"], textarea {
+    width: 100%;
+    box-sizing: border-box;
+    background: var(--panel);
+    border: 1px solid #303036;
+    border-radius: 4px;
+    color: var(--text);
+    padding: 7px 9px;
+    font-size: 13px;
+    font-family: inherit;
+  }
+  textarea {
+    resize: vertical;
+    min-height: 56px;
+    line-height: 1.4;
+  }
+  input[type="text"]:focus, textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  input[type="number"] {
+    width: 56px;
+    box-sizing: border-box;
+    background: var(--panel);
+    border: 1px solid #303036;
+    border-radius: 4px;
+    color: var(--text);
+    padding: 6px 7px;
+    font-size: 13px;
+  }
+  input[type="number"]:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .hint {
+    color: var(--muted);
+    font-size: 11px;
+    margin: 5px 0 12px;
+  }
+  .row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+  }
+  hr {
+    border: none;
+    border-top: 1px solid #303036;
+    margin: 12px 0;
+  }
+
+  /* ---- small switches ---- */
+  .toggle { position: relative; width: 36px; height: 20px; flex: none; }
+  .toggle input { opacity: 0; width: 0; height: 0; }
+  .slider {
+    position: absolute; inset: 0;
+    background: #303036;
+    border-radius: 20px;
+    cursor: pointer;
+    transition: background .15s;
+  }
+  .slider::before {
+    content: "";
+    position: absolute;
+    width: 14px; height: 14px;
+    left: 3px; top: 3px;
+    background: var(--text);
+    border-radius: 50%;
+    transition: transform .15s;
+  }
+  .toggle input:checked + .slider { background: var(--accent); }
+  .toggle input:checked + .slider::before { transform: translateX(16px); }
+
+  /* ---- big master power switch ---- */
+  .power-panel {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: var(--panel);
+    border: 1px solid #303036;
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin-bottom: 6px;
+  }
+  .power-status {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-weight: 600;
+    font-size: 13px;
+  }
+  .power-status .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--off);
+    box-shadow: none;
+  }
+  .power-status.on .dot { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+  .power-status.on { color: var(--ok); }
+  .power-status.off { color: var(--muted); }
+
+  .power-toggle { position: relative; width: 52px; height: 28px; flex: none; }
+  .power-toggle input { opacity: 0; width: 0; height: 0; }
+  .power-toggle .slider {
+    position: absolute; inset: 0;
+    background: var(--off);
+    border-radius: 28px;
+    cursor: pointer;
+    transition: background .15s;
+  }
+  .power-toggle .slider::before {
+    content: "";
+    position: absolute;
+    width: 22px; height: 22px;
+    left: 3px; top: 3px;
+    background: var(--text);
+    border-radius: 50%;
+    transition: transform .15s;
+  }
+  .power-toggle input:checked + .slider { background: var(--ok); }
+  .power-toggle input:checked + .slider::before { transform: translateX(24px); }
+
+  .info-panel {
+    background: var(--panel);
+    border-radius: 6px;
+    padding: 8px 10px;
+    margin-bottom: 12px;
+    font-size: 11.5px;
+    color: var(--muted);
+  }
+  .info-panel div { margin-bottom: 2px; }
+  .info-panel div:last-child { margin-bottom: 0; }
+  .info-panel b { color: var(--text); font-weight: 600; }
+  .off-note {
+    font-size: 11.5px;
+    color: var(--muted);
+    margin-bottom: 12px;
+    text-align: center;
+  }
+
+  .all-done-banner {
+    background: rgba(0, 245, 147, .12);
+    border: 1px solid var(--ok);
+    color: var(--ok);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 12px;
+    font-weight: 600;
+    text-align: center;
+    margin-bottom: 12px;
+  }
+
+  .autooff-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 4px;
+  }
+  .autooff-row > span { flex: 1; }
+  .autooff-hours {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  /* ---- per-game status list ---- */
+  .game-status-list {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    margin-bottom: 10px;
+    max-height: 180px;
+    overflow-y: auto;
+  }
+  .game-status-empty {
+    color: var(--muted);
+    font-size: 11.5px;
+    margin-bottom: 10px;
+  }
+  .game-status-row {
+    background: var(--panel);
+    border: 1px solid #303036;
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 11.5px;
+  }
+  .game-status-row.current { border-color: var(--accent); }
+  .game-status-row .g-name {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-weight: 600;
+  }
+  .game-status-row .g-badge {
+    font-size: 10px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 8px;
+    background: #303036;
+    color: var(--muted);
+  }
+  .game-status-row.current .g-badge { background: var(--accent); color: #0e0e10; }
+  .game-status-row .g-badge.done { background: var(--ok); color: #0e0e10; }
+  .game-status-row .g-badge.invalid { background: var(--err); color: #0e0e10; }
+  .game-status-row .g-badge.warn { background: var(--warn); color: #0e0e10; }
+  .game-status-row .g-detail {
+    color: var(--muted);
+    margin-top: 2px;
+  }
+
+  button {
+    width: 100%;
+    background: var(--accent);
+    color: #0e0e10;
+    border: none;
+    border-radius: 4px;
+    padding: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:hover { filter: brightness(1.1); }
+  #status {
+    margin-top: 8px;
+    font-size: 11px;
+    color: var(--ok);
+    min-height: 14px;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+  <h1>Drop Auto-Claimer</h1>
+
+  <div class="power-panel">
+    <div class="power-status off" id="powerStatus">
+      <span class="dot"></span>
+      <span id="powerStatusText">ปิดอยู่</span>
+    </div>
+    <label class="power-toggle">
+      <input type="checkbox" id="power">
+      <span class="slider"></span>
+    </label>
+  </div>
+
+  <div class="info-panel" id="infoPanel" hidden>
+    <div>กำลังดู: <b id="watchingChannel">-</b></div>
+    <div>เก็บล่าสุด: <b id="lastClaim">ยังไม่เก็บ</b></div>
+  </div>
+  <div class="off-note" id="offNote" hidden>ปิดอยู่ - ไม่มีการสแกน/เก็บ drop ใดๆ</div>
+  <div class="all-done-banner" id="allDoneBanner" hidden>🎉 เก็บครบทุกเกมในลิสต์แล้ว ปิดแท็บที่เปิดไว้ให้แล้ว</div>
+
+  <hr>
+
+  <h2>รายชื่อเกม (เรียงตามลำดับความสำคัญ บรรทัดละ 1 เกม)</h2>
+  <textarea id="gamesList" placeholder="poe2&#10;diablo 4&#10;path of exile"></textarea>
+  <div id="gamesPreview" class="hint"></div>
+  <div class="hint">แปลงเป็น URL ให้อัตโนมัติ (พิมพ์เล็ก เว้นวรรค→ขีด) ถ้าเกมไหนหาไม่เจอบน Twitch จะแจ้งเตือนด้านล่างหลังบันทึก</div>
+
+  <div class="row">
+    <span>เปิดใช้ Auto-watch (ไปดูให้เองอัตโนมัติ)</span>
+    <label class="toggle">
+      <input type="checkbox" id="autowatch">
+      <span class="slider"></span>
+    </label>
+  </div>
+
+  <div id="gameStatusList" class="game-status-list"></div>
+  <div id="gameStatusEmpty" class="game-status-empty" hidden>ยังไม่มีข้อมูลความคืบหน้า (จะขึ้นหลังเปิด auto-watch และหน้า inventory โหลดข้อมูลได้)</div>
+
+  <hr>
+
+  <div class="autooff-row">
+    <span>ปิดอัตโนมัติถ้าไม่มี drop ให้เก็บนาน</span>
+    <label class="toggle">
+      <input type="checkbox" id="autooff">
+      <span class="slider"></span>
+    </label>
+  </div>
+  <div class="autooff-hours">
+    <input type="number" id="autooffHours" min="1" max="72" step="1">
+    <span>ชั่วโมง</span>
+  </div>
+  <div class="hint">ค่าเริ่มต้นปิดฟีเจอร์นี้ไว้ ต้องเปิดเองถ้าต้องการ</div>
+
+  <button id="save">บันทึก</button>
+  <div id="status"></div>
+
+  <script src="shared.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

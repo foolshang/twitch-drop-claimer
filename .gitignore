@@ -1,0 +1,15 @@
+# AMO credentials - never commit these
+.env
+.env.*
+*.pem
+*.key
+
+# local record of already-submitted versions (not secret, but not source either)
+.amo-submitted-versions.json
+
+# build output
+web-ext-artifacts/
+
+# editor/OS cruft
+.DS_Store
+Thumbs.db

@@ -1,0 +1,11 @@
+{
+  "name": "twitch-drop-auto-claimer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Dev tooling for the Twitch Drop Auto-Claimer Firefox extension (not published to npm).",
+  "scripts": {
+    "submit:dry": "node scripts/submit-amo.js --dry-run",
+    "submit": "node scripts/submit-amo.js",
+    "submit:listed": "node scripts/submit-amo.js --listed"
+  }
+}
