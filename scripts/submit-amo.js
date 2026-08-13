@@ -31,7 +31,7 @@ const path = require("path");
 const os = require("os");
 const https = require("https");
 const crypto = require("crypto");
-const { spawnSync } = require("child_process");
+const { spawnSync, spawn } = require("child_process");
 
 const ROOT = path.join(__dirname, "..");
 const EXTENSION_FILES = [
@@ -203,6 +203,29 @@ function runWebExt(args, { allowFailure = false } = {}) {
   return res.status === 0;
 }
 
+// Same binary, but tees stdout/stderr to the console AND captures it, so the
+// sign step can tell "AMO accepted the upload but is still manually
+// reviewing it" (exit code 1, but not a real failure) apart from an actual
+// signing error - a plain spawnSync+inherit can't be inspected after the
+// fact, only streamed.
+function runWebExtCaptured(args) {
+  return new Promise((resolve, reject) => {
+    safeLog(`\n$ web-ext ${redact(args.join(" "))}`);
+    const child = spawn(WEB_EXT_BIN, args, { shell: true });
+    let combined = "";
+    child.stdout.on("data", (chunk) => {
+      process.stdout.write(redact(chunk.toString()));
+      combined += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      process.stderr.write(redact(chunk.toString()));
+      combined += chunk.toString();
+    });
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ code, combined }));
+  });
+}
+
 // ---- minimal HS256 JWT signer, only used for the pre-flight version check --
 // (the actual `web-ext sign` call builds its own JWT internally from
 // --api-key/--api-secret; this one is only for our separate GET request to
@@ -272,9 +295,9 @@ async function assertVersionNotAlreadySubmitted(version, issuer, secret) {
   safeLog(`AMO version-history check passed (${existing.length} versions on record, ${version} not among them).`);
 }
 
-function recordLedger(version, channel) {
+function recordLedger(version, channel, extra = {}) {
   const ledger = fs.existsSync(LEDGER_PATH) ? JSON.parse(fs.readFileSync(LEDGER_PATH, "utf8")) : [];
-  ledger.push({ version, channel, at: new Date().toISOString() });
+  ledger.push({ version, channel, at: new Date().toISOString(), ...extra });
   fs.writeFileSync(LEDGER_PATH, JSON.stringify(ledger, null, 2) + "\n");
 }
 
@@ -328,7 +351,23 @@ async function main() {
   if (args.listed) {
     signArgs.push("--amo-metadata", AMO_METADATA_PATH);
   }
-  runWebExt(signArgs);
+  const { code, combined } = await runWebExtCaptured(signArgs);
+
+  if (code !== 0) {
+    // A listed submission that passed validation but is awaiting manual
+    // review isn't a failure - web-ext's CLI just gives up waiting for the
+    // approval-timeout. Recognize that specific outcome instead of treating
+    // it the same as a real signing error.
+    if (/Approval:\s*timeout exceeded/i.test(combined)) {
+      const urlMatch = combined.match(/https:\/\/addons\.mozilla\.org\S+/);
+      const statusUrl = urlMatch ? urlMatch[0] : null;
+      safeLog("\nUpload accepted and passed automated validation - now awaiting manual review on AMO.");
+      if (statusUrl) safeLog(`Track status: ${statusUrl}`);
+      recordLedger(version, channel, { pendingReview: true, statusUrl });
+      return;
+    }
+    throw new Error(`web-ext sign failed with exit code ${code}`);
+  }
 
   recordLedger(version, channel);
   safeLog(`\nSigned and recorded version ${version} (${channel}) in ${LEDGER_PATH}`);
