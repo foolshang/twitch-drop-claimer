@@ -7,5 +7,8 @@
     "submit:dry": "node scripts/submit-amo.js --dry-run",
     "submit": "node scripts/submit-amo.js",
     "submit:listed": "node scripts/submit-amo.js --listed"
+  },
+  "devDependencies": {
+    "web-ext": "^8.3.0"
   }
 }

@@ -7,9 +7,14 @@
  *                               [--skip-version-check] [--dry-run]
  *
  * Credentials are NEVER hardcoded here - set them in the environment before
- * running (PowerShell: $env:AMO_JWT_ISSUER = "..."):
- *   AMO_JWT_ISSUER  - AMO API key (issuer)
- *   AMO_JWT_SECRET  - AMO API secret
+ * running (PowerShell: $env:AMO_JWT_ISSUER = "..."). Two name pairs are
+ * accepted, checked in this order:
+ *   AMO_JWT_ISSUER / AMO_JWT_SECRET      - preferred explicit names
+ *   WEB_EXT_API_KEY / WEB_EXT_API_SECRET - the names web-ext's own --api-key/
+ *                                          --api-secret flags are usually
+ *                                          paired with; used as a fallback so
+ *                                          credentials already set under
+ *                                          web-ext's own convention just work
  *
  * Defaults to --channel=unlisted (self-distribution / testing). Publishing
  * to the public listed channel requires the explicit --listed flag - this
@@ -40,6 +45,7 @@ const EXTENSION_FILES = [
 const GECKO_ID = "twitch-drop-auto-claimer@foolshang";
 const LEDGER_PATH = path.join(ROOT, ".amo-submitted-versions.json");
 const ARTIFACTS_DIR = path.join(ROOT, "web-ext-artifacts");
+const AMO_METADATA_PATH = path.join(ROOT, "scripts", "amo-metadata.json");
 
 function parseArgs(argv) {
   const args = { bump: null, listed: false, skipVersionCheck: false, dryRun: false };
@@ -49,17 +55,17 @@ function parseArgs(argv) {
     else if (a === "--skip-version-check") args.skipVersionCheck = true;
     else if (a === "--dry-run") args.dryRun = true;
     else if (a === "--help" || a === "-h") { printHelp(); process.exit(0); }
-    else { console.error(`Unknown argument: ${a}`); printHelp(); process.exit(1); }
+    else { safeError(`Unknown argument: ${a}`); printHelp(); process.exit(1); }
   }
   if (args.bump && !["patch", "minor", "major"].includes(args.bump)) {
-    console.error(`Invalid --bump value: ${args.bump} (expected patch|minor|major)`);
+    safeError(`Invalid --bump value: ${args.bump} (expected patch|minor|major)`);
     process.exit(1);
   }
   return args;
 }
 
 function printHelp() {
-  console.log(`
+  safeLog(`
 submit-amo.js - bump -> lint -> build -> sign
 
   --bump=patch|minor|major   bump manifest.json version before building (default: no bump)
@@ -68,8 +74,48 @@ submit-amo.js - bump -> lint -> build -> sign
   --dry-run                  run bump/lint/build only, never calls web-ext sign
 
 Required env vars for an actual sign (not needed for --dry-run):
-  AMO_JWT_ISSUER, AMO_JWT_SECRET
+  AMO_JWT_ISSUER / AMO_JWT_SECRET, or WEB_EXT_API_KEY / WEB_EXT_API_SECRET
 `);
+}
+
+// AMO_JWT_ISSUER/SECRET take priority; WEB_EXT_API_KEY/SECRET (web-ext's own
+// naming) are used as a fallback when the preferred names aren't set.
+function getCredentials() {
+  const issuer = process.env.AMO_JWT_ISSUER || process.env.WEB_EXT_API_KEY || "";
+  const secret = process.env.AMO_JWT_SECRET || process.env.WEB_EXT_API_SECRET || "";
+  const issuerSource = process.env.AMO_JWT_ISSUER ? "AMO_JWT_ISSUER" : process.env.WEB_EXT_API_KEY ? "WEB_EXT_API_KEY" : null;
+  const secretSource = process.env.AMO_JWT_SECRET ? "AMO_JWT_SECRET" : process.env.WEB_EXT_API_SECRET ? "WEB_EXT_API_SECRET" : null;
+  return { issuer, secret, issuerSource, secretSource };
+}
+
+// ============================================================================
+// redaction safeguard - permanent, unconditional
+// ============================================================================
+// Every env var whose NAME looks like a credential (SECRET/KEY/TOKEN) has its
+// VALUE registered here at startup, before anything else runs. safeLog/
+// safeError below scrub every one of these values out of anything printed,
+// no matter which code path produced the string - this is not specific to
+// AMO_JWT_* / WEB_EXT_API_*, it covers any secret-shaped env var that exists
+// in the process at all, including ones added later without updating this
+// file.
+const REDACTED_VALUES = Object.entries(process.env)
+  .filter(([name, value]) => /SECRET|KEY|TOKEN/i.test(name) && value && value.length >= 6)
+  .map(([, value]) => value);
+
+function redact(str) {
+  let out = String(str);
+  for (const value of REDACTED_VALUES) {
+    out = out.split(value).join("[REDACTED]");
+  }
+  return out;
+}
+
+function safeLog(...args) {
+  console.log(...args.map(redact));
+}
+
+function safeError(...args) {
+  console.error(...args.map(redact));
 }
 
 // ---- safety: refuse to ever run against the old D:\Browser copy ----------
@@ -86,7 +132,7 @@ function assertCorrectSourceTree() {
       throw new Error(`Expected source file missing: ${f} (wrong source tree?)`);
     }
   }
-  console.log(`Source tree OK: ${real}`);
+  safeLog(`Source tree OK: ${real}`);
 }
 
 // ---- version bump ----------------------------------------------------------
@@ -111,7 +157,7 @@ function applyBump(bumpLevel) {
   const oldVersion = manifest.version;
   manifest.version = bumpVersion(oldVersion, bumpLevel);
   fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
-  console.log(`Bumped version: ${oldVersion} -> ${manifest.version}`);
+  safeLog(`Bumped version: ${oldVersion} -> ${manifest.version}`);
   return manifest.version;
 }
 
@@ -123,22 +169,34 @@ function stageSource() {
   for (const f of EXTENSION_FILES) {
     fs.copyFileSync(path.join(ROOT, f), path.join(stageDir, f));
   }
-  console.log(`Staged ${EXTENSION_FILES.length} files -> ${stageDir}`);
+  safeLog(`Staged ${EXTENSION_FILES.length} files -> ${stageDir}`);
   return stageDir;
 }
 
-// ---- run web-ext via npx (no local dependency needed) ----------------------
-// Windows needs shell:true to resolve npx.cmd at all. All arguments passed
-// here are self-generated (fixed flags, paths built with path.join) except
-// the AMO credentials in the final `sign` call, which come from env vars the
-// user set themselves - not untrusted external input - so Node's built-in
-// argv escaping for the shell:true + args-array form is an acceptable
-// trade-off versus npx.cmd's own path-resolution logic breaking under manual
-// re-quoting (verified: manual quoting made npx.cmd mis-resolve its own
-// install location).
+// ---- run the locally-installed web-ext binary directly ---------------------
+// Deliberately NOT going through `npx`/`npm exec`: npm writes its own debug
+// log to disk (~/npm-cache/_logs/*-debug-N.log) containing the *full argv* of
+// whatever it ran, on essentially every invocation - which previously wrote
+// the plaintext --api-secret value straight to a file on disk, independent of
+// anything this script itself printed. `web-ext` is now a devDependency
+// (see package.json / `npm install`), so we call its binary in
+// node_modules/.bin directly - a plain child process npm/npx never sees or
+// logs.
+const WEB_EXT_BIN = path.join(
+  ROOT, "node_modules", ".bin", process.platform === "win32" ? "web-ext.cmd" : "web-ext"
+);
+
 function runWebExt(args, { allowFailure = false } = {}) {
-  console.log(`\n$ npx --yes web-ext ${args.join(" ")}`);
-  const res = spawnSync("npx", ["--yes", "web-ext", ...args], { stdio: "inherit", shell: true });
+  if (!fs.existsSync(WEB_EXT_BIN)) {
+    throw new Error(`web-ext binary not found at ${WEB_EXT_BIN} - run "npm install" first.`);
+  }
+  safeLog(`\n$ web-ext ${redact(args.join(" "))}`);
+  // Windows needs shell:true to resolve a .cmd shim at all. Unlike the old
+  // npx-based call, this no longer risks npm's own argv-logging side effect -
+  // the only remaining exposure is this process's own argv list in memory
+  // (visible to e.g. Task Manager while it runs), which is unavoidable for
+  // any CLI tool that takes credentials as flags.
+  const res = spawnSync(WEB_EXT_BIN, args, { stdio: "inherit", shell: true });
   if (res.status !== 0 && !allowFailure) {
     throw new Error(`web-ext ${args[0]} failed with exit code ${res.status}`);
   }
@@ -183,7 +241,7 @@ async function assertVersionNotAlreadySubmitted(version, issuer, secret) {
   }
 
   if (!issuer || !secret) {
-    console.log("No AMO credentials in env - skipping the remote version-history check (local ledger check passed).");
+    safeLog("No AMO credentials in env - skipping the remote version-history check (local ledger check passed).");
     return;
   }
 
@@ -197,7 +255,7 @@ async function assertVersionNotAlreadySubmitted(version, issuer, secret) {
   }
 
   if (res.status === 404) {
-    console.log("AMO has no record of this add-on yet - nothing to collide with.");
+    safeLog("AMO has no record of this add-on yet - nothing to collide with.");
     return;
   }
   if (res.status < 200 || res.status >= 300) {
@@ -211,7 +269,7 @@ async function assertVersionNotAlreadySubmitted(version, issuer, secret) {
   if (existing.includes(version)) {
     throw new Error(`Version ${version} was already submitted to AMO. Bump the version (--bump=patch) before signing.`);
   }
-  console.log(`AMO version-history check passed (${existing.length} versions on record, ${version} not among them).`);
+  safeLog(`AMO version-history check passed (${existing.length} versions on record, ${version} not among them).`);
 }
 
 function recordLedger(version, channel) {
@@ -226,48 +284,57 @@ async function main() {
 
   const version = applyBump(args.bump);
   const channel = args.listed ? "listed" : "unlisted";
-  console.log(`\nTarget version: ${version}   channel: ${channel}${args.dryRun ? "   (dry run)" : ""}`);
+  safeLog(`\nTarget version: ${version}   channel: ${channel}${args.dryRun ? "   (dry run)" : ""}`);
 
   const stageDir = stageSource();
 
   runWebExt(["lint", "--source-dir", stageDir]);
   runWebExt(["build", "--source-dir", stageDir, "--artifacts-dir", ARTIFACTS_DIR, "--overwrite-dest"]);
 
+  const { issuer, secret, issuerSource, secretSource } = getCredentials();
+
   if (!args.skipVersionCheck) {
-    await assertVersionNotAlreadySubmitted(version, process.env.AMO_JWT_ISSUER, process.env.AMO_JWT_SECRET);
+    await assertVersionNotAlreadySubmitted(version, issuer, secret);
   } else {
-    console.log("Skipping version-duplicate check (--skip-version-check).");
+    safeLog("Skipping version-duplicate check (--skip-version-check).");
   }
 
   if (args.dryRun) {
-    console.log("\n--dry-run: stopping before web-ext sign. Lint + build succeeded.");
+    safeLog("\n--dry-run: stopping before web-ext sign. Lint + build succeeded.");
     return;
   }
 
-  const issuer = process.env.AMO_JWT_ISSUER;
-  const secret = process.env.AMO_JWT_SECRET;
   if (!issuer || !secret) {
-    throw new Error("AMO_JWT_ISSUER / AMO_JWT_SECRET are not set in the environment. Set them first, or use --dry-run.");
+    throw new Error(
+      "No AMO credentials found. Set AMO_JWT_ISSUER/AMO_JWT_SECRET or WEB_EXT_API_KEY/WEB_EXT_API_SECRET, or use --dry-run."
+    );
   }
+  safeLog(`Using credentials from ${issuerSource} / ${secretSource}.`);
 
   if (args.listed) {
-    console.log("\n*** Signing to the PUBLIC LISTED channel (--listed was passed explicitly) ***");
+    safeLog("\n*** Signing to the PUBLIC LISTED channel (--listed was passed explicitly) ***");
   }
 
-  runWebExt([
+  const signArgs = [
     "sign",
     "--source-dir", stageDir,
     "--artifacts-dir", ARTIFACTS_DIR,
     "--api-key", issuer,
     "--api-secret", secret,
     "--channel", channel,
-  ]);
+  ];
+  // AMO requires a license on a listed add-on's first version - not needed
+  // for unlisted, so only attach it when actually signing to listed.
+  if (args.listed) {
+    signArgs.push("--amo-metadata", AMO_METADATA_PATH);
+  }
+  runWebExt(signArgs);
 
   recordLedger(version, channel);
-  console.log(`\nSigned and recorded version ${version} (${channel}) in ${LEDGER_PATH}`);
+  safeLog(`\nSigned and recorded version ${version} (${channel}) in ${LEDGER_PATH}`);
 }
 
 main().catch((e) => {
-  console.error(`\nsubmit-amo.js failed: ${e.message}`);
+  safeError(`\nsubmit-amo.js failed: ${e.message}`);
   process.exit(1);
 });

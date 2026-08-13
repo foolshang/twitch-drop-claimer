@@ -1,9 +1,11 @@
 /**
  * popup.js - main on/off switch + status, game watch-list, auto-watch,
- * auto-off settings. toSlug/parseWatchList/channelFromUrl come from shared.js.
+ * tab quota / priority, auto-off settings.
+ * toSlug/parseWatchList/channelFromUrl/directoryUrl come from shared.js.
  */
 
 const DEFAULT_AUTO_OFF_HOURS = 3;
+const DEFAULT_TAB_QUOTA = 3;
 
 function relativeTime(ts) {
   if (!ts) return null;
@@ -15,13 +17,22 @@ function relativeTime(ts) {
   return `${Math.round(diffHr / 24)} d ago`;
 }
 
-async function findWatchingChannel() {
+function formatDate(ts) {
+  if (!ts) return null;
+  const d = new Date(ts);
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+// auto-watch can hold several tabs open at once now - list every twitch.tv
+// channel tab currently open, not just the first one found
+async function findWatchingChannels() {
   const tabs = await browser.tabs.query({ url: "*://www.twitch.tv/*" });
+  const channels = [];
   for (const tab of tabs) {
     const ch = channelFromUrl(tab.url || "");
-    if (ch) return ch;
+    if (ch) channels.push(ch);
   }
-  return null;
+  return channels;
 }
 
 const $power = document.getElementById("power");
@@ -31,11 +42,14 @@ const $infoPanel = document.getElementById("infoPanel");
 const $offNote = document.getElementById("offNote");
 const $allDoneBanner = document.getElementById("allDoneBanner");
 const $watchingChannel = document.getElementById("watchingChannel");
+const $watchingChannelHint = document.getElementById("watchingChannelHint");
 const $lastClaim = document.getElementById("lastClaim");
 
 const $gamesList = document.getElementById("gamesList");
 const $gamesPreview = document.getElementById("gamesPreview");
 const $autoWatch = document.getElementById("autowatch");
+const $tabQuota = document.getElementById("tabQuota");
+const $priorityMode = document.getElementById("priorityMode");
 const $gameStatusList = document.getElementById("gameStatusList");
 const $gameStatusEmpty = document.getElementById("gameStatusEmpty");
 
@@ -57,8 +71,9 @@ async function renderInfo() {
   const rel = relativeTime(cfg.lastClaimAt);
   $lastClaim.textContent = rel ? `${cfg.lastClaimText || "-"} (${rel})` : "ยังไม่เก็บ";
 
-  const channel = await findWatchingChannel();
-  $watchingChannel.textContent = channel || "-";
+  const channels = await findWatchingChannels();
+  $watchingChannel.textContent = channels.length ? channels.join(", ") : "-";
+  $watchingChannelHint.hidden = channels.length <= 1;
 }
 
 function renderGamesPreview() {
@@ -75,9 +90,9 @@ function badgeEl(text, cls) {
   return span;
 }
 
-function gameRowEl(game, index, isCurrent, badge, detail) {
+function gameRowEl(game, index, isWatching, badge, detail) {
   const row = document.createElement("div");
-  row.className = isCurrent ? "game-status-row current" : "game-status-row";
+  row.className = isWatching ? "game-status-row current" : "game-status-row";
 
   const nameLine = document.createElement("div");
   nameLine.className = "g-name";
@@ -97,13 +112,15 @@ function gameRowEl(game, index, isCurrent, badge, detail) {
 
 async function renderGameStatus() {
   const cfg = await browser.storage.local.get([
-    "watchList", "activeGameIndex", "autoWatchEnabled", "watchPhase",
-    "invalidSlugs", "campaignProgress",
+    "watchList", "autoWatchEnabled", "watchPhase", "watchTabs",
+    "invalidSlugs", "campaignProgress", "priorityMode", "emptyUntil",
   ]);
   const watchList = cfg.watchList || [];
   const invalidSlugs = cfg.invalidSlugs || [];
   const campaignProgress = cfg.campaignProgress || {};
-  const activeIndex = cfg.activeGameIndex ?? 0;
+  const watchTabs = cfg.watchTabs || {};
+  const emptyUntil = cfg.emptyUntil || {};
+  const priorityMode = cfg.priorityMode || "list-order";
 
   $allDoneBanner.hidden = cfg.watchPhase !== "all-done";
 
@@ -115,9 +132,10 @@ async function renderGameStatus() {
   $gameStatusEmpty.hidden = true;
 
   watchList.forEach((game, i) => {
-    const isCurrent = cfg.autoWatchEnabled && cfg.watchPhase === "watching" && i === activeIndex;
     const invalid = invalidSlugs.includes(game.slug);
     const progress = campaignProgress[game.slug];
+    const isWatching = !!(cfg.autoWatchEnabled && watchTabs[game.slug]);
+    const isCooling = (emptyUntil[game.slug] || 0) > Date.now();
 
     let badge = null;
     let detail = "ยังไม่มีข้อมูลความคืบหน้า";
@@ -125,33 +143,40 @@ async function renderGameStatus() {
     if (invalid) {
       badge = badgeEl("ไม่พบเกมนี้", "invalid");
       detail = `หาหมวดหมู่ "${game.slug}" บน Twitch ไม่เจอ - ตรวจชื่อเกมอีกครั้ง`;
-    } else if (progress) {
-      if (progress.accountNotConnected) {
-        badge = badgeEl("ต้องเชื่อมบัญชี", "warn");
-        detail = "ไปที่หน้า inventory แล้วเชื่อมบัญชีเกมนี้ก่อน ถึงจะนับ drop ได้";
-      } else if (progress.allComplete) {
-        badge = badgeEl("เก็บครบแล้ว", "done");
-        detail = `${progress.claimed}/${progress.total} ชิ้น`;
-      } else if (progress.expired) {
-        badge = badgeEl("หมดอายุ", "done");
-      } else {
-        const parts = [];
-        if (progress.total > 0) parts.push(`${progress.claimed}/${progress.total} ชิ้น`);
-        if (progress.timeRemainingMin != null) parts.push(`เหลือดูอีก ~${progress.timeRemainingMin} นาที`);
-        detail = parts.length ? parts.join(" · ") : "กำลังติดตามความคืบหน้า...";
+    } else if (progress && progress.accountNotConnected) {
+      badge = badgeEl("ต้องเชื่อมบัญชี", "warn");
+      detail = "ไปที่หน้า inventory แล้วเชื่อมบัญชีเกมนี้ก่อน ถึงจะนับ drop ได้";
+    } else if (progress && progress.allComplete) {
+      badge = badgeEl("เก็บครบแล้ว", "done");
+      detail = `${progress.claimed}/${progress.total} ชิ้น`;
+    } else if (progress && progress.expired) {
+      badge = badgeEl("หมดอายุ", "done");
+    } else {
+      const parts = [];
+      if (progress && progress.total > 0) parts.push(`${progress.claimed}/${progress.total} ชิ้น`);
+      if (progress && progress.timeRemainingMin != null) parts.push(`เหลือดูอีก ~${progress.timeRemainingMin} นาที`);
+      if (priorityMode === "expiry") {
+        const d = progress && formatDate(progress.expiresAt);
+        parts.push(d ? `หมดอายุ ${d}` : "ไม่รู้วันหมดอายุ (ใช้ลำดับที่ใส่แทน)");
       }
+      detail = parts.length ? parts.join(" · ") : "กำลังติดตามความคืบหน้า...";
     }
 
-    if (isCurrent && !badge) badge = badgeEl("กำลังดู");
+    if (!badge) {
+      if (isWatching) badge = badgeEl("กำลังดู");
+      else if (isCooling) badge = badgeEl("รอคิว (ไม่มีคนไลฟ์)", "warn");
+      else if (cfg.autoWatchEnabled) badge = badgeEl("รอคิว");
+    }
 
-    $gameStatusList.appendChild(gameRowEl(game, i, isCurrent, badge, detail));
+    $gameStatusList.appendChild(gameRowEl(game, i, isWatching, badge, detail));
   });
 }
 
 // ---- load saved values ----
 (async () => {
   const cfg = await browser.storage.local.get([
-    "enabled", "watchListRaw", "autoWatchEnabled", "autoOffEnabled", "autoOffHours",
+    "enabled", "watchListRaw", "autoWatchEnabled", "tabQuota", "priorityMode",
+    "autoOffEnabled", "autoOffHours",
   ]);
 
   renderPower(cfg.enabled ?? true);
@@ -159,6 +184,8 @@ async function renderGameStatus() {
 
   $gamesList.value = cfg.watchListRaw || "";
   $autoWatch.checked = cfg.autoWatchEnabled ?? false;
+  $tabQuota.value = cfg.tabQuota || DEFAULT_TAB_QUOTA;
+  $priorityMode.value = cfg.priorityMode === "expiry" ? "expiry" : "list-order";
   $autoOff.checked = cfg.autoOffEnabled ?? false;
   $autoOffHours.value = cfg.autoOffHours || DEFAULT_AUTO_OFF_HOURS;
   renderGamesPreview();
@@ -177,10 +204,11 @@ $power.addEventListener("change", async () => {
 browser.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
   if (changes.enabled) renderPower(changes.enabled.newValue ?? true);
-  if (changes.lastClaimAt || changes.lastClaimText) renderInfo();
+  if (changes.lastClaimAt || changes.lastClaimText || changes.watchTabs) renderInfo();
   if (
-    changes.watchList || changes.activeGameIndex || changes.autoWatchEnabled ||
-    changes.watchPhase || changes.invalidSlugs || changes.campaignProgress
+    changes.watchList || changes.watchTabs || changes.autoWatchEnabled ||
+    changes.watchPhase || changes.invalidSlugs || changes.campaignProgress ||
+    changes.priorityMode || changes.emptyUntil
   ) {
     renderGameStatus();
   }
@@ -190,12 +218,16 @@ document.getElementById("save").addEventListener("click", async () => {
   const watchListRaw = $gamesList.value;
   const watchList = parseWatchList(watchListRaw);
   const hours = Math.max(1, Math.min(72, parseInt($autoOffHours.value, 10) || DEFAULT_AUTO_OFF_HOURS));
+  const quota = Math.max(1, Math.min(10, parseInt($tabQuota.value, 10) || DEFAULT_TAB_QUOTA));
   $autoOffHours.value = hours;
+  $tabQuota.value = quota;
 
   await browser.storage.local.set({
     watchListRaw,
     watchList,
     autoWatchEnabled: $autoWatch.checked,
+    tabQuota: quota,
+    priorityMode: $priorityMode.value === "expiry" ? "expiry" : "list-order",
     autoOffEnabled: $autoOff.checked,
     autoOffHours: hours,
   });

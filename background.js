@@ -10,15 +10,41 @@
  *    script can click any newly-available Claim buttons.
  *
  * 2. Auto-watch orchestration: given an ordered list of games
- *    (browser.storage.local `watchList`), keep exactly one pinned background
- *    tab pointed at a live, low-viewer channel of the current game, skipping
- *    to the next game when the current one is fully claimed/expired/invalid/
- *    empty of live channels, and stopping (closing the tab) once every game
- *    in the list is done.
+ *    (browser.storage.local `watchList`), keep one pinned background tab per
+ *    eligible game open at once (up to `tabQuota` concurrently, default 3),
+ *    each pointed at a live, low-viewer channel of its own game. Games
+ *    beyond the quota queue up in priority order. A game's tab closes on its
+ *    own the moment that game is fully claimed / expired / invalid / removed
+ *    from the list - the other tabs are unaffected. Once every game in the
+ *    list is done, all watch tabs close and the badge shows "done".
  *
  * Both are fully gated on the `enabled` flag in browser.storage.local -
  * once switched off, nothing here may open a tab, reload one, or fire a
  * request again. Auto-watch is additionally gated on `autoWatchEnabled`.
+ *
+ * Tab etiquette (verified below, not just assumed):
+ *   - every tabs.create/tabs.update call below passes an explicit
+ *     `active: false` - never omitted, never `true`.
+ *   - muting is done at the browser level via tabs.update({muted:true})
+ *     right after a watch tab is created - never by clicking Twitch's own
+ *     mute button (that part was removed from content.js).
+ *   - windows.update({focused:true}) is never called anywhere in this file.
+ *   - content.js's own same-tab `location.href = ...` navigation (picking a
+ *     channel from the directory, bouncing back to the directory on
+ *     offline/raid) never changes tab activation - navigating a page's own
+ *     location is not a WebExtension action and has no "active" concept, so
+ *     a background tab navigating itself stays in the background. This is
+ *     inherent browser behavior, not something this file needs to enforce.
+ *   - a background window kept minimized was considered for a "separate
+ *     window" mode, but is NOT implemented: whether Firefox keeps counting
+ *     Twitch watch-time for a fully minimized window (as opposed to a
+ *     background tab in a visible window, which is what this extension
+ *     already relies on) could not be verified without hours of live
+ *     watching on a real, logged-in Twitch account with an active Drops
+ *     campaign - not something this environment can do. Rather than ship an
+ *     option that might silently not work, only "current window" mode
+ *     exists. If you test it yourself and confirm minimized windows still
+ *     accrue watch time, this is the place to add it.
  */
 
 const RELOAD_ALARM = "reload-inventory";
@@ -29,8 +55,20 @@ const AUTO_WATCH_ALARM = "auto-watch-tick";
 const AUTO_WATCH_PERIOD_MIN = 1;
 const INVENTORY_URL = "https://www.twitch.tv/drops/inventory";
 const DEFAULT_AUTO_OFF_HOURS = 3;
+const DEFAULT_TAB_QUOTA = 3;
+const EMPTY_COOLDOWN_MS = 5 * 60 * 1000; // how long a "nobody live" game sits out before retrying
 
 const log = (...args) => console.log("[DropClaimer]", ...args);
+
+// serializes every auto-watch mutation so concurrent tab events (multiple
+// games finishing/going offline near-simultaneously) can't race each other
+// on a storage.local read-modify-write
+let taskChain = Promise.resolve();
+function serialized(fn) {
+  const run = taskChain.then(fn, fn);
+  taskChain = run.catch(() => {});
+  return run;
+}
 
 // ============================================================================
 // badge
@@ -71,8 +109,6 @@ async function openInventoryIfMissing() {
 
 let dropClaimedDebounce = null;
 async function handleDropClaimed() {
-  // a drop was just claimed somewhere -> refresh the inventory tab soon so
-  // campaign progress is current, but don't thrash if several claims land at once
   if (dropClaimedDebounce) return;
   dropClaimedDebounce = setTimeout(() => { dropClaimedDebounce = null; }, 60_000);
 
@@ -102,13 +138,8 @@ async function checkAutoOff() {
 }
 
 // ============================================================================
-// auto-watch orchestration
+// auto-watch orchestration - one tab per eligible game, up to tabQuota
 // ============================================================================
-
-// a game counts as "done" (skip it) if its slug turned out to be invalid, or
-// its campaign is fully claimed / expired. accountNotConnected never counts
-// as done on its own - that just needs the user to link their account, the
-// campaign might still be genuinely in progress.
 function isGameDone(slug, campaignProgress, invalidSlugs) {
   if (invalidSlugs && invalidSlugs.includes(slug)) return true;
   const p = campaignProgress && campaignProgress[slug];
@@ -116,155 +147,195 @@ function isGameDone(slug, campaignProgress, invalidSlugs) {
   return !!(p.allComplete || p.expired);
 }
 
-async function ensureWatchTab(game) {
-  const cfg = await browser.storage.local.get(["watchTabId", "watchTabGameSlug"]);
-  let tab = null;
-  if (cfg.watchTabId) {
-    try { tab = await browser.tabs.get(cfg.watchTabId); } catch { tab = null; }
-  }
-
-  const targetUrl = directoryUrl(game.slug);
-  const sameGame = cfg.watchTabGameSlug === game.slug;
-
-  if (!tab) {
-    const created = await browser.tabs.create({ url: targetUrl, active: false, pinned: true });
-    await browser.storage.local.set({
-      watchTabId: created.id,
-      watchTabGameSlug: game.slug,
-      watchPhase: "watching",
-    });
-    log("opened watch tab for", game.slug);
-    return;
-  }
-
-  if (!sameGame) {
-    // active game changed (skip/advance) - always interrupt and re-target,
-    // even if the tab was happily sitting on a channel for the old game
-    await browser.tabs.update(cfg.watchTabId, { url: targetUrl });
-    await browser.storage.local.set({ watchTabGameSlug: game.slug });
-    log("redirected watch tab to", game.slug);
-  }
-  await browser.storage.local.set({ watchPhase: "watching" });
+async function tabExists(tabId) {
+  if (!tabId) return false;
+  try { await browser.tabs.get(tabId); return true; } catch { return false; }
 }
 
-async function teardownWatch(reason) {
-  const cfg = await browser.storage.local.get(["watchTabId", "watchPhase"]);
-  if (cfg.watchTabId) {
-    try { await browser.tabs.remove(cfg.watchTabId); } catch { /* already closed */ }
+// closes (if open) and removes the tab tracked for one game - mutates the
+// passed-in watchTabs object in place, caller is responsible for persisting it
+async function closeWatchTab(watchTabs, slug) {
+  const tabId = watchTabs[slug];
+  if (tabId) {
+    try { await browser.tabs.remove(tabId); } catch { /* already closed by the user */ }
+  }
+  delete watchTabs[slug];
+}
+
+// list-order (default): original priority order, with any game currently in
+// its "nobody live" cooldown pushed to the back.
+// expiry: soonest-expiring-first among games with a known expiry date;
+// unknown-expiry games fall back to list order and sort after the known
+// ones - never guessed.
+function orderByPriority(games, mode, campaignProgress, emptyUntil) {
+  const now = Date.now();
+  const tagged = games.map((g, i) => ({
+    g, i, cooling: (emptyUntil[g.slug] || 0) > now,
+  }));
+
+  if (mode === "expiry") {
+    const withExpiry = tagged.map((x) => {
+      const p = campaignProgress[x.g.slug];
+      const expiresAt = p && typeof p.expiresAt === "number" ? p.expiresAt : null;
+      return { ...x, expiresAt };
+    });
+    const known = withExpiry.filter((x) => x.expiresAt != null && !x.cooling)
+      .sort((a, b) => a.expiresAt - b.expiresAt);
+    const unknown = withExpiry.filter((x) => x.expiresAt == null && !x.cooling)
+      .sort((a, b) => a.i - b.i);
+    const cooling = withExpiry.filter((x) => x.cooling).sort((a, b) => a.i - b.i);
+    return [...known, ...unknown, ...cooling].map((x) => x.g);
+  }
+
+  const active = tagged.filter((x) => !x.cooling).sort((a, b) => a.i - b.i);
+  const cooling = tagged.filter((x) => x.cooling).sort((a, b) => a.i - b.i);
+  return [...active, ...cooling].map((x) => x.g);
+}
+
+async function teardownAllWatch(reason) {
+  const cfg = await browser.storage.local.get(["watchTabs", "watchPhase"]);
+  const watchTabs = cfg.watchTabs || {};
+  for (const tabId of Object.values(watchTabs)) {
+    try { await browser.tabs.remove(tabId); } catch { /* already closed */ }
   }
   if (cfg.watchPhase !== "idle") {
-    await browser.storage.local.set({ watchTabId: null, watchTabGameSlug: null, watchPhase: "idle" });
+    await browser.storage.local.set({ watchTabs: {}, watchPhase: "idle" });
   }
   log("auto-watch idle:", reason);
   await refreshBadge();
 }
 
 async function finishAllDone() {
-  const cfg = await browser.storage.local.get(["watchPhase", "watchTabId"]);
+  const cfg = await browser.storage.local.get(["watchPhase", "watchTabs"]);
   if (cfg.watchPhase === "all-done") return; // already handled
-  log("every tracked game is fully collected - closing the watch tab");
-  if (cfg.watchTabId) {
-    try { await browser.tabs.remove(cfg.watchTabId); } catch { /* already closed */ }
+  const watchTabs = cfg.watchTabs || {};
+  log("every tracked game is fully collected - closing all watch tabs");
+  for (const tabId of Object.values(watchTabs)) {
+    try { await browser.tabs.remove(tabId); } catch { /* already closed */ }
   }
-  await browser.storage.local.set({ watchTabId: null, watchTabGameSlug: null, watchPhase: "all-done" });
+  await browser.storage.local.set({ watchTabs: {}, watchPhase: "all-done" });
   await refreshBadge();
 }
 
-// re-evaluate from the current activeGameIndex: skip any already-done games,
-// declare "all done" if every game is done, otherwise make sure the watch
-// tab is pointed at the right game
+// the core scheduler - not self-serializing, callers must go through
+// serialized(autoWatchTick)
 async function autoWatchTick() {
   const cfg = await browser.storage.local.get([
-    "enabled", "autoWatchEnabled", "watchList", "activeGameIndex",
-    "invalidSlugs", "campaignProgress",
+    "enabled", "autoWatchEnabled", "watchList", "invalidSlugs", "campaignProgress",
+    "watchTabs", "tabQuota", "priorityMode", "emptyUntil",
   ]);
   if (!cfg.enabled || !cfg.autoWatchEnabled) return;
 
   const list = cfg.watchList || [];
   if (list.length === 0) {
-    await teardownWatch("no games in list");
+    await teardownAllWatch("no games in list");
     return;
   }
 
   const invalidSlugs = cfg.invalidSlugs || [];
   const campaignProgress = cfg.campaignProgress || {};
+  const emptyUntil = cfg.emptyUntil || {};
+  const quota = Math.max(1, cfg.tabQuota || DEFAULT_TAB_QUOTA);
+  const priorityMode = cfg.priorityMode === "expiry" ? "expiry" : "list-order";
+  let watchTabs = { ...(cfg.watchTabs || {}) };
 
-  let cursor = cfg.activeGameIndex ?? 0;
-  if (cursor >= list.length || cursor < 0) cursor = 0;
+  const eligible = list.filter((g) => !isGameDone(g.slug, campaignProgress, invalidSlugs));
 
-  let checked = 0;
-  while (checked < list.length && isGameDone(list[cursor].slug, campaignProgress, invalidSlugs)) {
-    cursor = (cursor + 1) % list.length;
-    checked++;
-  }
-
-  if (checked >= list.length) {
+  if (eligible.length === 0) {
     await finishAllDone();
     return;
   }
 
-  if (cursor !== cfg.activeGameIndex) {
-    await browser.storage.local.set({ activeGameIndex: cursor });
+  // drop tabs for games that are no longer eligible (done, invalid, or
+  // removed from the list) - every other game's tab is untouched
+  const eligibleSlugs = new Set(eligible.map((g) => g.slug));
+  for (const slug of Object.keys(watchTabs)) {
+    if (!eligibleSlugs.has(slug)) {
+      await closeWatchTab(watchTabs, slug);
+    }
   }
 
-  await ensureWatchTab(list[cursor]);
+  // drop bookkeeping for tabs the user closed manually
+  for (const slug of Object.keys(watchTabs)) {
+    if (!(await tabExists(watchTabs[slug]))) delete watchTabs[slug];
+  }
+
+  // fill remaining quota with the next-priority eligible games not already watched
+  const ordered = orderByPriority(eligible, priorityMode, campaignProgress, emptyUntil);
+  let openCount = Object.keys(watchTabs).length;
+  for (const game of ordered) {
+    if (openCount >= quota) break;
+    if (watchTabs[game.slug]) continue; // already has a tab
+
+    const tab = await browser.tabs.create({ url: directoryUrl(game.slug), active: false, pinned: true });
+    await browser.tabs.update(tab.id, { active: false, muted: true });
+    watchTabs[game.slug] = tab.id;
+    openCount++;
+    log("opened watch tab for", game.slug, `(${openCount}/${quota})`);
+  }
+
+  await browser.storage.local.set({ watchTabs, watchPhase: "watching" });
   await refreshBadge();
 }
 
-async function advanceAutoWatch() {
-  const cfg = await browser.storage.local.get(["watchList", "activeGameIndex"]);
-  const list = cfg.watchList || [];
-  if (list.length === 0) return;
-  const next = ((cfg.activeGameIndex ?? 0) + 1) % list.length;
-  await browser.storage.local.set({ activeGameIndex: next });
-  await autoWatchTick();
-}
-
 async function handleDirectoryInvalid(slug) {
-  const cfg = await browser.storage.local.get("invalidSlugs");
-  const invalidSlugs = cfg.invalidSlugs || [];
-  if (!invalidSlugs.includes(slug)) {
-    invalidSlugs.push(slug);
-    await browser.storage.local.set({ invalidSlugs });
-  }
-  log("slug looks invalid (directory 404/redirect):", slug);
-  await advanceAutoWatch();
+  return serialized(async () => {
+    const cfg = await browser.storage.local.get(["invalidSlugs", "watchTabs"]);
+    const invalidSlugs = cfg.invalidSlugs || [];
+    if (!invalidSlugs.includes(slug)) invalidSlugs.push(slug);
+    const watchTabs = { ...(cfg.watchTabs || {}) };
+    await closeWatchTab(watchTabs, slug);
+    await browser.storage.local.set({ invalidSlugs, watchTabs });
+    log("slug looks invalid (directory 404/redirect), closed its tab:", slug);
+    await autoWatchTick();
+  });
 }
 
 async function handleDirectoryEmpty(slug) {
-  log("no live channels for", slug, "- moving to the next game");
-  await advanceAutoWatch();
+  return serialized(async () => {
+    const cfg = await browser.storage.local.get(["watchTabs", "emptyUntil"]);
+    const watchTabs = { ...(cfg.watchTabs || {}) };
+    await closeWatchTab(watchTabs, slug);
+    const emptyUntil = { ...(cfg.emptyUntil || {}) };
+    emptyUntil[slug] = Date.now() + EMPTY_COOLDOWN_MS;
+    await browser.storage.local.set({ watchTabs, emptyUntil });
+    log("no live channels for", slug, "- freed its slot for", Math.round(EMPTY_COOLDOWN_MS / 60000), "min");
+    await autoWatchTick();
+  });
 }
 
 async function mergeInventoryProgress(campaigns) {
   if (!campaigns || campaigns.length === 0) return;
 
-  const cfg = await browser.storage.local.get(["campaignProgress", "watchList", "activeGameIndex"]);
-  const progress = cfg.campaignProgress || {};
-  const activeSlug = (cfg.watchList || [])[cfg.activeGameIndex ?? 0]?.slug;
-  let activeGameJustFinished = false;
+  return serialized(async () => {
+    const cfg = await browser.storage.local.get(["campaignProgress", "watchTabs"]);
+    const progress = cfg.campaignProgress || {};
+    const watchTabs = { ...(cfg.watchTabs || {}) };
+    let anyJustFinished = false;
 
-  for (const c of campaigns) {
-    const allComplete = c.total > 0 && c.claimed >= c.total && !c.accountNotConnected;
-    progress[c.slug] = {
-      label: c.label,
-      claimed: c.claimed,
-      total: c.total,
-      accountNotConnected: !!c.accountNotConnected,
-      expired: !!c.expired,
-      allComplete,
-      timeRemainingMin: c.timeRemainingMin ?? null,
-      updatedAt: Date.now(),
-    };
-    if (c.slug === activeSlug && (allComplete || c.expired)) activeGameJustFinished = true;
-  }
+    for (const c of campaigns) {
+      const allComplete = c.total > 0 && c.claimed >= c.total && !c.accountNotConnected;
+      progress[c.slug] = {
+        label: c.label,
+        claimed: c.claimed,
+        total: c.total,
+        accountNotConnected: !!c.accountNotConnected,
+        expired: !!c.expired,
+        allComplete,
+        expiresAt: typeof c.expiresAt === "number" ? c.expiresAt : null,
+        timeRemainingMin: c.timeRemainingMin ?? null,
+        updatedAt: Date.now(),
+      };
+      if ((allComplete || c.expired) && watchTabs[c.slug]) {
+        await closeWatchTab(watchTabs, c.slug);
+        anyJustFinished = true;
+        log(c.slug, allComplete ? "fully claimed" : "expired", "- closed its tab");
+      }
+    }
 
-  await browser.storage.local.set({ campaignProgress: progress });
-
-  if (activeGameJustFinished) {
-    log("active game's campaign is complete/expired -> advancing now");
-    await advanceAutoWatch();
-  }
+    await browser.storage.local.set({ campaignProgress: progress, watchTabs });
+    if (anyJustFinished) await autoWatchTick();
+  });
 }
 
 // ============================================================================
@@ -276,18 +347,17 @@ async function applyEnabledState(enabled) {
     browser.alarms.create(AUTO_OFF_ALARM, { periodInMinutes: AUTO_OFF_PERIOD_MIN });
     browser.alarms.create(AUTO_WATCH_ALARM, { periodInMinutes: AUTO_WATCH_PERIOD_MIN });
     await openInventoryIfMissing();
-    await autoWatchTick();
+    await serialized(autoWatchTick);
   } else {
     await browser.alarms.clear(RELOAD_ALARM);
     await browser.alarms.clear(AUTO_OFF_ALARM);
     await browser.alarms.clear(AUTO_WATCH_ALARM);
-    await teardownWatch("master switch off");
+    await teardownAllWatch("master switch off");
   }
   await refreshBadge();
 }
 
 browser.alarms.onAlarm.addListener(async (alarm) => {
-  // always re-check the live value from storage, in case clear() raced the toggle-off
   const cfg = await browser.storage.local.get("enabled");
   if (!cfg.enabled) return;
 
@@ -310,7 +380,7 @@ browser.alarms.onAlarm.addListener(async (alarm) => {
   } else if (alarm.name === AUTO_OFF_ALARM) {
     checkAutoOff();
   } else if (alarm.name === AUTO_WATCH_ALARM) {
-    autoWatchTick();
+    serialized(autoWatchTick);
   }
 });
 
@@ -324,15 +394,16 @@ browser.runtime.onMessage.addListener((msg, sender) => {
     case "isWatchTab":
       return (async () => {
         const cfg = await browser.storage.local.get([
-          "enabled", "autoWatchEnabled", "watchTabId", "watchTabGameSlug", "watchList",
+          "enabled", "autoWatchEnabled", "watchTabs", "watchList",
         ]);
-        const isWatchTab = !!(
-          cfg.enabled && cfg.autoWatchEnabled && sender.tab && sender.tab.id === cfg.watchTabId
-        );
-        const activeGame = isWatchTab
-          ? (cfg.watchList || []).find((g) => g.slug === cfg.watchTabGameSlug) || null
-          : null;
-        return { isWatchTab, activeGame };
+        if (!cfg.enabled || !cfg.autoWatchEnabled || !sender.tab) {
+          return { isWatchTab: false, activeGame: null };
+        }
+        const watchTabs = cfg.watchTabs || {};
+        const slug = Object.keys(watchTabs).find((s) => watchTabs[s] === sender.tab.id);
+        if (!slug) return { isWatchTab: false, activeGame: null };
+        const game = (cfg.watchList || []).find((g) => g.slug === slug) || { slug, input: slug };
+        return { isWatchTab: true, activeGame: game };
       })();
 
     case "directoryInvalid":
@@ -370,21 +441,23 @@ browser.storage.onChanged.addListener(async (changes, area) => {
 
   if (changes.autoWatchEnabled) {
     if (changes.autoWatchEnabled.newValue) {
-      await autoWatchTick();
+      await serialized(autoWatchTick);
     } else {
-      await teardownWatch("auto-watch turned off");
+      await teardownAllWatch("auto-watch turned off");
     }
   }
 
   if (changes.watchList) {
-    // drop any invalid-slug memory for games no longer in the list, and give
-    // "all done" a chance to re-evaluate in case a new game was added
     const newList = changes.watchList.newValue || [];
     const slugs = new Set(newList.map((g) => g.slug));
-    const cfg = await browser.storage.local.get(["invalidSlugs", "watchPhase"]);
+    const cfg = await browser.storage.local.get("invalidSlugs");
     const invalidSlugs = (cfg.invalidSlugs || []).filter((s) => slugs.has(s));
     await browser.storage.local.set({ invalidSlugs });
-    await autoWatchTick();
+    await serialized(autoWatchTick);
+  }
+
+  if (changes.tabQuota || changes.priorityMode) {
+    await serialized(autoWatchTick);
   }
 });
 

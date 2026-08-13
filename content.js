@@ -205,18 +205,17 @@
   }
 
   // =========================================================================
-  // Channel page: lowest quality + mute (BEST-EFFORT, needs verification)
+  // Channel page: lowest quality (BEST-EFFORT, needs verification)
+  //
+  // Muting is NOT done here - it's handled at the browser level by
+  // background.js via tabs.update({muted:true}) right after the tab is
+  // created, which is more reliable than clicking Twitch's own mute button
+  // and can't be undone by the page re-rendering its player.
   // =========================================================================
   let qualityAttempts = 0;
-  function applyLowQualityAndMute() {
+  function applyLowQuality() {
     qualityAttempts++;
     try {
-      const muteBtn = document.querySelector('button[data-a-target="player-mute-unmute-button"]');
-      if (muteBtn) {
-        const label = (muteBtn.getAttribute("aria-label") || "").toLowerCase();
-        if (label.includes("mute") && !label.includes("unmute")) muteBtn.click();
-      }
-
       const settingsBtn = document.querySelector('button[data-a-target="player-settings-button"]');
       if (settingsBtn) {
         settingsBtn.click();
@@ -238,10 +237,10 @@
           }
         }, 300);
       }
-      log("applied quality/mute (best-effort)");
+      log("applied quality setting (best-effort)");
       return true;
     } catch (e) {
-      log("applyLowQualityAndMute failed:", e);
+      log("applyLowQuality failed:", e);
       return qualityAttempts >= 5; // stop retrying after 5 failed attempts
     }
   }
@@ -280,6 +279,37 @@
       }
     }
     return found ? total : null;
+  }
+
+  // Best-effort campaign expiry date, used by the "soonest expiry first"
+  // priority mode. Fails closed like everything else here: returns null
+  // (unknown) rather than a guessed date whenever the text doesn't clearly
+  // match one of these patterns, sanity-bounded to reject obvious parse
+  // errors (dates more than ~2 years out).
+  function extractExpiresAt(cardText) {
+    let m = cardText.match(/(\d+)\s*days?\s*left/i);
+    if (m) {
+      const days = parseInt(m[1], 10);
+      if (!Number.isNaN(days) && days >= 0 && days < 365) {
+        return Date.now() + days * 24 * 60 * 60 * 1000;
+      }
+    }
+
+    m = cardText.match(/ends?\s+(?:on\s+)?([A-Za-z]{3,9}\s+\d{1,2})/i);
+    if (m) {
+      const now = new Date();
+      let candidate = new Date(`${m[1]} ${now.getFullYear()}`);
+      if (!Number.isNaN(candidate.getTime())) {
+        let ts = candidate.getTime();
+        if (ts < Date.now() - 24 * 60 * 60 * 1000) {
+          // already passed this year by more than a day -> must mean next year
+          ts = new Date(`${m[1]} ${now.getFullYear() + 1}`).getTime();
+        }
+        if (!Number.isNaN(ts) && ts - Date.now() < 2 * 365 * 24 * 60 * 60 * 1000) return ts;
+      }
+    }
+
+    return null;
   }
 
   // Only ever counts a reward as "claimed" when we find explicit, unambiguous
@@ -329,6 +359,7 @@
         total: rewards.length,
         accountNotConnected,
         expired,
+        expiresAt: extractExpiresAt(cardText),
         timeRemainingMin: extractRemainingMinutes(rewards),
       });
     }
@@ -450,7 +481,7 @@
         const wt = await getWatchTabInfo();
         if (!wt.isWatchTab) return; // not our tab - never touch the user's own viewing
 
-        if (!qualityApplied) qualityApplied = applyLowQualityAndMute();
+        if (!qualityApplied) qualityApplied = applyLowQuality();
 
         const expectedSlug = wt.activeGame && wt.activeGame.slug;
         const currentChannel = channelFromUrl(location.href);

@@ -10,6 +10,9 @@
 # build output
 web-ext-artifacts/
 
+# local dependencies (web-ext, installed via npm install)
+node_modules/
+
 # editor/OS cruft
 .DS_Store
 Thumbs.db

@@ -76,6 +76,19 @@
     outline: none;
     border-color: var(--accent);
   }
+  select {
+    background: var(--panel);
+    border: 1px solid #303036;
+    border-radius: 4px;
+    color: var(--text);
+    padding: 5px 7px;
+    font-size: 12px;
+    font-family: inherit;
+  }
+  select:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
   .hint {
     color: var(--muted);
     font-size: 11px;
@@ -292,6 +305,7 @@
     <div>กำลังดู: <b id="watchingChannel">-</b></div>
     <div>เก็บล่าสุด: <b id="lastClaim">ยังไม่เก็บ</b></div>
   </div>
+  <div class="hint" id="watchingChannelHint" hidden>* auto-watch เปิดได้หลายแท็บพร้อมกัน แต่ละแท็บ mute + ไม่แย่งโฟกัสหน้าจอ</div>
   <div class="off-note" id="offNote" hidden>ปิดอยู่ - ไม่มีการสแกน/เก็บ drop ใดๆ</div>
   <div class="all-done-banner" id="allDoneBanner" hidden>🎉 เก็บครบทุกเกมในลิสต์แล้ว ปิดแท็บที่เปิดไว้ให้แล้ว</div>
 
@@ -309,6 +323,19 @@
       <span class="slider"></span>
     </label>
   </div>
+
+  <div class="autooff-row">
+    <span>ดูพร้อมกันสูงสุดกี่แท็บ</span>
+    <input type="number" id="tabQuota" min="1" max="10" step="1" style="width:56px">
+  </div>
+  <div class="row">
+    <span>ลำดับเมื่อเกมเกินโควตาแท็บ</span>
+    <select id="priorityMode">
+      <option value="list-order">ตามลำดับที่ใส่</option>
+      <option value="expiry">ใกล้หมดอายุก่อน</option>
+    </select>
+  </div>
+  <div class="hint">"ใกล้หมดอายุก่อน" ใช้ได้เฉพาะเกมที่อ่านวันหมดอายุจากหน้า inventory ได้ - เกมที่อ่านไม่ได้จะเรียงตามลำดับที่ใส่แทนโดยไม่เดา (จะมีแจ้งในลิสต์ด้านล่าง)</div>
 
   <div id="gameStatusList" class="game-status-list"></div>
   <div id="gameStatusEmpty" class="game-status-empty" hidden>ยังไม่มีข้อมูลความคืบหน้า (จะขึ้นหลังเปิด auto-watch และหน้า inventory โหลดข้อมูลได้)</div>
