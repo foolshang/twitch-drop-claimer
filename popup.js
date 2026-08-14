@@ -41,6 +41,7 @@ const $powerStatusText = document.getElementById("powerStatusText");
 const $infoPanel = document.getElementById("infoPanel");
 const $offNote = document.getElementById("offNote");
 const $allDoneBanner = document.getElementById("allDoneBanner");
+const $sleepWarning = document.getElementById("sleepWarning");
 const $watchingChannel = document.getElementById("watchingChannel");
 const $watchingChannelHint = document.getElementById("watchingChannelHint");
 const $lastClaim = document.getElementById("lastClaim");
@@ -123,6 +124,12 @@ async function renderGameStatus() {
   const priorityMode = cfg.priorityMode || "list-order";
 
   $allDoneBanner.hidden = cfg.watchPhase !== "all-done";
+  // Firefox has no way for an extension to keep the machine awake (no
+  // browser.power API, and Screen Wake Lock API rejects on a background tab
+  // - verified live, not assumed) - the only real mitigation is the OS
+  // sleep setting, so surface that whenever there's actually a watch tab
+  // open to lose.
+  $sleepWarning.hidden = !(cfg.autoWatchEnabled && Object.keys(watchTabs).length > 0);
 
   $gameStatusList.replaceChildren();
   if (watchList.length === 0) {

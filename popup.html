@@ -207,6 +207,38 @@
     margin-bottom: 12px;
   }
 
+  .sleep-warning {
+    background: rgba(240, 147, 43, .1);
+    border: 1px solid var(--warn);
+    border-radius: 6px;
+    padding: 6px 10px;
+    margin-bottom: 12px;
+    font-size: 11.5px;
+  }
+  .sleep-warning summary {
+    color: var(--warn);
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 11.5px;
+  }
+  .sleep-warning-body {
+    margin-top: 8px;
+    color: var(--text);
+    line-height: 1.5;
+  }
+  .sleep-warning-body ol { margin: 4px 0; padding-left: 18px; }
+  .sleep-warning-body code {
+    display: block;
+    background: #0e0e10;
+    border: 1px solid #303036;
+    border-radius: 4px;
+    padding: 6px 8px;
+    margin: 6px 0;
+    font-size: 11px;
+    color: var(--ok);
+    user-select: all;
+  }
+
   .autooff-row {
     display: flex;
     align-items: center;
@@ -308,6 +340,22 @@
   <div class="hint" id="watchingChannelHint" hidden>* auto-watch เปิดได้หลายแท็บพร้อมกัน แต่ละแท็บ mute + ไม่แย่งโฟกัสหน้าจอ</div>
   <div class="off-note" id="offNote" hidden>ปิดอยู่ - ไม่มีการสแกน/เก็บ drop ใดๆ</div>
   <div class="all-done-banner" id="allDoneBanner" hidden>🎉 เก็บครบทุกเกมในลิสต์แล้ว ปิดแท็บที่เปิดไว้ให้แล้ว</div>
+
+  <details class="sleep-warning" id="sleepWarning" hidden>
+    <summary>⚠️ เครื่อง sleep แล้วการดูจะหยุดชั่วคราว — ตั้งไม่ให้ sleep ตอนนี้</summary>
+    <div class="sleep-warning-body">
+      Firefox ไม่มีทางให้ extension กันเครื่อง sleep ได้ (ตรวจสอบแล้ว: ไม่มี
+      power API และ Screen Wake Lock API ก็ใช้กับแท็บ background ไม่ได้ - เจตนา
+      ของ browser เอง ไม่ใช่ข้อจำกัดของ extension นี้) ต้องตั้งที่ Windows เอง:
+      <ol>
+        <li>Settings → System → Power &amp; battery → Screen and sleep</li>
+        <li>ช่อง "When plugged in, put my device to sleep after" → เลือก <b>Never</b></li>
+      </ol>
+      หรือใช้คำสั่งนี้ใน PowerShell (สิทธิ์ Admin):
+      <code>powercfg /change standby-timeout-ac 0</code>
+      <div class="hint">อย่าลืมตั้งกลับหลังฟาร์มเสร็จ ถ้าไม่อยากให้เครื่องไม่ sleep ตลอดไป</div>
+    </div>
+  </details>
 
   <hr>
 
