@@ -25,11 +25,23 @@
         "*://www.twitch.tv/*"
       ],
       "js": [
+        "gql-bridge.js"
+      ],
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "*://www.twitch.tv/*"
+      ],
+      "js": [
         "shared.js",
         "content.js"
       ],
       "run_at": "document_idle"
     }
+  ],
+  "web_accessible_resources": [
+    "inject.js"
   ],
   "browser_specific_settings": {
     "gecko": {

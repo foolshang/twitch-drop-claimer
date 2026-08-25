@@ -32,6 +32,18 @@ expiry-first (fails closed to list order if an expiry date can't be
 parsed). Once every listed game is done, all watch tabs close and the
 toolbar badge shows a checkmark.
 
+**Drop-status verification (fake-category detection).** A directory can
+list a channel that isn't actually broadcasting with the target game's
+drop campaign attached, so watching it never accrues progress. Shortly
+after a watch tab picks a channel, the background script cross-checks it
+against two signals passively observed from Twitch's own GraphQL traffic
+(via `gql-bridge.js`/`inject.js`, never issuing a request of its own): does
+this exact channel have the campaign attached at all, and has
+account-wide minutes-watched for it moved since the channel was picked. If
+neither holds after a short grace period, the tab is rotated back to the
+directory and that channel is put on a cooldown so it isn't immediately
+re-picked, while the rest of the eligible channels are unaffected.
+
 **Master on/off switch.** A single `enabled` flag in
 `browser.storage.local`, toggled from the popup or an optional
 auto-off timer (default 3h, configurable 1–72h), gates everything above —
@@ -66,15 +78,18 @@ content script plus reading tab URLs on Twitch only.
 
 ## Testing
 
-`test/toggle-behavior.test.js` and `test/auto-watch-multi-tab.test.js` are
-Node-based tests that exercise the real `content.js`/`background.js` logic
-against a stubbed `browser.*` API (tabs registry, storage, alarms) — no
-browser required. Run with `node test/<file>.js`.
+`test/toggle-behavior.test.js`, `test/auto-watch-multi-tab.test.js`, and
+`test/drop-verification.test.js` are Node-based tests that exercise the
+real `background.js`/`content.js` logic against a stubbed `browser.*` API
+(tabs registry, storage, alarms) — no browser required. Run with
+`node test/<file>.js`.
 
 They cover: no timer/tab/click activity of any kind once `enabled` is
 switched off (and no leaked activity from callbacks already in flight),
-and the auto-watch scheduler's tab-per-game accounting, quota limits, and
-priority ordering.
+the auto-watch scheduler's tab-per-game accounting/quota/priority
+ordering, and the fake-category verification's two signal paths plus the
+tab-etiquette audit for every `tabs.create`/`tabs.update` call
+(`active: false` always, never `windows.update(focused: true)`).
 
 ## AMO submission workflow
 
@@ -100,8 +115,10 @@ Listed submissions also read license/category metadata from
 | File | Purpose |
 |---|---|
 | `manifest.json` | Extension manifest (Manifest V2, Firefox) |
-| `background.js` | Alarms, inventory reload, auto-watch tab orchestration, badge |
+| `background.js` | Alarms, inventory reload, auto-watch tab orchestration, drop-status verification, badge |
 | `content.js` | Claim-button scanning/clicking, directory/channel picking for watch tabs, inventory progress parsing |
+| `gql-bridge.js` | `document_start` content script that injects `inject.js` and relays its signals to `background.js` |
+| `inject.js` | Page-world script that passively observes Twitch's GraphQL traffic for drop-campaign/minutes-watched signals |
 | `shared.js` | Helpers shared between background and content scripts (slugs, channel/directory URL parsing) |
 | `popup.html` / `popup.js` | Settings UI: on/off switch, watch list, auto-watch/tab quota/priority mode, auto-off timer, sleep warning |
 | `scripts/submit-amo.js` | AMO submission pipeline |

@@ -2,7 +2,7 @@
  * Twitch Drop Auto-Claimer - background script
  * (loaded after shared.js - toSlug/channelFromUrl/directoryUrl come from there)
  *
- * Two independent jobs:
+ * Three independent jobs:
  *
  * 1. Inventory upkeep (unchanged from before): Twitch's inventory page
  *    doesn't always update progress live, so if a tab is open on
@@ -18,7 +18,16 @@
  *    from the list - the other tabs are unaffected. Once every game in the
  *    list is done, all watch tabs close and the badge shows "done".
  *
- * Both are fully gated on the `enabled` flag in browser.storage.local -
+ * 3. Drop-status verification: a game's directory can list a channel that
+ *    isn't actually broadcasting with that game's drop campaign attached
+ *    ("fake category"), so watching it silently never accrues progress.
+ *    verifyDropStatus() cross-checks each watched channel against Twitch's
+ *    own GraphQL signals (relayed from inject.js/gql-bridge.js) a short
+ *    while after it's picked, and rotates the tab to the next channel if
+ *    the stream turns out not to be crediting us. See the "drop-status
+ *    verification" section below for the full decision logic.
+ *
+ * All three are fully gated on the `enabled` flag in browser.storage.local -
  * once switched off, nothing here may open a tab, reload one, or fire a
  * request again. Auto-watch is additionally gated on `autoWatchEnabled`.
  *
@@ -57,6 +66,14 @@ const INVENTORY_URL = "https://www.twitch.tv/drops/inventory";
 const DEFAULT_AUTO_OFF_HOURS = 3;
 const DEFAULT_TAB_QUOTA = 3;
 const EMPTY_COOLDOWN_MS = 5 * 60 * 1000; // how long a "nobody live" game sits out before retrying
+
+// drop-status verification: catches channels that are listed under a game's
+// drops directory but aren't actually broadcasting with that game's drop
+// campaign attached ("fake category"), so watching them never accrues
+// progress. See verifyDropStatus() below.
+const VERIFY_DELAY_MS = 100 * 1000; // time to let Twitch register the view + surface drop UI/API signals before judging on minutes-watched
+const GQL_SETTLE_MS = 20 * 1000; // ignore a channelCampaigns signal seen this soon after navigating - the page may not have finished loading the new channel's metadata yet
+const CHANNEL_BLOCK_COOLDOWN_MS = 45 * 60 * 1000; // don't immediately re-pick a channel we just rejected
 
 const log = (...args) => console.log("[DropClaimer]", ...args);
 
@@ -199,7 +216,7 @@ async function teardownAllWatch(reason) {
     try { await browser.tabs.remove(tabId); } catch { /* already closed */ }
   }
   if (cfg.watchPhase !== "idle") {
-    await browser.storage.local.set({ watchTabs: {}, watchPhase: "idle" });
+    await browser.storage.local.set({ watchTabs: {}, watchPhase: "idle", watchMeta: {}, dropSignals: {} });
   }
   log("auto-watch idle:", reason);
   await refreshBadge();
@@ -213,7 +230,7 @@ async function finishAllDone() {
   for (const tabId of Object.values(watchTabs)) {
     try { await browser.tabs.remove(tabId); } catch { /* already closed */ }
   }
-  await browser.storage.local.set({ watchTabs: {}, watchPhase: "all-done" });
+  await browser.storage.local.set({ watchTabs: {}, watchPhase: "all-done", watchMeta: {}, dropSignals: {} });
   await refreshBadge();
 }
 
@@ -222,7 +239,7 @@ async function finishAllDone() {
 async function autoWatchTick() {
   const cfg = await browser.storage.local.get([
     "enabled", "autoWatchEnabled", "watchList", "invalidSlugs", "campaignProgress",
-    "watchTabs", "tabQuota", "priorityMode", "emptyUntil",
+    "watchTabs", "tabQuota", "priorityMode", "emptyUntil", "watchMeta", "dropSignals",
   ]);
   if (!cfg.enabled || !cfg.autoWatchEnabled) return;
 
@@ -238,6 +255,8 @@ async function autoWatchTick() {
   const quota = Math.max(1, cfg.tabQuota || DEFAULT_TAB_QUOTA);
   const priorityMode = cfg.priorityMode === "expiry" ? "expiry" : "list-order";
   let watchTabs = { ...(cfg.watchTabs || {}) };
+  let watchMeta = { ...(cfg.watchMeta || {}) };
+  let dropSignals = { ...(cfg.dropSignals || {}) };
 
   const eligible = list.filter((g) => !isGameDone(g.slug, campaignProgress, invalidSlugs));
 
@@ -252,6 +271,8 @@ async function autoWatchTick() {
   for (const slug of Object.keys(watchTabs)) {
     if (!eligibleSlugs.has(slug)) {
       await closeWatchTab(watchTabs, slug);
+      delete watchMeta[slug];
+      delete dropSignals[slug];
     }
   }
 
@@ -274,7 +295,7 @@ async function autoWatchTick() {
     log("opened watch tab for", game.slug, `(${openCount}/${quota})`);
   }
 
-  await browser.storage.local.set({ watchTabs, watchPhase: "watching" });
+  await browser.storage.local.set({ watchTabs, watchPhase: "watching", watchMeta, dropSignals });
   await refreshBadge();
 }
 
@@ -308,9 +329,11 @@ async function mergeInventoryProgress(campaigns) {
   if (!campaigns || campaigns.length === 0) return;
 
   return serialized(async () => {
-    const cfg = await browser.storage.local.get(["campaignProgress", "watchTabs"]);
+    const cfg = await browser.storage.local.get(["campaignProgress", "watchTabs", "watchMeta", "dropSignals"]);
     const progress = cfg.campaignProgress || {};
     const watchTabs = { ...(cfg.watchTabs || {}) };
+    const watchMeta = { ...(cfg.watchMeta || {}) };
+    const dropSignals = { ...(cfg.dropSignals || {}) };
     let anyJustFinished = false;
 
     for (const c of campaigns) {
@@ -328,13 +351,193 @@ async function mergeInventoryProgress(campaigns) {
       };
       if ((allComplete || c.expired) && watchTabs[c.slug]) {
         await closeWatchTab(watchTabs, c.slug);
+        delete watchMeta[c.slug];
+        delete dropSignals[c.slug];
         anyJustFinished = true;
         log(c.slug, allComplete ? "fully claimed" : "expired", "- closed its tab");
       }
     }
 
-    await browser.storage.local.set({ campaignProgress: progress, watchTabs });
+    await browser.storage.local.set({ campaignProgress: progress, watchTabs, watchMeta, dropSignals });
     if (anyJustFinished) await autoWatchTick();
+  });
+}
+
+// ============================================================================
+// drop-status verification - catches "fake category" streams: a channel
+// listed under a game's drops-filtered directory that isn't actually
+// broadcasting with that game's drop campaign attached, so watching it
+// never accrues progress.
+//
+// Signal sources (both fed in via messages, see the switch below):
+//   - dropSignals[slug].channelCampaigns: from the channel page's own
+//     DropsHighlightService_AvailableDrops GQL response (via gql-bridge.js
+//     / inject.js) - which campaigns (if any) Twitch associates with
+//     whatever is live on that exact channel right now. Empty -> not
+//     drops-tagged at all -> immediate, high-confidence "fake category".
+//   - dropSignals[slug].latestMinutesWatched: from the account-wide
+//     Inventory GQL query - minutes accrued for this game's campaign.
+//     Compared against a baseline taken when we started watching the
+//     current channel; if it hasn't moved after VERIFY_DELAY_MS, treat the
+//     stream as not crediting us (whether that's because it's mistagged or
+//     some other reason doesn't matter - it's not working, so rotate).
+//
+// Already-claimed campaigns are NOT this function's job: mergeInventoryProgress
+// / isGameDone already close a game's tab the moment its campaign is fully
+// claimed or expired. verifyDropStatus only runs for games still eligible
+// and currently on a channel, and only ever *rotates* the channel - it never
+// removes a game from the watch list.
+// ============================================================================
+async function rejectChannel(slug, channelName, tabId) {
+  const cfg = await browser.storage.local.get(["blockedChannels", "watchMeta", "dropSignals"]);
+  const blockedChannels = { ...(cfg.blockedChannels || {}) };
+  const forSlug = { ...(blockedChannels[slug] || {}) };
+  forSlug[(channelName || "").toLowerCase()] = Date.now() + CHANNEL_BLOCK_COOLDOWN_MS;
+  blockedChannels[slug] = forSlug;
+
+  const watchMeta = { ...(cfg.watchMeta || {}) };
+  delete watchMeta[slug];
+  const dropSignals = { ...(cfg.dropSignals || {}) };
+  delete dropSignals[slug];
+
+  await browser.storage.local.set({ blockedChannels, watchMeta, dropSignals });
+
+  try {
+    // same tab, bounced back to the directory - cheaper than closing and
+    // reopening, and content.js's existing directory-page picker takes it
+    // from here (it will read blockedChannels back via isWatchTab and skip
+    // this channel on the re-pick).
+    await browser.tabs.update(tabId, { url: directoryUrl(slug), active: false });
+  } catch (e) {
+    log("rejectChannel: tab already gone for", slug, e);
+  }
+}
+
+async function verifyDropStatus(slug) {
+  const cfg = await browser.storage.local.get([
+    "watchTabs", "watchMeta", "dropSignals", "campaignProgress",
+  ]);
+  const tabId = (cfg.watchTabs || {})[slug];
+  const meta = (cfg.watchMeta || {})[slug];
+  if (!tabId || !meta) return; // no tab, or no channel picked yet for it
+
+  const progress = (cfg.campaignProgress || {})[slug];
+  if (progress && (progress.allComplete || progress.expired)) return; // autoWatchTick handles closing this tab
+
+  const elapsed = Date.now() - meta.watchStartedAt;
+  const signal = (cfg.dropSignals || {})[slug] || {};
+
+  // Fast path: the channel's own GQL response already told us it has no
+  // drop campaign attached at all. Give it a short settle window in case
+  // the query fired before the page finished loading the new channel.
+  const channelCampaigns = signal.channelCampaigns;
+  if (
+    channelCampaigns &&
+    elapsed >= GQL_SETTLE_MS &&
+    channelCampaigns.at >= meta.watchStartedAt &&
+    channelCampaigns.campaignIds.length === 0
+  ) {
+    log(slug, "channel", meta.channel, "has no drop campaign attached (GQL) - fake category, rotating");
+    await rejectChannel(slug, meta.channel, tabId);
+    return;
+  }
+
+  if (elapsed < VERIFY_DELAY_MS) return; // too soon to judge on minutes-watched
+
+  // First Inventory reading seen since this channel started: record it as
+  // the baseline and judge on the next sweep, rather than comparing against
+  // a stale number left over from a previous channel.
+  if (meta.minutesWatchedAtStart == null) {
+    if (signal.latestMinutesWatched != null && signal.latestMinutesAt >= meta.watchStartedAt) {
+      const watchMeta = { ...(cfg.watchMeta || {}) };
+      watchMeta[slug] = { ...meta, minutesWatchedAtStart: signal.latestMinutesWatched };
+      await browser.storage.local.set({ watchMeta });
+    }
+    return;
+  }
+
+  // Never saw an Inventory response for this channel at all after the full
+  // delay - fail closed to "keep watching" rather than rotate on silence
+  // (the page's own background refetch may simply not have fired yet).
+  if (signal.latestMinutesWatched == null || signal.latestMinutesAt < meta.watchStartedAt) return;
+
+  if (signal.latestMinutesWatched <= meta.minutesWatchedAtStart) {
+    log(
+      slug, "channel", meta.channel, "shows 0 accrued minutes after",
+      Math.round(elapsed / 1000), "s - fake category, rotating"
+    );
+    await rejectChannel(slug, meta.channel, tabId);
+  }
+}
+
+async function verifySweep() {
+  const cfg = await browser.storage.local.get(["watchMeta"]);
+  for (const slug of Object.keys(cfg.watchMeta || {})) {
+    await verifyDropStatus(slug);
+  }
+}
+
+async function handleDirectoryPicked(slug, channel, tab) {
+  return serialized(async () => {
+    if (!tab) return;
+    const cfg = await browser.storage.local.get(["watchTabs", "watchMeta", "dropSignals"]);
+    if ((cfg.watchTabs || {})[slug] !== tab.id) return; // stale message from a tab no longer tracked for this slug
+
+    const watchMeta = { ...(cfg.watchMeta || {}) };
+    watchMeta[slug] = { channel, tabId: tab.id, watchStartedAt: Date.now(), minutesWatchedAtStart: null };
+    const dropSignals = { ...(cfg.dropSignals || {}) };
+    delete dropSignals[slug]; // fresh channel, fresh signals
+
+    await browser.storage.local.set({ watchMeta, dropSignals });
+    log("watch tab for", slug, "now on channel", channel);
+  });
+}
+
+// clears the per-channel baseline when a watch tab leaves its channel for
+// any reason that isn't our own rejectChannel() (offline, raided away) - so
+// stale minutes-watched numbers never carry over to whatever channel comes
+// next.
+async function handleChannelLeft(slug) {
+  return serialized(async () => {
+    if (!slug) return;
+    const cfg = await browser.storage.local.get(["watchMeta", "dropSignals"]);
+    const watchMeta = { ...(cfg.watchMeta || {}) };
+    const dropSignals = { ...(cfg.dropSignals || {}) };
+    delete watchMeta[slug];
+    delete dropSignals[slug];
+    await browser.storage.local.set({ watchMeta, dropSignals });
+  });
+}
+
+async function handleGqlDropSignal(msg, tab) {
+  if (!tab) return;
+  return serialized(async () => {
+    const cfg = await browser.storage.local.get(["watchTabs", "dropSignals"]);
+    const watchTabs = cfg.watchTabs || {};
+    const slug = Object.keys(watchTabs).find((s) => watchTabs[s] === tab.id);
+    if (!slug) return; // signal from a tab we're not tracking (e.g. the user's own browsing)
+
+    const dropSignals = { ...(cfg.dropSignals || {}) };
+    const entry = { ...(dropSignals[slug] || {}) };
+
+    if (msg.signal.kind === "channelCampaigns") {
+      entry.channelCampaigns = { campaignIds: msg.signal.campaignIds, at: msg.at };
+    } else if (msg.signal.kind === "inventory") {
+      // Inventory is account-wide, covering every in-progress campaign at
+      // once - pick out the entry for the game this tab is watching by
+      // matching its display name back to our slug (shared.js's toSlug is
+      // already loaded in this context).
+      const match = (msg.signal.campaigns || []).find(
+        (c) => c.gameName && toSlug(c.gameName) === slug
+      );
+      if (match) {
+        entry.latestMinutesWatched = match.minutesWatched;
+        entry.latestMinutesAt = msg.at;
+      }
+    }
+
+    dropSignals[slug] = entry;
+    await browser.storage.local.set({ dropSignals });
   });
 }
 
@@ -381,6 +584,7 @@ browser.alarms.onAlarm.addListener(async (alarm) => {
     checkAutoOff();
   } else if (alarm.name === AUTO_WATCH_ALARM) {
     serialized(autoWatchTick);
+    serialized(verifySweep);
   }
 });
 
@@ -394,16 +598,19 @@ browser.runtime.onMessage.addListener((msg, sender) => {
     case "isWatchTab":
       return (async () => {
         const cfg = await browser.storage.local.get([
-          "enabled", "autoWatchEnabled", "watchTabs", "watchList",
+          "enabled", "autoWatchEnabled", "watchTabs", "watchList", "blockedChannels",
         ]);
         if (!cfg.enabled || !cfg.autoWatchEnabled || !sender.tab) {
-          return { isWatchTab: false, activeGame: null };
+          return { isWatchTab: false, activeGame: null, blockedChannels: [] };
         }
         const watchTabs = cfg.watchTabs || {};
         const slug = Object.keys(watchTabs).find((s) => watchTabs[s] === sender.tab.id);
-        if (!slug) return { isWatchTab: false, activeGame: null };
+        if (!slug) return { isWatchTab: false, activeGame: null, blockedChannels: [] };
         const game = (cfg.watchList || []).find((g) => g.slug === slug) || { slug, input: slug };
-        return { isWatchTab: true, activeGame: game };
+        const now = Date.now();
+        const blockedForSlug = (cfg.blockedChannels || {})[slug] || {};
+        const blockedChannels = Object.keys(blockedForSlug).filter((name) => blockedForSlug[name] > now);
+        return { isWatchTab: true, activeGame: game, blockedChannels };
       })();
 
     case "directoryInvalid":
@@ -412,14 +619,22 @@ browser.runtime.onMessage.addListener((msg, sender) => {
     case "directoryEmpty":
       return handleDirectoryEmpty(msg.slug);
 
+    case "directoryPicked":
+      return handleDirectoryPicked(msg.slug, msg.channel, sender.tab);
+
+    case "channelOffline":
+    case "channelRedirected":
+      return handleChannelLeft(msg.slug);
+
+    case "gqlDropSignal":
+      return handleGqlDropSignal(msg, sender.tab);
+
     case "inventoryProgress":
       return mergeInventoryProgress(msg.campaigns);
 
     case "dropClaimed":
       return handleDropClaimed();
 
-    // "directoryPicked" / "channelOffline" / "channelRedirected" are informational
-    // only (the content script has already acted); nothing to do here.
     default:
       return undefined;
   }

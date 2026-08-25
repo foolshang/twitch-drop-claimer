@@ -39,6 +39,8 @@ const EXTENSION_FILES = [
   "shared.js",
   "background.js",
   "content.js",
+  "gql-bridge.js",
+  "inject.js",
   "popup.html",
   "popup.js",
 ];

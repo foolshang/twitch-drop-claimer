@@ -84,3 +84,35 @@ was added instead: the popup now shows a collapsible warning whenever
 auto-watch actually has a tab open, explaining why sleep isn't prevented
 automatically and linking the Windows power-settings steps (plus a
 `powercfg` one-liner) to disable sleep manually.
+
+## 2026-08-25 — Auto-watch tabs wasted on "fake category" streams
+
+**Problem:** A game's drops directory can list a channel that isn't
+actually broadcasting with that game's drop campaign attached (wrong/fake
+category), so a watch tab parked there never accrues progress - silently
+burning a slot out of the tab quota for as long as that channel stays live.
+
+**Fix:** Added a drop-status verification layer. Two new content scripts,
+`gql-bridge.js` (isolated world, `document_start`) and `inject.js` (page
+world, injected as an external `<script src>` since twitch.tv's CSP blocks
+inline scripts), passively observe Twitch's own GraphQL traffic to
+`gql.twitch.tv` - matched by the request array's `operationName` (stable
+across deploys, unlike the paired persisted-query hash) rather than by
+issuing any request of its own - and relay two signals to background.js:
+`DropsHighlightService_AvailableDrops` (which campaigns, if any, are
+attached to the channel actually live right now) and `Inventory`
+(account-wide minutes-watched per campaign). `verifyDropStatus()` in
+background.js combines these with the existing `campaignProgress` data: an
+empty campaign list on the channel is an immediate "fake category" verdict
+(after a short settle window); otherwise, if minutes-watched hasn't moved
+since the channel was picked after a longer verify delay, it's treated the
+same way. Either case rotates the same tab back to its directory page via
+`rejectChannel()` (same-tab `tabs.update`, `active:false`, matching the
+file's existing tab-etiquette rule) and records the channel in a
+per-slug `blockedChannels` cooldown so the directory-page picker in
+content.js (`pickBestChannel()`) skips it on the re-pick. Added
+`test/drop-verification.test.js` covering both signal paths and the
+tab-etiquette audit for the new `tabs.update` call; GQL operation names and
+field paths are flagged as best-effort, same as the file's existing DOM
+selectors, since Twitch's API is private/undocumented and needs
+verification against real traffic before relying on it in production.

@@ -184,7 +184,11 @@
     return Math.round(n);
   }
 
-  function pickBestChannel() {
+  // blockedNames: channels rejected by the background verification check
+  // (fake-category / no drop progress) - skipped so we don't immediately
+  // re-pick the same bad stream.
+  function pickBestChannel(blockedNames) {
+    const blocked = blockedNames instanceof Set ? blockedNames : new Set(blockedNames || []);
     const links = document.querySelectorAll(
       'a[data-a-target="preview-card-image-link"], article a[data-a-target="preview-card-channel-link"]'
     );
@@ -199,9 +203,10 @@
       const name = href.split("/").filter(Boolean).pop();
       candidates.push({ href, name, viewers: viewers ?? Infinity });
     });
-    if (candidates.length === 0) return null;
-    candidates.sort((a, b) => a.viewers - b.viewers);
-    return candidates[0];
+    const usable = candidates.filter((c) => !blocked.has((c.name || "").toLowerCase()));
+    if (usable.length === 0) return null;
+    usable.sort((a, b) => a.viewers - b.viewers);
+    return usable[0];
   }
 
   // =========================================================================
@@ -449,7 +454,7 @@
           return;
         }
 
-        const picked = pickBestChannel();
+        const picked = pickBestChannel(wt.blockedChannels);
         if (picked) {
           log("picked channel:", picked.href, "viewers:", picked.viewers);
           clearInterval(directoryIntervalId);
