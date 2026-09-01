@@ -126,22 +126,94 @@
     return location.pathname.startsWith("/drops/inventory");
   }
 
+  // A slug that doesn't map to any real Twitch category doesn't always
+  // redirect the URL away (the directoryIntervalId check below already
+  // catches that case) - confirmed live 2026-09-01: a wrong slug for a
+  // renamed game (Twitch shows "Rainbow Six Siege" but the category slug is
+  // still "tom-clancys-rainbow-six-siege"; the guessed
+  // "rainbow-six-siege" slug kept the same URL) rendered with
+  // document.title still the bare default "Twitch" and no <h1> at all -
+  // indistinguishable from "the category is real but genuinely has 0 live
+  // channels right now" using pickBestChannel() alone, which would
+  // otherwise sit in the "nobody's live" cooldown forever and never get
+  // flagged as the real bug it is. A real category's title/heading always
+  // carries its name, even with zero viewers.
+  function looksLikeUnknownCategory() {
+    return document.title.trim() === "Twitch" && !document.querySelector("h1");
+  }
+
+  // Real dom-debug capture (reportChannelDomDebug below) against a channel
+  // that actually went offline mid-session found: the animated-viewer-count
+  // check alone tracked live/offline correctly the whole time (true for a
+  // real live channel, false throughout the real offline one), while a
+  // second check that used to be here - a broad, unscoped
+  // `[class*='live-indicator']` match - stayed stuck `true` through the
+  // entire offline session, and the captured bodyText at the same moment
+  // showed only sidebar content (a Followed/Live Channels list), not
+  // anything player-related - almost certainly matching some OTHER live
+  // channel's badge in that sidebar list, not the one actually being
+  // watched. Dropped rather than reintroduced scoped to a player container,
+  // since there's no real DOM captured yet to build that scoped selector
+  // from - see HISTORY.md. hasLiveIndicatorClass is still captured in
+  // reportChannelDomDebug (diagnostic only, not part of this decision) in
+  // case that data is useful for building a scoped version later.
+  //
+  // 2026-09-01: dumped the real channel-page DOM in both states over RDP
+  // (warframe live vs ghazzytv offline). `.channel-root` - the single
+  // element wrapping the whole channel page - carries state modifiers that
+  // are React-state-driven and scoped to the viewed channel (never the
+  // sidebar): `.channel-root--live` when live, `.channel-root__player--offline`
+  // + `.channel-root__info--offline` when offline. The two were cleanly
+  // mutually exclusive (1/0 either way) in the capture. The old
+  // `.channel-status-info--offline` selector matched ZERO elements in both
+  // dumps - fully stale; an autohosting-while-offline channel now uses
+  // `.channel-status-info--autohost`, and `.channel-root__info--offline`
+  // covers that case too.
   function looksLive() {
-    // signals that the stream is live: LIVE badge or the animated viewer counter
-    if (document.querySelector('[data-a-target="animated-channel-viewers-count"]')) return true;
-    const badge = document.querySelector(".tw-channel-status-text-indicator, [class*='live-indicator']");
-    if (badge && /live|ไลฟ์|สด/i.test(badge.textContent || "")) return true;
-    return false;
+    return !!document.querySelector('[data-a-target="animated-channel-viewers-count"]');
   }
 
   function looksOffline() {
-    // clear offline signals: offline banner / full-page past-broadcast recommendations
-    if (document.querySelector('[data-a-target="player-overlay-content-gate"]')) return false; // content gate is not "offline"
-    if (document.querySelector('.channel-status-info--offline')) return true;
-    const el = document.querySelector('[data-a-target="home-offline-carousel"], [data-test-selector="offline-recommendations"]');
-    if (el) return true;
+    // content gate (subscriber-only / mature / rerun) is NOT "offline"
+    if (document.querySelector('[data-a-target="player-overlay-content-gate"]')) return false;
+    // channel-page root reflecting an offline broadcast directly (scoped to
+    // the viewed channel, verified against real DOM - see comment above)
+    if (document.querySelector('.channel-root__player--offline, .channel-root__info--offline')) return true;
+    // full-page offline recommendations carousel (only rendered when offline)
+    if (document.querySelector('[data-a-target="home-offline-carousel"], [data-test-selector="offline-recommendations"]')) return true;
     const txt = document.body.innerText || "";
     return /is offline|ออฟไลน์อยู่/i.test(txt.slice(0, 5000));
+  }
+
+  // gated on the same `debugGql` storage flag as [gql-debug] (a misnomer by
+  // now - it's become this project's general "verbose diagnostics" switch,
+  // reused here rather than adding a second toggle for the same purpose).
+  // Reports every individual selector looksLive()/looksOffline() check on
+  // its own, not just their combined true/false, so a stuck-on-an-offline-
+  // channel report can be root-caused from whatever the watch tab actually
+  // saw next time it happens, instead of needing someone to manually catch
+  // a real offline channel and copy its DOM out by hand.
+  async function reportChannelDomDebug(channel) {
+    try {
+      const cfg = await browser.storage.local.get("debugGql");
+      if (!cfg.debugGql) return;
+      browser.runtime.sendMessage({
+        type: "channelDomDebug",
+        channel,
+        at: Date.now(),
+        title: document.title,
+        looksLive: looksLive(),
+        looksOffline: looksOffline(),
+        hasAnimatedViewers: !!document.querySelector('[data-a-target="animated-channel-viewers-count"]'),
+        hasLiveIndicatorClass: !!document.querySelector(".tw-channel-status-text-indicator, [class*='live-indicator']"),
+        hasChannelRootLive: !!document.querySelector(".channel-root--live"),
+        hasChannelRootOffline: !!document.querySelector(".channel-root__player--offline, .channel-root__info--offline"),
+        hasContentGate: !!document.querySelector('[data-a-target="player-overlay-content-gate"]'),
+        hasOfflineBannerClass: !!document.querySelector(".channel-status-info--offline"),
+        hasOfflineCarousel: !!document.querySelector('[data-a-target="home-offline-carousel"], [data-test-selector="offline-recommendations"]'),
+        bodyTextSnippet: (document.body.innerText || "").slice(0, 300),
+      }).catch(() => {});
+    } catch { /* never let a diagnostic failure break the real offline check */ }
   }
 
   // ask background whether this tab is the one it's using for auto-watch, and
@@ -253,37 +325,69 @@
   // =========================================================================
   // Inventory page: parse campaign progress (BEST-EFFORT, needs verification)
   // =========================================================================
-  function closestCampaignCard(el) {
-    let node = el;
-    for (let i = 0; i < 8 && node && node !== document.body; i++) {
-      if (node.querySelector && node.querySelector("h1,h2,h3,h4,h5")) return node;
+  // Real /drops/inventory capture (see HISTORY.md) found each campaign
+  // card only identified by a boxart <img> - no game name text anywhere in
+  // the card (that only exists in the unrelated followed/live-channels
+  // sidebar). Card boundary found by counting: walk up from the boxart img
+  // until an ancestor contains exactly that one image, and its own parent
+  // contains 2+ (i.e. we've stepped into the next card's shared wrapper) -
+  // robust to the styled-components hash classes actually surrounding it
+  // (verified against 7 real cards, correctly separated every time).
+  const GAME_CARD_IMAGE_SELECTOR = '[data-test-selector="DropsCampaignInProgressDescription-game-card-image"]';
+
+  function findCampaignCardBoundary(img) {
+    let node = img;
+    for (let i = 0; i < 10 && node; i++) {
+      if (node.querySelectorAll(GAME_CARD_IMAGE_SELECTOR).length === 1) {
+        const parent = node.parentElement;
+        const parentImageCount = parent ? parent.querySelectorAll(GAME_CARD_IMAGE_SELECTOR).length : 99;
+        if (!parent || parentImageCount >= 2) return node;
+      }
       node = node.parentElement;
     }
-    return el.closest('[class*="campaign" i]') || el.parentElement || el;
+    return img.parentElement || img;
   }
 
-  function extractRemainingMinutes(rewards) {
-    let total = 0;
-    let found = false;
-    for (const el of rewards) {
-      const text = el.innerText || "";
-      let m = text.match(/(\d+)\s*\/\s*(\d+)\s*(?:min|minute|นาที)/i);
-      if (m) {
-        const now = parseInt(m[1], 10);
-        const max = parseInt(m[2], 10);
-        if (!Number.isNaN(now) && !Number.isNaN(max) && max > now) {
-          total += max - now;
-          found = true;
-        }
-        continue;
-      }
-      m = text.match(/(\d+)\s*(?:min|minute|นาที)\s*(?:left|remaining|เหลือ)/i);
-      if (m) {
-        total += parseInt(m[1], 10);
-        found = true;
-      }
-    }
-    return found ? total : null;
+  // The boxart <img> src encodes a numeric id (".../{id}_IGDB-285x380.jpg")
+  // confirmed (for a real, non-tracked Division 2 campaign, id 504463) to
+  // equal Twitch's own GQL `game.id` exactly - gameIdMap (background.js,
+  // learned from DropChannelCampaignsProgress, see inject.js) maps that id
+  // to a game name so this card can be matched to a slug without ever
+  // reading a name off the card itself.
+  function extractGameIdFromBoxart(img) {
+    const m = (img.src || "").match(/\/(\d+)_IGDB-/);
+    return m ? m[1] : null;
+  }
+
+  // aria-valuenow/valuemax on each reward tier's own [role="progressbar"]
+  // (a real ARIA role, unlike the styled-components classes around it) -
+  // confirmed via real capture to already be a 0-100 percentage, at 100
+  // exactly when a reward is fully watched. Far more direct than the old
+  // text-regex approach, which relied on a "N/M min" pattern that no
+  // longer appears anywhere in the current markup at all.
+  function extractTierPercent(bar) {
+    const now = parseFloat(bar.getAttribute("aria-valuenow"));
+    const max = parseFloat(bar.getAttribute("aria-valuemax"));
+    if (Number.isNaN(now) || Number.isNaN(max) || max <= 0) return null;
+    return (now / max) * 100;
+  }
+
+  // Best-effort: real cards show "N% of X hours"/"N% of X minutes" text
+  // right next to each tier's own progress bar (verified, e.g. "53% of 4
+  // hours") - used only to convert a known percentage into a remaining-
+  // minutes estimate for a tier that isn't done yet. Unlike the card
+  // boundary and percentage above, exactly how tightly this text is scoped
+  // per-tier vs bleeding into a neighboring tier hasn't been fully nailed
+  // down against every real card layout - if this returns null, the tier
+  // is still counted correctly by extractTierPercent, it's only the
+  // minutes-remaining estimate that's skipped for it.
+  function extractTierDurationMin(tierEl) {
+    const text = (tierEl && tierEl.innerText) || "";
+    let m = text.match(/of\s+(\d+)\s*hours?/i);
+    if (m) return parseInt(m[1], 10) * 60;
+    m = text.match(/of\s+(\d+)\s*minutes?/i);
+    if (m) return parseInt(m[1], 10);
+    return null;
   }
 
   // Best-effort campaign expiry date, used by the "soonest expiry first"
@@ -300,6 +404,22 @@
       }
     }
 
+    // The format actually seen on a real card (2026-09-01 RDP capture):
+    // "End Date: Wed, Aug 26, 7:59 AM GMT+7" - an optional leading weekday,
+    // then "<Month> <day>". This is an absolute date and is shown on both
+    // active and already-ended cards, so a parsed date in the past is taken
+    // at face value (the campaign really did end then) rather than rolled
+    // forward a year. Trailing time/timezone ignored; day granularity is
+    // enough for "soonest expiry first" ordering.
+    m = cardText.match(/End Date:\s*(?:[A-Za-z]{3,9},?\s*)?([A-Za-z]{3,9}\s+\d{1,2})/i);
+    if (m) {
+      const ts = new Date(`${m[1]} ${new Date().getFullYear()}`).getTime();
+      if (!Number.isNaN(ts) && Math.abs(ts - Date.now()) < 2 * 365 * 24 * 60 * 60 * 1000) return ts;
+    }
+
+    // "ends on Aug 26" / "ends Aug 26" - relative phrasing only ever used on
+    // an in-progress campaign, so a date that looks already-past must mean
+    // next year (Dec -> Jan wraparound).
     m = cardText.match(/ends?\s+(?:on\s+)?([A-Za-z]{3,9}\s+\d{1,2})/i);
     if (m) {
       const now = new Date();
@@ -307,7 +427,6 @@
       if (!Number.isNaN(candidate.getTime())) {
         let ts = candidate.getTime();
         if (ts < Date.now() - 24 * 60 * 60 * 1000) {
-          // already passed this year by more than a day -> must mean next year
           ts = new Date(`${m[1]} ${now.getFullYear() + 1}`).getTime();
         }
         if (!Number.isNaN(ts) && ts - Date.now() < 2 * 365 * 24 * 60 * 60 * 1000) return ts;
@@ -322,53 +441,80 @@
   // "not yet claimed" - wrongly marking a campaign complete would make the
   // extension abandon a game that still has drops left, which is worse than
   // watching a finished campaign a little longer.
-  function parseInventoryCampaigns(watchList) {
-    const rewardEls = [...document.querySelectorAll(
-      '[data-test-selector*="DropsCampaignInProgressRewardPresentation"]'
-    )];
-    if (rewardEls.length === 0) return [];
-
-    const cards = new Map();
-    for (const el of rewardEls) {
-      const card = closestCampaignCard(el);
-      if (!cards.has(card)) cards.set(card, []);
-      cards.get(card).push(el);
-    }
+  //
+  // gameIdMap: browser.storage.local's game.id -> game.name map, learned
+  // by background.js from real GQL traffic (see inject.js/background.js) -
+  // required now that no card shows a game name as text at all. A card
+  // whose boxart id isn't in the map yet is skipped, not guessed at - it
+  // picks itself back up the next scan once background.js has learned it.
+  function parseInventoryCampaigns(watchList, gameIdMap) {
+    const imgs = [...document.querySelectorAll(GAME_CARD_IMAGE_SELECTOR)];
+    if (imgs.length === 0) return [];
 
     const results = [];
-    for (const [card, rewards] of cards) {
-      const heading = card.querySelector("h1,h2,h3,h4,h5");
-      const name = (heading?.textContent || "").trim();
-      if (!name) continue;
+    for (const img of imgs) {
+      const gameId = extractGameIdFromBoxart(img);
+      const name = gameId && gameIdMap && gameIdMap[gameId];
+      if (!name) continue; // id not learned yet - fails closed, see comment above
 
       const slug = toSlug(name);
       if (!watchList.some((g) => g.slug === slug)) continue; // not a game we're tracking
 
+      const card = findCampaignCardBoundary(img);
       const cardText = card.innerText || "";
       const accountNotConnected = /connect.*account|link.*account|account not connected|เชื่อมต่อบัญชี/i.test(cardText);
-      const expired = /expired|this drop.*(no longer|unavailable)|หมดอายุ/i.test(cardText);
+      // real capture: current text is "This reward is no longer
+      // available." - the previous "this drop...no longer/unavailable"
+      // pattern required the literal word "drop" and never matched it
+      const expired = /expired|no longer available|unavailable|หมดอายุ/i.test(cardText);
 
+      const bars = [...card.querySelectorAll('[role="progressbar"]')];
       let claimed = 0;
-      for (const rewardEl of rewards) {
-        const bar = rewardEl.querySelector('[role="progressbar"]');
-        if (!bar) continue; // can't confirm -> don't count as claimed
-        const now = parseFloat(bar.getAttribute("aria-valuenow"));
-        const max = parseFloat(bar.getAttribute("aria-valuemax"));
-        if (!Number.isNaN(now) && !Number.isNaN(max) && max > 0 && now >= max) claimed++;
+      let timeRemainingMin = 0;
+      let foundDuration = false;
+      for (const bar of bars) {
+        const percent = extractTierPercent(bar);
+        if (percent == null) continue; // can't confirm -> doesn't count toward claimed or remaining time
+        if (percent >= 100) { claimed++; continue; }
+        const tierEl = bar.closest(".tw-tower") || bar.parentElement || bar;
+        const durationMin = extractTierDurationMin(tierEl);
+        if (durationMin != null) {
+          timeRemainingMin += Math.round((durationMin * (100 - percent)) / 100);
+          foundDuration = true;
+        }
       }
 
       results.push({
         slug,
         label: name,
         claimed,
-        total: rewards.length,
+        total: bars.length,
         accountNotConnected,
         expired,
         expiresAt: extractExpiresAt(cardText),
-        timeRemainingMin: extractRemainingMinutes(rewards),
+        timeRemainingMin: foundDuration ? timeRemainingMin : null,
       });
     }
-    return results;
+    return dedupeBySlugPreferringActive(results);
+  }
+
+  // A game can have more than one campaign card showing at once (e.g. an
+  // old one past its end date still listed alongside a new active one) -
+  // real capture caught exactly this for marvel-rivals. Since results are
+  // per-card but background.js's mergeInventoryProgress/isGameDone key
+  // everything by slug, multiple same-slug entries must be collapsed to
+  // one before leaving this file, or whichever entry happens to land last
+  // in DOM order silently wins - closing+reopening the watch tab for no
+  // reason if the active one loses, or permanently abandoning a still-live
+  // campaign if the expired one loses. A slug only counts as expired if
+  // every one of its cards is expired.
+  function dedupeBySlugPreferringActive(results) {
+    const bySlug = new Map();
+    for (const r of results) {
+      const existing = bySlug.get(r.slug);
+      if (!existing || (existing.expired && !r.expired)) bySlug.set(r.slug, r);
+    }
+    return [...bySlug.values()];
   }
 
   // =========================================================================
@@ -383,6 +529,7 @@
   let initialScanTimeoutId = null;
   let channelWatchIntervalId = null;
   let directoryIntervalId = null;
+  let searchResolveTimeoutId = null;
 
   function start() {
     if (running) return; // avoid stacking duplicate timers when toggled ON/OFF rapidly
@@ -410,17 +557,17 @@
       // ---- campaign progress for the auto-skip logic -------------------------
       const scanInventory = async () => {
         if (!enabled) return;
-        const cfg = await browser.storage.local.get("watchList");
+        const cfg = await browser.storage.local.get(["watchList", "gameIdMap"]);
         const watchList = cfg.watchList || [];
         if (watchList.length === 0) return;
-        const campaigns = parseInventoryCampaigns(watchList);
+        const campaigns = parseInventoryCampaigns(watchList, cfg.gameIdMap || {});
         if (campaigns.length > 0) {
           browser.runtime.sendMessage({ type: "inventoryProgress", campaigns }).catch(() => {});
         }
       };
-      // React renders async - wait for reward elements before the first read
+      // React renders async - wait for campaign cards before the first read
       waitFor(
-        () => document.querySelector('[data-test-selector*="DropsCampaignInProgressRewardPresentation"]') !== null,
+        () => document.querySelector(GAME_CARD_IMAGE_SELECTOR) !== null,
         15_000,
         () => !running
       ).then(() => {
@@ -448,9 +595,14 @@
 
         // Twitch redirected us away from /directory/category/<slug> -> bad slug
         if (!location.pathname.startsWith(`/directory/category/${expectedSlug}`)) {
-          log("directory redirected away from", expectedSlug, "- treating as invalid slug");
+          log("directory redirected away from", expectedSlug, "to", location.pathname, "- treating as invalid slug (retried automatically later)");
           clearInterval(directoryIntervalId);
-          browser.runtime.sendMessage({ type: "directoryInvalid", slug: expectedSlug }).catch(() => {});
+          browser.runtime.sendMessage({
+            type: "directoryInvalid",
+            slug: expectedSlug,
+            actualPathname: location.pathname,
+            actualHref: location.href,
+          }).catch(() => {});
           return;
         }
 
@@ -463,12 +615,49 @@
           return;
         }
 
+        // give the SPA a couple of ticks (~10s) to finish hydrating the
+        // category title/heading before trusting its absence - a slug this
+        // wrong never gets one at all, no matter how long we wait. Hand it
+        // to background.js to look up the real slug via Twitch's own search
+        // (see handleDirectoryUnknownCategory); it falls back to marking the
+        // slug invalid if search can't resolve it either.
+        if (attempts >= 2 && looksLikeUnknownCategory()) {
+          log("directory page for", expectedSlug, "never got a category title/heading - likely a wrong slug (e.g. a renamed game); asking background to resolve the real slug via search");
+          clearInterval(directoryIntervalId);
+          browser.runtime.sendMessage({
+            type: "directoryUnknownCategory",
+            slug: expectedSlug,
+            gameName: (wt.activeGame && (wt.activeGame.displayName || wt.activeGame.input)) || null,
+          }).catch(() => {});
+          return;
+        }
+
         // nobody live after ~2 minutes of retrying -> move on to the next game
         if (attempts >= 24) {
           log("directory empty, giving up on", expectedSlug);
           clearInterval(directoryIntervalId);
           browser.runtime.sendMessage({ type: "directoryEmpty", slug: expectedSlug }).catch(() => {});
           return;
+        }
+      }, 5_000);
+    }
+
+    // --- search results page: report the top "category" result so
+    // background.js can resolve a game name to Twitch's real directory slug
+    // (see handleDirectoryUnknownCategory -> searchUrl). The
+    // `a[data-a-target="search-result-category"]` link is a stable selector
+    // (not a styled-components hash) and its href carries the canonical slug,
+    // even for a game whose display name no longer matches its slug. Sent
+    // unconditionally - background ignores it unless it opened this tab to
+    // resolve a slug - so a user's own search costs one extra ignored message.
+    if (location.pathname === "/search") {
+      const term = new URLSearchParams(location.search).get("term");
+      searchResolveTimeoutId = setTimeout(() => {
+        if (!running || !term) return;
+        const a = document.querySelector('a[data-a-target="search-result-category"]');
+        const m = a && (a.getAttribute("href") || "").match(/\/directory\/category\/([^/?#]+)/);
+        if (m) {
+          browser.runtime.sendMessage({ type: "searchCategoryResult", term, slug: decodeURIComponent(m[1]) }).catch(() => {});
         }
       }, 5_000);
     }
@@ -490,6 +679,8 @@
 
         const expectedSlug = wt.activeGame && wt.activeGame.slug;
         const currentChannel = channelFromUrl(location.href);
+
+        reportChannelDomDebug(currentChannel || initialChannel);
 
         // raid/host: Twitch navigated this tab away from the channel we picked
         if (initialChannel && currentChannel && currentChannel !== initialChannel) {
@@ -527,9 +718,11 @@
     clearTimeout(initialScanTimeoutId);
     clearInterval(channelWatchIntervalId);
     clearInterval(directoryIntervalId);
+    clearTimeout(searchResolveTimeoutId);
     scanIntervalId = inventoryIntervalId = inventoryScanIntervalId =
       inventoryWaitTimeoutId = inventoryFirstScanTimeoutId =
-      initialScanTimeoutId = channelWatchIntervalId = directoryIntervalId = null;
+      initialScanTimeoutId = channelWatchIntervalId = directoryIntervalId =
+      searchResolveTimeoutId = null;
 
     log("stopped");
   }

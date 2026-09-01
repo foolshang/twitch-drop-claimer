@@ -110,6 +110,7 @@ function makeSandbox({ pathname }) {
       runtime: {
         sendMessage: () => Promise.resolve(),
         onMessage: { addListener: () => {} },
+        getManifest: () => ({ version: "0.0.0-test" }),
       },
       tabs: {
         create: () => { state.tabsCreate++; return Promise.resolve({ id: nextTabId++ }); },

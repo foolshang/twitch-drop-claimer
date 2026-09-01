@@ -259,7 +259,7 @@
     flex-direction: column;
     gap: 5px;
     margin-bottom: 10px;
-    max-height: 180px;
+    max-height: 300px;
     overflow-y: auto;
   }
   .game-status-empty {
@@ -293,9 +293,52 @@
   .game-status-row .g-badge.done { background: var(--ok); color: #0e0e10; }
   .game-status-row .g-badge.invalid { background: var(--err); color: #0e0e10; }
   .game-status-row .g-badge.warn { background: var(--warn); color: #0e0e10; }
+  .game-status-row .g-badge.open { background: var(--ok); color: #0e0e10; }
   .game-status-row .g-detail {
     color: var(--muted);
     margin-top: 2px;
+  }
+  .game-status-row .g-wait {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 5px;
+    color: var(--muted);
+    font-size: 11px;
+  }
+  .game-status-row .g-wait input[type="date"] {
+    background: var(--bg);
+    border: 1px solid #303036;
+    border-radius: 4px;
+    color: var(--text);
+    padding: 3px 5px;
+    font-size: 11px;
+    font-family: inherit;
+    color-scheme: dark;
+  }
+  .game-status-row .g-wait button.g-wait-clear {
+    width: auto;
+    background: none;
+    color: var(--muted);
+    border: 1px solid #303036;
+    padding: 2px 7px;
+    font-size: 11px;
+    font-weight: 400;
+  }
+  #campaignsCheck {
+    width: auto;
+    background: none;
+    color: var(--accent);
+    border: 1px solid #303036;
+    padding: 5px 10px;
+    font-size: 11.5px;
+    font-weight: 600;
+    margin-bottom: 8px;
+  }
+  #campaignsCheckStatus {
+    font-size: 11px;
+    color: var(--muted);
+    margin-bottom: 10px;
   }
 
   button {
@@ -362,7 +405,10 @@
   <h2>รายชื่อเกม (เรียงตามลำดับความสำคัญ บรรทัดละ 1 เกม)</h2>
   <textarea id="gamesList" placeholder="poe2&#10;diablo 4&#10;path of exile"></textarea>
   <div id="gamesPreview" class="hint"></div>
-  <div class="hint">แปลงเป็น URL ให้อัตโนมัติ (พิมพ์เล็ก เว้นวรรค→ขีด) ถ้าเกมไหนหาไม่เจอบน Twitch จะแจ้งเตือนด้านล่างหลังบันทึก</div>
+  <div class="hint">แปลงเป็น URL ให้อัตโนมัติ (พิมพ์เล็ก เว้นวรรค→ขีด) หลังบันทึก จะเช็คหน้า All Campaigns ของ Twitch ว่าเกมนั้นมี drop เปิดอยู่จริงไหม แล้วปรับชื่อให้ตรงกับ Twitch ให้เอง เกมที่ไม่มีแคมเปญตอนนี้ auto-watch จะข้ามไว้ก่อน (ตั้งวันเริ่มเองได้ในลิสต์ด้านล่าง)</div>
+
+  <button id="campaignsCheck" type="button">🔄 เช็ค All Campaigns ตอนนี้</button>
+  <div id="campaignsCheckStatus"></div>
 
   <div class="row">
     <span>เปิดใช้ Auto-watch (ไปดูให้เองอัตโนมัติ)</span>
@@ -383,7 +429,7 @@
       <option value="expiry">ใกล้หมดอายุก่อน</option>
     </select>
   </div>
-  <div class="hint">"ใกล้หมดอายุก่อน" ใช้ได้เฉพาะเกมที่อ่านวันหมดอายุจากหน้า inventory ได้ - เกมที่อ่านไม่ได้จะเรียงตามลำดับที่ใส่แทนโดยไม่เดา (จะมีแจ้งในลิสต์ด้านล่าง)</div>
+  <div class="hint">"ใกล้หมดอายุก่อน" ใช้วันหมดแคมเปญจาก Twitch (รู้เกือบทุกเกมที่มี drop เปิดอยู่) เกมที่ยังไม่รู้วันหมดจะเรียงตามลำดับที่ใส่แทนโดยไม่เดา</div>
 
   <div id="gameStatusList" class="game-status-list"></div>
   <div id="gameStatusEmpty" class="game-status-empty" hidden>ยังไม่มีข้อมูลความคืบหน้า (จะขึ้นหลังเปิด auto-watch และหน้า inventory โหลดข้อมูลได้)</div>
@@ -391,17 +437,24 @@
   <hr>
 
   <div class="autooff-row">
-    <span>ปิดอัตโนมัติถ้าไม่มี drop ให้เก็บนาน</span>
+    <span>ปิดสวิตช์อัตโนมัติเมื่อเก็บ drop ครบทุกเกมแล้ว</span>
     <label class="toggle">
       <input type="checkbox" id="autooff">
       <span class="slider"></span>
     </label>
   </div>
-  <div class="autooff-hours">
-    <input type="number" id="autooffHours" min="1" max="72" step="1">
-    <span>ชั่วโมง</span>
+  <div class="hint">พอทุกเกมในลิสต์เก็บครบ/หมดอายุ/ไม่มีแคมเปญแล้ว จะปิดสวิตช์หลักให้เอง (แท็บที่ดูอยู่ปิดเองต่อเกมอยู่แล้วไม่ว่าเปิดอันนี้หรือไม่) ค่าเริ่มต้นปิดไว้</div>
+
+  <hr>
+
+  <div class="row">
+    <span>Debug: log GQL operations ที่เห็นไปที่ console ของ background page</span>
+    <label class="toggle">
+      <input type="checkbox" id="debugGql">
+      <span class="slider"></span>
+    </label>
   </div>
-  <div class="hint">ค่าเริ่มต้นปิดฟีเจอร์นี้ไว้ ต้องเปิดเองถ้าต้องการ</div>
+  <div class="hint">เปิดแล้วดู log ได้ที่ about:debugging#/runtime/this-firefox → Inspect ที่ extension นี้ → แท็บ Console (ไม่ใช่ DevTools ของหน้า twitch.tv) มีผลทันทีไม่ต้องกดบันทึก</div>
 
   <button id="save">บันทึก</button>
   <div id="status"></div>
