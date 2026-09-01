@@ -19,18 +19,6 @@
     const msg = event.data;
     if (!msg || msg.type !== MSG_TYPE || !msg.payload) return;
 
-    const payload = msg.payload;
-    // inject.js's debug instrumentation (see its top-of-file comment) - kept
-    // as separate message types so background.js's normal signal handling
-    // doesn't have to branch on payload shape
-    if (payload.install) {
-      browser.runtime.sendMessage({ type: "gqlInstall", ...payload.install }).catch(() => {});
-    } else if (payload.opSeen) {
-      browser.runtime.sendMessage({ type: "gqlOpSeen", ...payload.opSeen }).catch(() => {});
-    } else if (payload.rawOp) {
-      browser.runtime.sendMessage({ type: "gqlRawOp", ...payload.rawOp }).catch(() => {});
-    } else {
-      browser.runtime.sendMessage({ type: "gqlDropSignal", ...payload }).catch(() => {});
-    }
+    browser.runtime.sendMessage({ type: "gqlDropSignal", ...msg.payload }).catch(() => {});
   });
 })();

@@ -78,7 +78,6 @@ const $gameStatusList = document.getElementById("gameStatusList");
 const $gameStatusEmpty = document.getElementById("gameStatusEmpty");
 
 const $autoOff = document.getElementById("autooff");
-const $debugGql = document.getElementById("debugGql");
 const $status = document.getElementById("status");
 
 function renderPower(enabled) {
@@ -297,7 +296,7 @@ async function renderGameStatus() {
 (async () => {
   const cfg = await browser.storage.local.get([
     "enabled", "watchListRaw", "autoWatchEnabled", "tabQuota", "priorityMode",
-    "autoOffEnabled", "debugGql",
+    "autoOffEnabled",
   ]);
 
   renderPower(cfg.enabled ?? true);
@@ -308,7 +307,6 @@ async function renderGameStatus() {
   $tabQuota.value = cfg.tabQuota || DEFAULT_TAB_QUOTA;
   $priorityMode.value = cfg.priorityMode === "expiry" ? "expiry" : "list-order";
   $autoOff.checked = cfg.autoOffEnabled ?? false;
-  $debugGql.checked = cfg.debugGql ?? false;
   renderGamesPreview();
   await renderGameStatus();
   // if the background has since resolved canonical Twitch names for the
@@ -316,11 +314,6 @@ async function renderGameStatus() {
   // fresh popup open, so do it once here too)
   await reconcileGamesTextarea();
 })();
-
-// debug toggle - like the master switch, takes effect immediately
-$debugGql.addEventListener("change", async () => {
-  await browser.storage.local.set({ debugGql: $debugGql.checked });
-});
 
 $gamesList.addEventListener("input", renderGamesPreview);
 

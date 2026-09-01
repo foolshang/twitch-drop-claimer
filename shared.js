@@ -3,12 +3,11 @@
  * popup) so game-name <-> slug conversion stays identical everywhere.
  */
 
-// bump this string on every meaningful edit to background.js during this
-// debug-instrumentation work, and say the expected value out loud when
-// asking for a fresh test - lets whoever's testing confirm from the
-// background console alone that Firefox is actually running this exact
-// source tree, not a stale reload/cached build/old .xpi.
-const BUILD_MARKER = "2026-09-01-r8";
+// bump this string on every meaningful source edit, and say the expected
+// value out loud when asking for a fresh test - lets whoever's testing
+// confirm from the background console alone that Firefox is actually running
+// this exact source tree, not a stale reload/cached build/old .xpi.
+const BUILD_MARKER = "2026-09-02-r1";
 
 const ALIASES = {
   // Path of Exile

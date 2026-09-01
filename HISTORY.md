@@ -891,3 +891,34 @@ listed channel via `npm run submit:listed` - lint clean (0/0/0), signed
 and auto-approved to `web-ext-artifacts/33d37586a96d443fa884-0.6.0.xpi`,
 recorded in `.amo-submitted-versions.json`. Firefox installs auto-update
 from the AMO listing.
+
+## 2026-09-02 — Released 0.6.1 (debug instrumentation stripped)
+
+0.6.0 shipped the GQL/DOM debugging layer that had accumulated across the
+August drop-verification work. It was gated off by default, but the popup
+still showed a "Debug: log GQL operations" toggle to end users, and
+`inject.js` posted an `opSeen` message per GraphQL operation (plus a
+one-shot `install` and `rawOp` dumps) on every twitch.tv page regardless of
+the flag - real overhead for no user benefit.
+
+Removed for 0.6.1:
+- `inject.js`: the `install` / `opSeen` / `rawOp` posts, `RAW_DUMP_OPS`,
+  `safeStringify`, `opSeq`. Only the signal `EXTRACTORS`
+  (`DropChannelCampaignsProgress`, `Inventory`, `SideNav`,
+  `ViewerDropsDashboard`) and the fetch/XHR hooks that feed them remain.
+- `gql-bridge.js`: collapsed to a single `gqlDropSignal` relay - the
+  `gqlInstall` / `gqlOpSeen` / `gqlRawOp` branches are gone.
+- `background.js`: `handleGqlInstall`, `handleGqlOpSeen`,
+  `handleChannelDomDebug`, `handleGqlRawOp`, `debugTag`, the `debugGql`
+  block at the top of `handleGqlDropSignal`, and the four message-dispatch
+  cases for them.
+- `content.js`: `reportChannelDomDebug()` and its call site in the
+  channel-watch interval.
+- `popup.html` / `popup.js`: the Debug toggle row and all `debugGql`
+  read/write/listener code.
+
+Kept: the unconditional `BUILD_MARKER` startup log (`background.js`, per the
+global "am I running the current code" rule) and the unconditional
+`[verify]` logging in `verifyDropStatus()` (normal operational visibility,
+never a diagnostic toggle). `BUILD_MARKER` bumped to `2026-09-02-r1`,
+`manifest.json` to 0.6.1. All six test files still pass unchanged.

@@ -65,76 +65,17 @@
  * it ever does fire, not as anything depended on.
  * DropsInventoryRewardGroupStatus, also real and fires there repeatedly,
  * has no game field at all (just per-reward-group claim status) - not
- * useful for the id->name mapping, still captured via RAW_DUMP_OPS below
- * purely for continued exploration (e.g. whether it ever carries a
- * currentMinutesWatched-style number that could one day be a faster
- * alternative to the DOM scrape).
- *
- * DEBUG INSTRUMENTATION: unconditionally posts `opSeen` (every operationName
- * seen, not just ones with an extractor) and a one-shot `install` event
- * (how early the fetch/XHR hooks went up, and page visibility at that
- * moment). Always sending these is intentional - gating in this page-world
- * script would need an async storage read that could itself lose the race
- * against the very first GQL call being observed. background.js is what
- * decides whether to print anything, gated on the `debugGql` storage flag.
+ * useful for the id->name mapping, so no extractor for it.
  */
 (() => {
   const GQL_URL = "https://gql.twitch.tv/gql";
   const MSG_TYPE = "__DROP_CLAIMER_GQL__";
-  const RAW_DUMP_OPS = new Set([
-    "DropsInventoryRewardGroupStatus",
-    // seen firing from a real channel watch tab (unlike
-    // DropsHighlightService_AvailableDrops, which never fires there at all)
-    // - under investigation as a possible faster, per-channel replacement
-    // for the /drops/inventory DOM scrape verifyDropStatus() currently uses
-    // in background.js, IF its payload turns out to carry per-channel
-    // progress. Not used for anything yet - this only captures the raw body
-    // so that can actually be checked instead of guessed.
-    "DropChannelCampaignsProgress",
-    // real op, confirmed firing once per /drops/inventory page load. Not
-    // used for live progress (once per load is too slow for that) but that's
-    // irrelevant for gameIdMap, which only ever needs a fresh id->name read
-    // once per reload cycle anyway - re-added here purely to capture its raw
-    // body and check whether it carries game.id alongside game.displayName
-    // (the pre-redesign extractor for this op only ever read displayName,
-    // never confirmed whether id was sitting right next to it). If so this
-    // is a strictly better gameIdMap source than DropChannelCampaignsProgress
-    // since it's confirmed to fire on the inventory page itself, not
-    // dependent on a channel tab's player UI being mounted.
-    "Inventory",
-  ]);
-  const RAW_DUMP_MAX_LEN = 8000; // keep individual postMessage/log lines sane
 
   function post(payload) {
     try {
       window.postMessage({ type: MSG_TYPE, payload }, window.location.origin);
     } catch { /* never let a messaging failure surface to the page */ }
   }
-
-  function safeStringify(obj) {
-    try {
-      const s = JSON.stringify(obj);
-      return s.length > RAW_DUMP_MAX_LEN ? s.slice(0, RAW_DUMP_MAX_LEN) + "...[truncated]" : s;
-    } catch {
-      return "[unstringifiable]";
-    }
-  }
-
-  // one-shot: how early the fetch/XHR hooks went up, and what the page
-  // looked like at that moment (visibility matters for "does Twitch even
-  // query drops in a hidden tab")
-  post({
-    install: {
-      at: Date.now(),
-      perfNowMs: Math.round(performance.now()),
-      readyState: document.readyState,
-      visibilityState: document.visibilityState,
-      hidden: document.hidden,
-      href: location.href,
-    },
-  });
-
-  let opSeq = 0;
 
   // ---- extractors: operationName -> (responseBody) => signal | null --------
   const EXTRACTORS = {
@@ -258,41 +199,6 @@
     responseEntries.forEach((resEntry, i) => {
       const reqEntry = requestEntries && requestEntries[i];
       const name = reqEntry && reqEntry.operationName;
-
-      // every operationName seen, matched or not - the only way to tell
-      // "this query never fires here" apart from "it fires but our extractor
-      // is wrong"
-      opSeq++;
-      post({
-        opSeen: {
-          operationName: name || null,
-          seq: opSeq,
-          at: Date.now(),
-          visibilityState: document.visibilityState,
-          hidden: document.hidden,
-        },
-      });
-
-      // full raw body for ops under active investigation (RAW_DUMP_OPS), or
-      // any response we couldn't pair with a named request at all -
-      // requestEntries === null means parsing the *request* body itself
-      // failed (not JSON, or not the array/object shape expected); name
-      // missing with requestEntries != null means that request entry simply
-      // has no operationName field. Both matter for figuring out why some
-      // ops show up as "(unnamed)".
-      if (!name || RAW_DUMP_OPS.has(name)) {
-        post({
-          rawOp: {
-            operationName: name || null,
-            seq: opSeq,
-            at: Date.now(),
-            requestParseFailed: requestEntries === null,
-            request: reqEntry ? safeStringify(reqEntry) : null,
-            response: safeStringify(resEntry),
-          },
-        });
-      }
-
       const extractor = name && EXTRACTORS[name];
       if (!extractor) return;
       const signal = extractor(resEntry);

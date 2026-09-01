@@ -151,6 +151,17 @@ Listed submissions also read license/category metadata from
 
 ## Changelog
 
+### 0.6.1
+
+- Removed the GQL/DOM debug instrumentation that shipped in 0.6.0: the
+  "Debug: log GQL operations" popup toggle and its `debugGql` flag, the
+  `[gql-debug]` / `[dom-debug]` logging in `background.js`, and the
+  unconditional per-operation `opSeen` / `install` / `rawOp` messages
+  `inject.js` posted on every Twitch page. The functional GraphQL
+  extractors (game id↔name↔slug, open-campaign snapshot) and the
+  unconditional `BUILD_MARKER` / `[verify]` operational logging are
+  unchanged.
+
 ### 0.6.0
 
 - **Open-campaign check.** Typing a game now resolves to Twitch's own game

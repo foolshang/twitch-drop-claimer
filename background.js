@@ -59,8 +59,8 @@
  *    other drops-related one tried so far - never fires at all in a
  *    background (active:false) tab; Twitch apparently only issues it from a
  *    mounted, visible player UI component. gql-bridge.js/inject.js are kept
- *    only for [gql-debug]/[dom-debug] exploration under the `debugGql`
- *    storage flag, not for anything verifyDropStatus currently relies on.
+ *    only for the id->name / id->slug / open-campaign snapshot extractors
+ *    (see inject.js), not for anything verifyDropStatus currently relies on.
  *
  * 4. Open-campaign snapshot: to tell whether a game the user added actually
  *    has a live drop campaign right now (and to resolve the typed name to
@@ -1000,127 +1000,8 @@ async function handleChannelLeft(slug) {
   log(slug, "- DOM check reported offline/redirected (informational only, does not reject the channel)");
 }
 
-// ============================================================================
-// debug instrumentation - see inject.js's top-of-file comment for what these
-// are for. All gated on the `debugGql` storage flag (off by default, toggled
-// from the popup) so normal operation never prints anything here; every
-// line goes to console.log, i.e. this background page's own console
-// (about:debugging -> This Firefox -> Inspect on the extension), not any
-// page's DevTools console.
-// ============================================================================
-function debugTag(tab, slug) {
-  return `tab=${tab ? tab.id : "?"} active=${tab ? tab.active : "?"} slug=${slug || "-"}`;
-}
-
-async function handleGqlInstall(msg, tab) {
-  const cfg = await browser.storage.local.get(["debugGql", "watchTabs"]);
-  if (!cfg.debugGql) return;
-  const watchTabs = cfg.watchTabs || {};
-  const slug = tab && Object.keys(watchTabs).find((s) => watchTabs[s] === tab.id);
-  log(
-    "[gql-debug] install",
-    new Date(msg.at).toISOString(),
-    debugTag(tab, slug),
-    `perfNow=${msg.perfNowMs}ms`,
-    `readyState=${msg.readyState}`,
-    `docHidden=${msg.hidden}`,
-    `visibility=${msg.visibilityState}`,
-    msg.href
-  );
-}
-
-async function handleGqlOpSeen(msg, tab) {
-  const cfg = await browser.storage.local.get(["debugGql", "watchTabs"]);
-  if (!cfg.debugGql) return;
-  const watchTabs = cfg.watchTabs || {};
-  const slug = tab && Object.keys(watchTabs).find((s) => watchTabs[s] === tab.id);
-  log(
-    "[gql-debug] op",
-    new Date(msg.at).toISOString(),
-    debugTag(tab, slug),
-    `seq=${msg.seq}`,
-    `docHidden=${msg.hidden}`,
-    `visibility=${msg.visibilityState}`,
-    `op=${msg.operationName || "(unnamed)"}`
-  );
-}
-
-// content.js's per-selector DOM snapshot from the channel watch-tab's own
-// looksLive()/looksOffline() checks (see content.js's reportChannelDomDebug)
-// - lets a stuck-on-an-offline-channel report be root-caused from what the
-// tab actually saw on its own next check, rather than needing someone to
-// manually catch a real offline channel and copy its DOM out by hand.
-async function handleChannelDomDebug(msg, tab) {
-  const cfg = await browser.storage.local.get(["debugGql", "watchTabs"]);
-  if (!cfg.debugGql) return;
-  const watchTabs = cfg.watchTabs || {};
-  const slug = tab && Object.keys(watchTabs).find((s) => watchTabs[s] === tab.id);
-  log(
-    "[dom-debug] channel",
-    new Date(msg.at).toISOString(),
-    debugTag(tab, slug),
-    `channel=${msg.channel}`,
-    `looksLive=${msg.looksLive}`,
-    `looksOffline=${msg.looksOffline}`,
-    `animatedViewers=${msg.hasAnimatedViewers}`,
-    `liveIndicatorClass=${msg.hasLiveIndicatorClass}`,
-    `channelRootLive=${msg.hasChannelRootLive}`,
-    `channelRootOffline=${msg.hasChannelRootOffline}`,
-    `contentGate=${msg.hasContentGate}`,
-    `offlineBannerClass=${msg.hasOfflineBannerClass}`,
-    `offlineCarousel=${msg.hasOfflineCarousel}`,
-    `title="${msg.title}"`,
-    "\n  bodyText:", msg.bodyTextSnippet
-  );
-}
-
-// raw request/response dump for operations inject.js's RAW_DUMP_OPS is
-// currently investigating (see its top-of-file comment) - DropChannelCampaignsProgress
-// (fires from a real channel watch tab - does it carry per-channel drop
-// progress?), DropsInventoryRewardGroupStatus (fires repeatedly on the
-// inventory page, unlike "Inventory", a real but only-once-per-load
-// operationName), and any op that came back with no operationName at all.
-// Neither of the two is wired into any decision yet - see the top-of-file
-// comment on why campaign-progress DOM-scrape stays the only thing
-// verifyDropStatus acts on. Gated on debugGql like the rest of
-// [gql-debug]; each line can be long (full JSON body).
-async function handleGqlRawOp(msg, tab) {
-  const cfg = await browser.storage.local.get(["debugGql", "watchTabs"]);
-  if (!cfg.debugGql) return;
-  const watchTabs = cfg.watchTabs || {};
-  const slug = tab && Object.keys(watchTabs).find((s) => watchTabs[s] === tab.id);
-  log(
-    "[gql-debug] rawOp",
-    new Date(msg.at).toISOString(),
-    debugTag(tab, slug),
-    `seq=${msg.seq}`,
-    `op=${msg.operationName || "(unnamed)"}`,
-    `requestParseFailed=${msg.requestParseFailed}`,
-    "\n  request:", msg.request,
-    "\n  response:", msg.response
-  );
-}
-
 async function handleGqlDropSignal(msg, tab) {
   if (!tab) return;
-
-  const dbgCfg = await browser.storage.local.get(["debugGql", "watchTabs"]);
-  if (dbgCfg.debugGql) {
-    const watchTabs = dbgCfg.watchTabs || {};
-    const slug = Object.keys(watchTabs).find((s) => watchTabs[s] === tab.id);
-    log(
-      "[gql-debug] signal",
-      new Date(msg.at).toISOString(),
-      debugTag(tab, slug),
-      `op=${msg.operationName}`,
-      `kind=${msg.signal.kind}`,
-      // openCampaigns carries the whole campaign list (100+ entries) - just
-      // its size here, the useful summary is logged in its own handler below
-      msg.signal.kind === "openCampaigns"
-        ? `games=${(msg.signal.games || []).length}`
-        : JSON.stringify(msg.signal)
-    );
-  }
 
   // openCampaigns is a full snapshot of every drop campaign Twitch currently
   // lists (from the transient /drops/campaigns tab, see refreshOpenCampaigns)
@@ -1334,20 +1215,8 @@ browser.runtime.onMessage.addListener((msg, sender) => {
     case "channelRedirected":
       return handleChannelLeft(msg.slug);
 
-    case "channelDomDebug":
-      return handleChannelDomDebug(msg, sender.tab);
-
     case "gqlDropSignal":
       return handleGqlDropSignal(msg, sender.tab);
-
-    case "gqlOpSeen":
-      return handleGqlOpSeen(msg, sender.tab);
-
-    case "gqlInstall":
-      return handleGqlInstall(msg, sender.tab);
-
-    case "gqlRawOp":
-      return handleGqlRawOp(msg, sender.tab);
 
     case "inventoryProgress":
       return mergeInventoryProgress(msg.campaigns);

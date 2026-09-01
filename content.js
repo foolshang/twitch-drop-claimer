@@ -142,21 +142,18 @@
     return document.title.trim() === "Twitch" && !document.querySelector("h1");
   }
 
-  // Real dom-debug capture (reportChannelDomDebug below) against a channel
-  // that actually went offline mid-session found: the animated-viewer-count
-  // check alone tracked live/offline correctly the whole time (true for a
-  // real live channel, false throughout the real offline one), while a
-  // second check that used to be here - a broad, unscoped
-  // `[class*='live-indicator']` match - stayed stuck `true` through the
-  // entire offline session, and the captured bodyText at the same moment
-  // showed only sidebar content (a Followed/Live Channels list), not
+  // Real DOM capture against a channel that actually went offline mid-session
+  // found: the animated-viewer-count check alone tracked live/offline
+  // correctly the whole time (true for a real live channel, false throughout
+  // the real offline one), while a second check that used to be here - a
+  // broad, unscoped `[class*='live-indicator']` match - stayed stuck `true`
+  // through the entire offline session, and the captured bodyText at the same
+  // moment showed only sidebar content (a Followed/Live Channels list), not
   // anything player-related - almost certainly matching some OTHER live
   // channel's badge in that sidebar list, not the one actually being
   // watched. Dropped rather than reintroduced scoped to a player container,
   // since there's no real DOM captured yet to build that scoped selector
-  // from - see HISTORY.md. hasLiveIndicatorClass is still captured in
-  // reportChannelDomDebug (diagnostic only, not part of this decision) in
-  // case that data is useful for building a scoped version later.
+  // from - see HISTORY.md.
   //
   // 2026-09-01: dumped the real channel-page DOM in both states over RDP
   // (warframe live vs ghazzytv offline). `.channel-root` - the single
@@ -183,37 +180,6 @@
     if (document.querySelector('[data-a-target="home-offline-carousel"], [data-test-selector="offline-recommendations"]')) return true;
     const txt = document.body.innerText || "";
     return /is offline|ออฟไลน์อยู่/i.test(txt.slice(0, 5000));
-  }
-
-  // gated on the same `debugGql` storage flag as [gql-debug] (a misnomer by
-  // now - it's become this project's general "verbose diagnostics" switch,
-  // reused here rather than adding a second toggle for the same purpose).
-  // Reports every individual selector looksLive()/looksOffline() check on
-  // its own, not just their combined true/false, so a stuck-on-an-offline-
-  // channel report can be root-caused from whatever the watch tab actually
-  // saw next time it happens, instead of needing someone to manually catch
-  // a real offline channel and copy its DOM out by hand.
-  async function reportChannelDomDebug(channel) {
-    try {
-      const cfg = await browser.storage.local.get("debugGql");
-      if (!cfg.debugGql) return;
-      browser.runtime.sendMessage({
-        type: "channelDomDebug",
-        channel,
-        at: Date.now(),
-        title: document.title,
-        looksLive: looksLive(),
-        looksOffline: looksOffline(),
-        hasAnimatedViewers: !!document.querySelector('[data-a-target="animated-channel-viewers-count"]'),
-        hasLiveIndicatorClass: !!document.querySelector(".tw-channel-status-text-indicator, [class*='live-indicator']"),
-        hasChannelRootLive: !!document.querySelector(".channel-root--live"),
-        hasChannelRootOffline: !!document.querySelector(".channel-root__player--offline, .channel-root__info--offline"),
-        hasContentGate: !!document.querySelector('[data-a-target="player-overlay-content-gate"]'),
-        hasOfflineBannerClass: !!document.querySelector(".channel-status-info--offline"),
-        hasOfflineCarousel: !!document.querySelector('[data-a-target="home-offline-carousel"], [data-test-selector="offline-recommendations"]'),
-        bodyTextSnippet: (document.body.innerText || "").slice(0, 300),
-      }).catch(() => {});
-    } catch { /* never let a diagnostic failure break the real offline check */ }
   }
 
   // ask background whether this tab is the one it's using for auto-watch, and
@@ -679,8 +645,6 @@
 
         const expectedSlug = wt.activeGame && wt.activeGame.slug;
         const currentChannel = channelFromUrl(location.href);
-
-        reportChannelDomDebug(currentChannel || initialChannel);
 
         // raid/host: Twitch navigated this tab away from the channel we picked
         if (initialChannel && currentChannel && currentChannel !== initialChannel) {
