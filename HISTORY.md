@@ -880,3 +880,14 @@ per-game detail and the mode hint were updated to match.
 
 New tests: `testAutoOffOnAllDone`, `testAutoOffRespectsReenableGrace`,
 `testExpiryPriorityUsesCampaignEndAt`. BUILD_MARKER -> `2026-09-01-r8`.
+
+## 2026-09-02 — Released 0.6.0
+
+`manifest.json` 0.6.0. `README.md` rewritten (open-campaign check,
+permanent slug resolution, completion-based auto-off, updated test list)
+with a Changelog section. Committed as `8fc06d4` on `master` (+ a
+`release/0.6.0` branch), pushed to GitHub. Submitted to the public AMO
+listed channel via `npm run submit:listed` - lint clean (0/0/0), signed
+and auto-approved to `web-ext-artifacts/33d37586a96d443fa884-0.6.0.xpi`,
+recorded in `.amo-submitted-versions.json`. Firefox installs auto-update
+from the AMO listing.
