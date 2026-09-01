@@ -922,3 +922,10 @@ global "am I running the current code" rule) and the unconditional
 `[verify]` logging in `verifyDropStatus()` (normal operational visibility,
 never a diagnostic toggle). `BUILD_MARKER` bumped to `2026-09-02-r1`,
 `manifest.json` to 0.6.1. All six test files still pass unchanged.
+
+Committed as `02fa4da` on `master`, pushed to GitHub. Submitted to the
+public AMO listed channel via `npm run submit:listed` - lint clean
+(0/0/0), signed and auto-approved to
+`web-ext-artifacts/33d37586a96d443fa884-0.6.1.xpi`, recorded in
+`.amo-submitted-versions.json`. Firefox installs auto-update from the AMO
+listing.
