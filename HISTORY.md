@@ -981,3 +981,10 @@ per release (0.6.1 → 0.6.2 → 0.6.3 …) unless told otherwise.
 AMO. New features are built on a `dev` branch (test locally with
 `npx web-ext run`), then merged to `master` with the version bump in the
 same merge, and only then submitted to AMO.
+
+Committed as `0f003dd` on `master`, pushed to GitHub. Submitted to the
+public AMO listed channel via `npm run submit:listed` - lint clean
+(0/0/0), signed and auto-approved to
+`web-ext-artifacts/33d37586a96d443fa884-0.6.2.xpi`, recorded in
+`.amo-submitted-versions.json`. Firefox installs auto-update from the AMO
+listing. Created the `dev` branch off this commit for the next feature.
