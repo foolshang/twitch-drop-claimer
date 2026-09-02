@@ -99,6 +99,7 @@ function makeSandbox() {
 async function setUpWatchingChannel(channelName) {
   const { ctx, storageData, tabsById, flush, violations } = makeSandbox();
   vm.runInContext(read("shared.js"), ctx);
+  vm.runInContext(read("i18n.js"), ctx);
   storageData.watchList = [{ input: "poe2", slug: "path-of-exile-2" }];
 
   vm.runInContext(read("background.js"), ctx);

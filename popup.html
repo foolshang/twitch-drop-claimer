@@ -94,6 +94,15 @@
     font-size: 11px;
     margin: 5px 0 12px;
   }
+  .lang-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  .lang-row label { margin-bottom: 0; }
+  .lang-row select { flex: none; }
   .row {
     display: flex;
     align-items: center;
@@ -365,6 +374,11 @@
 <body>
   <h1>Drop Auto-Claimer</h1>
 
+  <div class="lang-row">
+    <label for="uiLang" data-i18n="lang_label">Language</label>
+    <select id="uiLang"></select>
+  </div>
+
   <div class="power-panel">
     <div class="power-status off" id="powerStatus">
       <span class="dot"></span>
@@ -377,41 +391,39 @@
   </div>
 
   <div class="info-panel" id="infoPanel" hidden>
-    <div>กำลังดู: <b id="watchingChannel">-</b></div>
-    <div>เก็บล่าสุด: <b id="lastClaim">ยังไม่เก็บ</b></div>
+    <div><span data-i18n="label_watching">Watching:</span> <b id="watchingChannel">-</b></div>
+    <div><span data-i18n="label_last_claim">Last claim:</span> <b id="lastClaim"></b></div>
   </div>
-  <div class="hint" id="watchingChannelHint" hidden>* auto-watch เปิดได้หลายแท็บพร้อมกัน แต่ละแท็บ mute + ไม่แย่งโฟกัสหน้าจอ</div>
-  <div class="off-note" id="offNote" hidden>ปิดอยู่ - ไม่มีการสแกน/เก็บ drop ใดๆ</div>
-  <div class="all-done-banner" id="allDoneBanner" hidden>🎉 เก็บครบทุกเกมในลิสต์แล้ว ปิดแท็บที่เปิดไว้ให้แล้ว</div>
+  <div class="hint" id="watchingChannelHint" data-i18n="multi_tab_hint" hidden></div>
+  <div class="off-note" id="offNote" hidden></div>
+  <div class="all-done-banner" id="allDoneBanner" data-i18n="all_done_banner" hidden></div>
 
   <details class="sleep-warning" id="sleepWarning" hidden>
-    <summary>⚠️ เครื่อง sleep แล้วการดูจะหยุดชั่วคราว — ตั้งไม่ให้ sleep ตอนนี้</summary>
+    <summary data-i18n="sleep_summary"></summary>
     <div class="sleep-warning-body">
-      Firefox ไม่มีทางให้ extension กันเครื่อง sleep ได้ (ตรวจสอบแล้ว: ไม่มี
-      power API และ Screen Wake Lock API ก็ใช้กับแท็บ background ไม่ได้ - เจตนา
-      ของ browser เอง ไม่ใช่ข้อจำกัดของ extension นี้) ต้องตั้งที่ Windows เอง:
+      <span data-i18n="sleep_body_intro"></span>
       <ol>
-        <li>Settings → System → Power &amp; battery → Screen and sleep</li>
-        <li>ช่อง "When plugged in, put my device to sleep after" → เลือก <b>Never</b></li>
+        <li data-i18n="sleep_body_step1"></li>
+        <li data-i18n="sleep_body_step2"></li>
       </ol>
-      หรือใช้คำสั่งนี้ใน PowerShell (สิทธิ์ Admin):
+      <span data-i18n="sleep_body_cmd_label"></span>
       <code>powercfg /change standby-timeout-ac 0</code>
-      <div class="hint">อย่าลืมตั้งกลับหลังฟาร์มเสร็จ ถ้าไม่อยากให้เครื่องไม่ sleep ตลอดไป</div>
+      <div class="hint" data-i18n="sleep_body_note"></div>
     </div>
   </details>
 
   <hr>
 
-  <h2>รายชื่อเกม (เรียงตามลำดับความสำคัญ บรรทัดละ 1 เกม)</h2>
+  <h2 data-i18n="games_heading"></h2>
   <textarea id="gamesList" placeholder="poe2&#10;diablo 4&#10;path of exile"></textarea>
   <div id="gamesPreview" class="hint"></div>
-  <div class="hint">แปลงเป็น URL ให้อัตโนมัติ (พิมพ์เล็ก เว้นวรรค→ขีด) หลังบันทึก จะเช็คหน้า All Campaigns ของ Twitch ว่าเกมนั้นมี drop เปิดอยู่จริงไหม แล้วปรับชื่อให้ตรงกับ Twitch ให้เอง เกมที่ไม่มีแคมเปญตอนนี้ auto-watch จะข้ามไว้ก่อน (ตั้งวันเริ่มเองได้ในลิสต์ด้านล่าง)</div>
+  <div class="hint" data-i18n="games_hint"></div>
 
-  <button id="campaignsCheck" type="button">🔄 เช็ค All Campaigns ตอนนี้</button>
+  <button id="campaignsCheck" type="button" data-i18n="btn_check_campaigns"></button>
   <div id="campaignsCheckStatus"></div>
 
   <div class="row">
-    <span>เปิดใช้ Auto-watch (ไปดูให้เองอัตโนมัติ)</span>
+    <span data-i18n="enable_autowatch"></span>
     <label class="toggle">
       <input type="checkbox" id="autowatch">
       <span class="slider"></span>
@@ -419,37 +431,38 @@
   </div>
 
   <div class="autooff-row">
-    <span>ดูพร้อมกันสูงสุดกี่แท็บ</span>
+    <span data-i18n="tab_quota_label"></span>
     <input type="number" id="tabQuota" min="1" max="10" step="1" style="width:56px">
   </div>
   <div class="row">
-    <span>ลำดับเมื่อเกมเกินโควตาแท็บ</span>
+    <span data-i18n="priority_label"></span>
     <select id="priorityMode">
-      <option value="list-order">ตามลำดับที่ใส่</option>
-      <option value="expiry">ใกล้หมดอายุก่อน</option>
+      <option value="list-order" data-i18n="priority_list_order"></option>
+      <option value="expiry" data-i18n="priority_expiry"></option>
     </select>
   </div>
-  <div class="hint">"ใกล้หมดอายุก่อน" ใช้วันหมดแคมเปญจาก Twitch (รู้เกือบทุกเกมที่มี drop เปิดอยู่) เกมที่ยังไม่รู้วันหมดจะเรียงตามลำดับที่ใส่แทนโดยไม่เดา</div>
+  <div class="hint" data-i18n="priority_hint"></div>
 
   <div id="gameStatusList" class="game-status-list"></div>
-  <div id="gameStatusEmpty" class="game-status-empty" hidden>ยังไม่มีข้อมูลความคืบหน้า (จะขึ้นหลังเปิด auto-watch และหน้า inventory โหลดข้อมูลได้)</div>
+  <div id="gameStatusEmpty" class="game-status-empty" data-i18n="game_status_empty" hidden></div>
 
   <hr>
 
   <div class="autooff-row">
-    <span>ปิดสวิตช์อัตโนมัติเมื่อเก็บ drop ครบทุกเกมแล้ว</span>
+    <span data-i18n="autooff_label"></span>
     <label class="toggle">
       <input type="checkbox" id="autooff">
       <span class="slider"></span>
     </label>
   </div>
-  <div class="hint">พอทุกเกมในลิสต์เก็บครบ/หมดอายุ/ไม่มีแคมเปญแล้ว จะปิดสวิตช์หลักให้เอง (แท็บที่ดูอยู่ปิดเองต่อเกมอยู่แล้วไม่ว่าเปิดอันนี้หรือไม่) ค่าเริ่มต้นปิดไว้</div>
+  <div class="hint" data-i18n="autooff_hint"></div>
 
   <hr>
 
-  <button id="save">บันทึก</button>
+  <button id="save" data-i18n="btn_save"></button>
   <div id="status"></div>
 
+  <script src="i18n.js"></script>
   <script src="shared.js"></script>
   <script src="popup.js"></script>
 </body>

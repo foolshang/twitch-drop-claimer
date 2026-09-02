@@ -1,25 +1,32 @@
 /**
  * popup.js - main on/off switch + status, game watch-list, auto-watch,
- * tab quota / priority, auto-off settings.
- * toSlug/parseWatchList/channelFromUrl/directoryUrl come from shared.js.
+ * tab quota / priority, auto-off settings, UI language.
+ * toSlug/parseWatchList/channelFromUrl/directoryUrl come from shared.js;
+ * I18N_LANGS/i18nResolveLang/i18nT/i18nLocale/applyI18n come from i18n.js.
  */
 
 const DEFAULT_TAB_QUOTA = 3;
 
+// current UI language - resolved from storage `uiLang` / the browser locale on
+// load, updated by the language picker. Every user-facing string goes through
+// t() with this.
+let LANG = "en";
+const t = (key, params) => i18nT(LANG, key, params);
+
 function relativeTime(ts) {
   if (!ts) return null;
   const diffMin = Math.round((Date.now() - ts) / 60000);
-  if (diffMin < 1) return "just now";
-  if (diffMin < 60) return `${diffMin} min ago`;
+  if (diffMin < 1) return t("time_just_now");
+  if (diffMin < 60) return t("time_min_ago", { n: diffMin });
   const diffHr = Math.round(diffMin / 60);
-  if (diffHr < 24) return `${diffHr} h ago`;
-  return `${Math.round(diffHr / 24)} d ago`;
+  if (diffHr < 24) return t("time_hour_ago", { n: diffHr });
+  return t("time_day_ago", { n: Math.round(diffHr / 24) });
 }
 
 function formatDate(ts) {
   if (!ts) return null;
   const d = new Date(ts);
-  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  return d.toLocaleDateString(i18nLocale(LANG), { month: "short", day: "numeric" });
 }
 
 // <input type="date"> <-> epoch-ms (local midnight) conversions
@@ -79,21 +86,31 @@ const $gameStatusEmpty = document.getElementById("gameStatusEmpty");
 
 const $autoOff = document.getElementById("autooff");
 const $status = document.getElementById("status");
+const $uiLang = document.getElementById("uiLang");
+
+// re-render every string on the page for the current LANG: the static
+// [data-i18n] markup plus everything popup.js builds itself.
+function applyLanguage() {
+  document.documentElement.lang = i18nLocale(LANG);
+  applyI18n(document, LANG);
+  renderPower($power.checked);
+  renderInfo();
+  renderGamesPreview();
+  renderGameStatus();
+}
 
 function renderPower(enabled) {
   $power.checked = enabled;
   $powerStatus.classList.toggle("on", enabled);
   $powerStatus.classList.toggle("off", !enabled);
-  $powerStatusText.textContent = enabled ? "กำลังทำงาน" : "ปิดอยู่";
+  $powerStatusText.textContent = enabled ? t("status_on") : t("status_off");
   $infoPanel.hidden = !enabled;
   $offNote.hidden = enabled;
   if (!enabled) {
     browser.storage.local.get(["completedAllAt", "autoOffEnabled"]).then((cfg) => {
       const justCompleted = cfg.autoOffEnabled && cfg.completedAllAt
         && Date.now() - cfg.completedAllAt < 24 * 60 * 60 * 1000;
-      $offNote.textContent = justCompleted
-        ? "🎉 เก็บ drop ครบทุกเกมแล้ว - ปิดสวิตช์ให้อัตโนมัติ เปิดใหม่ได้เมื่อมีเกม/แคมเปญใหม่"
-        : "ปิดอยู่ - ไม่มีการสแกน/เก็บ drop ใดๆ";
+      $offNote.textContent = justCompleted ? t("off_note_completed") : t("off_note");
     });
   }
 }
@@ -101,7 +118,7 @@ function renderPower(enabled) {
 async function renderInfo() {
   const cfg = await browser.storage.local.get(["lastClaimAt", "lastClaimText"]);
   const rel = relativeTime(cfg.lastClaimAt);
-  $lastClaim.textContent = rel ? `${cfg.lastClaimText || "-"} (${rel})` : "ยังไม่เก็บ";
+  $lastClaim.textContent = rel ? `${cfg.lastClaimText || "-"} (${rel})` : t("not_claimed_yet");
 
   const channels = await findWatchingChannels();
   $watchingChannel.textContent = channels.length ? channels.join(", ") : "-";
@@ -141,7 +158,7 @@ function gameRowEl(game, index, isWatching, badge, detail, waitUntil) {
   if (canonical) {
     const alias = document.createElement("div");
     alias.className = "g-detail";
-    alias.textContent = `พิมพ์ไว้: "${game.input}"`;
+    alias.textContent = t("row_typed_as", { input: game.input });
     row.appendChild(alias);
   }
 
@@ -160,7 +177,7 @@ function gameRowEl(game, index, isWatching, badge, detail, waitUntil) {
     const waitLine = document.createElement("div");
     waitLine.className = "g-wait";
     const waitLabel = document.createElement("span");
-    waitLabel.textContent = "เริ่มดูตั้งแต่:";
+    waitLabel.textContent = t("row_start_from");
     const dateInput = document.createElement("input");
     dateInput.type = "date";
     dateInput.value = tsToDateInput(waitUntil);
@@ -173,7 +190,7 @@ function gameRowEl(game, index, isWatching, badge, detail, waitUntil) {
       const clearBtn = document.createElement("button");
       clearBtn.type = "button";
       clearBtn.className = "g-wait-clear";
-      clearBtn.textContent = "ล้าง";
+      clearBtn.textContent = t("row_clear");
       clearBtn.addEventListener("click", async () => {
         await setGameWaitUntil(game.slug, null);
       });
@@ -234,40 +251,44 @@ async function renderGameStatus() {
     const noOpenCampaign = ocFresh && !hasOpenCampaign;
 
     let badge = null;
-    let detail = "ยังไม่มีข้อมูลความคืบหน้า";
+    let detail = t("detail_no_progress");
 
     if (isWaiting) {
-      badge = badgeEl(`รอถึง ${formatDate(waitUntil)}`, "warn");
-      detail = `ตั้งไว้ให้เริ่ม auto-watch เกมนี้วันที่ ${formatDate(waitUntil)}`;
+      badge = badgeEl(t("badge_waiting_until", { date: formatDate(waitUntil) }), "warn");
+      detail = t("detail_waiting_until", { date: formatDate(waitUntil) });
     } else if (noOpenCampaign) {
-      badge = badgeEl("ไม่มีดรอปเปิดตอนนี้", "warn");
+      badge = badgeEl(t("badge_no_open_drop"), "warn");
       const endTxt = (campaign && campaign.endAt) || (ocEntry && ocEntry.endAt);
       detail = endTxt
-        ? `Twitch ไม่มี drop campaign เปิดให้เกมนี้ (แคมเปญล่าสุดหมด ${formatDate(endTxt)}) - auto-watch ข้ามไว้ก่อน ตั้งวันเริ่มเองได้ด้านล่าง`
-        : "Twitch ไม่มี drop campaign เปิดให้เกมนี้ตอนนี้ - auto-watch ข้ามไว้ก่อน ตั้งวันเริ่มเองได้ด้านล่าง";
+        ? t("detail_no_open_drop_end", { date: formatDate(endTxt) })
+        : t("detail_no_open_drop");
     } else if (invalid) {
-      badge = badgeEl("ไม่พบเกมนี้ (ชั่วคราว)", "invalid");
+      badge = badgeEl(t("badge_not_found"), "invalid");
       const retryMin = Math.max(0, Math.round(((invalidSlugs[game.slug] || 0) - Date.now()) / 60000));
-      detail = `หน้าหมวดหมู่ "${game.slug}" เพิ่งเด้งไปที่อื่น - จะลองใหม่อัตโนมัติใน ~${retryMin} นาที (ถ้าเจอบ่อยทั้งที่ชื่อเกมถูกอยู่แล้ว น่าจะเป็น bug ตอนตรวจ ไม่ใช่ชื่อผิดจริง แจ้งได้)`;
+      detail = t("detail_not_found", { slug: game.slug, min: retryMin });
     } else if (progress && progress.accountNotConnected) {
-      badge = badgeEl("ต้องเชื่อมบัญชี", "warn");
-      detail = "ไปที่หน้า inventory แล้วเชื่อมบัญชีเกมนี้ก่อน ถึงจะนับ drop ได้";
+      badge = badgeEl(t("badge_need_link"), "warn");
+      detail = t("detail_need_link");
     } else if (progress && progress.allComplete) {
-      badge = badgeEl("เก็บครบแล้ว", "done");
-      detail = `${progress.claimed}/${progress.total} ชิ้น`;
+      badge = badgeEl(t("badge_all_claimed"), "done");
+      detail = t("detail_pieces", { claimed: progress.claimed, total: progress.total });
     } else if (progress && progress.expired) {
-      badge = badgeEl("หมดอายุ", "done");
+      badge = badgeEl(t("badge_expired"), "done");
     } else {
       const parts = [];
-      if (progress && progress.total > 0) parts.push(`${progress.claimed}/${progress.total} ชิ้น`);
-      if (progress && progress.timeRemainingMin != null) parts.push(`เหลือดูอีก ~${progress.timeRemainingMin} นาที`);
+      if (progress && progress.total > 0) {
+        parts.push(t("detail_pieces", { claimed: progress.claimed, total: progress.total }));
+      }
+      if (progress && progress.timeRemainingMin != null) {
+        parts.push(t("detail_time_remaining", { n: progress.timeRemainingMin }));
+      }
       const campEnd = (campaign && campaign.endAt) || (ocEntry && ocEntry.endAt) ||
         (progress && typeof progress.expiresAt === "number" ? progress.expiresAt : null);
-      if (hasOpenCampaign && campEnd) parts.push(`ดรอปเปิดถึง ${formatDate(campEnd)}`);
+      if (hasOpenCampaign && campEnd) parts.push(t("detail_drop_open_until", { date: formatDate(campEnd) }));
       if (priorityMode === "expiry" && !campEnd) {
-        parts.push("ไม่รู้วันหมดอายุ (ใช้ลำดับที่ใส่แทน)");
+        parts.push(t("detail_no_expiry_known"));
       }
-      detail = parts.length ? parts.join(" · ") : "กำลังติดตามความคืบหน้า...";
+      detail = parts.length ? parts.join(" · ") : t("detail_tracking");
 
       // ViewerDropsDashboard's self.isAccountConnected can be stale - if the
       // /drops/inventory page is actually showing an in-progress drop card
@@ -275,29 +296,42 @@ async function renderGameStatus() {
       // contradict that with a "connect your account" warning
       const inventoryConfirmsLinked = progress && progress.total > 0;
       if (campaign && campaign.open && campaign.accountConnected === false && !inventoryConfirmsLinked) {
-        badge = badgeEl("ยังไม่เชื่อมบัญชีเกม", "warn");
-        detail += " · ต้องเชื่อมบัญชีเกมนี้กับ Twitch ก่อน ถึงจะนับ drop ได้";
+        badge = badgeEl(t("badge_account_not_linked"), "warn");
+        detail += t("detail_account_not_linked_suffix");
       } else if (hasOpenCampaign && !isWatching) {
-        badge = badgeEl("ดรอปเปิดอยู่", "open");
+        badge = badgeEl(t("badge_drop_open"), "open");
       }
     }
 
     if (!badge) {
-      if (isWatching) badge = badgeEl("กำลังดู");
-      else if (isCooling) badge = badgeEl("รอคิว (ไม่มีคนไลฟ์)", "warn");
-      else if (cfg.autoWatchEnabled) badge = badgeEl("รอคิว");
+      if (isWatching) badge = badgeEl(t("badge_watching"));
+      else if (isCooling) badge = badgeEl(t("badge_queued_no_live"), "warn");
+      else if (cfg.autoWatchEnabled) badge = badgeEl(t("badge_queued"));
     }
 
     $gameStatusList.appendChild(gameRowEl(game, i, isWatching, badge, detail, waitUntil));
   });
 }
 
+// populate the language picker once (each option labelled in its own script)
+for (const { code, label } of I18N_LANGS) {
+  const opt = document.createElement("option");
+  opt.value = code;
+  opt.textContent = label;
+  $uiLang.appendChild(opt);
+}
+
 // ---- load saved values ----
 (async () => {
   const cfg = await browser.storage.local.get([
     "enabled", "watchListRaw", "autoWatchEnabled", "tabQuota", "priorityMode",
-    "autoOffEnabled",
+    "autoOffEnabled", "uiLang",
   ]);
+
+  LANG = i18nResolveLang(cfg.uiLang, navigator.language);
+  $uiLang.value = LANG;
+  document.documentElement.lang = i18nLocale(LANG);
+  applyI18n(document, LANG);
 
   renderPower(cfg.enabled ?? true);
   await renderInfo();
@@ -316,6 +350,13 @@ async function renderGameStatus() {
 })();
 
 $gamesList.addEventListener("input", renderGamesPreview);
+
+// language picker - persist and re-render immediately (no "save" needed)
+$uiLang.addEventListener("change", async () => {
+  LANG = i18nResolveLang($uiLang.value, navigator.language);
+  await browser.storage.local.set({ uiLang: LANG });
+  applyLanguage();
+});
 
 // main switch - takes effect immediately, no need to press "save"
 $power.addEventListener("change", async () => {
@@ -342,6 +383,12 @@ async function reconcileGamesTextarea() {
 // the popup can stay open while things change in the background -> keep it live
 browser.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
+  if (changes.uiLang && changes.uiLang.newValue && changes.uiLang.newValue !== LANG) {
+    LANG = i18nResolveLang(changes.uiLang.newValue, navigator.language);
+    $uiLang.value = LANG;
+    applyLanguage();
+    return;
+  }
   if (changes.enabled) renderPower(changes.enabled.newValue ?? true);
   if (changes.lastClaimAt || changes.lastClaimText || changes.watchTabs) renderInfo();
   if (
@@ -357,19 +404,19 @@ browser.storage.onChanged.addListener((changes, area) => {
 
 $campaignsCheck.addEventListener("click", async () => {
   $campaignsCheck.disabled = true;
-  $campaignsCheckStatus.textContent = "กำลังเปิดหน้า All Campaigns เพื่อเช็ค...";
+  $campaignsCheckStatus.textContent = t("campaigns_checking");
   try {
     const res = await browser.runtime.sendMessage({ type: "refreshCampaigns" });
     if (res && res.ok) {
       $campaignsCheckStatus.textContent =
-        `เช็คแล้ว: มี drop เปิดอยู่ ${res.active} เกม (จากทั้งหมด ${res.total}) · เพิ่งอัปเดต`;
+        t("campaigns_checked", { active: res.active, total: res.total });
       await renderGameStatus();
       await reconcileGamesTextarea();
     } else {
-      $campaignsCheckStatus.textContent = "เช็คไม่สำเร็จ - เปิดหน้า twitch.tv/drops/campaigns เองแล้วลองใหม่";
+      $campaignsCheckStatus.textContent = t("campaigns_failed");
     }
   } catch (e) {
-    $campaignsCheckStatus.textContent = "เช็คไม่สำเร็จ: " + e;
+    $campaignsCheckStatus.textContent = t("campaigns_failed_err", { err: e });
   } finally {
     $campaignsCheck.disabled = false;
   }
@@ -390,6 +437,6 @@ document.getElementById("save").addEventListener("click", async () => {
     autoOffEnabled: $autoOff.checked,
   });
   await renderGameStatus();
-  $status.textContent = "บันทึกแล้ว ✓";
+  $status.textContent = t("saved");
   setTimeout(() => ($status.textContent = ""), 2000);
 });

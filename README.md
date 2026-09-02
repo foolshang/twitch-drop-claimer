@@ -71,6 +71,13 @@ off automatically once every game in the list is done (fully claimed /
 expired / no open campaign) — nothing left for it to do until you change
 the list.
 
+**Popup language.** The popup has a language picker (top of the panel)
+with nine languages — Thai, English, Simplified Chinese, Japanese, Korean,
+Russian, French, Portuguese, Traditional Chinese (Taiwan). The choice is
+stored in `browser.storage.local` (`uiLang`); when unset it follows the
+browser's own language, falling back to English. The toolbar tooltip is
+localized too.
+
 ## Known limitation: sleep prevention
 
 Firefox extensions have no working way to keep the machine awake while
@@ -112,9 +119,11 @@ tab-etiquette audit for every `tabs.create` / `tabs.update` call
 (`active: false` always, never `windows.update(focused: true)`); the
 open-campaign extractor and game-name matcher; skipping games with no open
 campaign and the manual wait-until date; wrong-slug resolution via search;
-the inventory campaign-progress parser against a real captured DOM; and the
+the inventory campaign-progress parser against a real captured DOM; the
 channel-page live/offline and unknown-category detection against real
-captured DOM.
+captured DOM; and the popup i18n string tables (key parity across all
+languages, locale resolution, and that every key referenced in
+`popup.html` / `popup.js` / `background.js` exists).
 
 ## AMO submission workflow
 
@@ -145,11 +154,21 @@ Listed submissions also read license/category metadata from
 | `gql-bridge.js` | `document_start` content script that injects `inject.js` and relays its signals to `background.js` |
 | `inject.js` | Page-world script that passively observes Twitch's GraphQL traffic — game id↔name↔slug, campaign progress, and the full open-campaign list (`ViewerDropsDashboard`) |
 | `shared.js` | Helpers shared between background and content scripts (slugs + aliases, channel/directory/search URL parsing, game-name → open-campaign matching) |
-| `popup.html` / `popup.js` | Settings UI: on/off switch, watch list with per-game campaign status and a "start from date" picker, auto-watch / tab quota / priority mode, completion-based auto-off, "check All Campaigns now", sleep warning |
+| `i18n.js` | Popup UI string tables (9 languages) + lookup/resolve/apply helpers; loaded in the popup and as a background script |
+| `popup.html` / `popup.js` | Settings UI: language picker, on/off switch, watch list with per-game campaign status and a "start from date" picker, auto-watch / tab quota / priority mode, completion-based auto-off, "check All Campaigns now", sleep warning |
 | `scripts/submit-amo.js` | AMO submission pipeline |
 | `test/` | Node-based tests against a stubbed `browser.*` API / jsdom |
 
 ## Changelog
+
+### 0.6.2
+
+- **Popup language switcher.** A language picker at the top of the popup
+  with nine languages (Thai, English, Simplified Chinese, Japanese,
+  Korean, Russian, French, Portuguese, Traditional Chinese / Taiwan). The
+  choice is stored as `uiLang`; unset follows the browser language and
+  falls back to English. All popup text and the toolbar tooltip are
+  localized. New `i18n.js` string tables + helpers, new `test/i18n.test.js`.
 
 ### 0.6.1
 

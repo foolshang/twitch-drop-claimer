@@ -107,6 +107,7 @@ function tabsForSlugs(watchTabs) {
 async function testQuotaFilling() {
   const { ctx, storageData, tabsById, flush } = makeSandbox();
   vm.runInContext(read("shared.js"), ctx);
+  vm.runInContext(read("i18n.js"), ctx);
 
   storageData.watchList = [
     { input: "poe2", slug: "path-of-exile-2" },
@@ -137,6 +138,7 @@ async function testQuotaFilling() {
 async function testIndependentCompletion() {
   const { ctx, storageData, tabsById, flush } = makeSandbox();
   vm.runInContext(read("shared.js"), ctx);
+  vm.runInContext(read("i18n.js"), ctx);
 
   storageData.watchList = [
     { input: "poe2", slug: "path-of-exile-2" },
@@ -168,6 +170,7 @@ async function testIndependentCompletion() {
 async function testAllDoneClosesEverything() {
   const { ctx, storageData, tabsById, flush } = makeSandbox();
   vm.runInContext(read("shared.js"), ctx);
+  vm.runInContext(read("i18n.js"), ctx);
 
   storageData.watchList = [
     { input: "poe2", slug: "path-of-exile-2" },
@@ -199,6 +202,7 @@ async function testAllDoneClosesEverything() {
 async function testAutoOffOnAllDone() {
   const { ctx, storageData, flush } = makeSandbox();
   vm.runInContext(read("shared.js"), ctx);
+  vm.runInContext(read("i18n.js"), ctx);
   storageData.autoOffEnabled = true;
   storageData.enabledSince = Date.now() - 60 * 60 * 1000; // an hour ago, past the re-enable grace window
   storageData.watchList = [{ input: "poe2", slug: "path-of-exile-2" }];
@@ -226,6 +230,7 @@ async function testAutoOffOnAllDone() {
 async function testExpiryPriorityUsesCampaignEndAt() {
   const { ctx, storageData, flush } = makeSandbox();
   vm.runInContext(read("shared.js"), ctx);
+  vm.runInContext(read("i18n.js"), ctx);
   storageData.priorityMode = "expiry";
   storageData.tabQuota = 1; // only the top-priority game gets watched
   const soon = Date.now() + 2 * 8.64e7;
@@ -250,6 +255,7 @@ async function testExpiryPriorityUsesCampaignEndAt() {
 async function testAutoOffRespectsReenableGrace() {
   const { ctx, storageData, flush } = makeSandbox();
   vm.runInContext(read("shared.js"), ctx);
+  vm.runInContext(read("i18n.js"), ctx);
   storageData.autoOffEnabled = true;
   storageData.enabledSince = Date.now(); // just re-enabled
   storageData.watchPhase = "all-done";
@@ -273,6 +279,7 @@ async function testAutoOffRespectsReenableGrace() {
 async function testInvalidSlugRetriesAfterCooldown() {
   const { ctx, storageData, tabsById, flush } = makeSandbox();
   vm.runInContext(read("shared.js"), ctx);
+  vm.runInContext(read("i18n.js"), ctx);
   storageData.watchList = [{ input: "poe2", slug: "path-of-exile-2" }];
 
   vm.runInContext(read("background.js"), ctx);
@@ -311,6 +318,7 @@ function freshOpenCampaigns(bySlug) {
 async function testSkipsGameWithNoOpenCampaign() {
   const { ctx, storageData, flush } = makeSandbox();
   vm.runInContext(read("shared.js"), ctx);
+  vm.runInContext(read("i18n.js"), ctx);
 
   storageData.watchList = [
     { input: "marvel rivals", slug: "marvel-rivals" },
@@ -345,6 +353,7 @@ async function testSkipsGameWithNoOpenCampaign() {
 async function testWaitUntilDateGatesAutoWatch() {
   const { ctx, storageData, flush } = makeSandbox();
   vm.runInContext(read("shared.js"), ctx);
+  vm.runInContext(read("i18n.js"), ctx);
 
   storageData.watchList = [{ input: "path of exile 2", slug: "path-of-exile-2" }];
   storageData.openCampaigns = freshOpenCampaigns({
@@ -373,6 +382,7 @@ async function testWaitUntilDateGatesAutoWatch() {
 async function testUnknownCategorySlugResolvedViaSearch() {
   const { ctx, storageData, tabsById, flush } = makeSandbox();
   vm.runInContext(read("shared.js"), ctx);
+  vm.runInContext(read("i18n.js"), ctx);
 
   storageData.watchList = [{ input: "Rainbow Six Siege", slug: "rainbow-six-siege", gameId: "460630", campaign: { open: true } }];
   storageData.openCampaigns = freshOpenCampaigns({
@@ -416,6 +426,7 @@ async function testUnknownCategorySlugResolvedViaSearch() {
 async function testUnknownCategoryFallsBackToInvalidWhenSearchFails() {
   const { ctx, storageData, flush } = makeSandbox();
   vm.runInContext(read("shared.js"), ctx);
+  vm.runInContext(read("i18n.js"), ctx);
   storageData.watchList = [{ input: "Nonexistent Game", slug: "nonexistent-game", campaign: { open: true } }];
   storageData.openCampaigns = freshOpenCampaigns({
     "nonexistent-game": { slug: "nonexistent-game", displayName: "Nonexistent Game", gameId: "0", active: true, endAt: Date.now() + 8.64e7 },
@@ -448,6 +459,7 @@ async function testUnknownCategoryFallsBackToInvalidWhenSearchFails() {
 async function testGqlActiveOverridesDomExpiredFalsePositive() {
   const { ctx, storageData, tabsById, flush } = makeSandbox();
   vm.runInContext(read("shared.js"), ctx);
+  vm.runInContext(read("i18n.js"), ctx);
   storageData.watchList = [{ input: "marvel rivals", slug: "marvel-rivals" }];
   storageData.gameIdMap = { "1264310518": "Marvel Rivals" };
   storageData.gameActiveIds = { "1264310518": true };
@@ -473,6 +485,7 @@ async function testGqlActiveOverridesDomExpiredFalsePositive() {
 async function testNoTabViolations() {
   const { ctx, storageData, flush, violations } = makeSandbox();
   vm.runInContext(read("shared.js"), ctx);
+  vm.runInContext(read("i18n.js"), ctx);
   storageData.watchList = [
     { input: "poe2", slug: "path-of-exile-2" },
     { input: "diablo 4", slug: "diablo-iv" },

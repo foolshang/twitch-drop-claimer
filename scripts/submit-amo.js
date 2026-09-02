@@ -36,6 +36,7 @@ const { spawnSync, spawn } = require("child_process");
 const ROOT = path.join(__dirname, "..");
 const EXTENSION_FILES = [
   "manifest.json",
+  "i18n.js",
   "shared.js",
   "background.js",
   "content.js",

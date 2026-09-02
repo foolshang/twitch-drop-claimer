@@ -150,6 +150,7 @@ function makeSandbox({ pathname }) {
 async function testContentLeak(pathname) {
   const { ctx, state, setEnabled, flush } = makeSandbox({ pathname });
   vm.runInContext(read("shared.js"), ctx);
+  vm.runInContext(read("i18n.js"), ctx);
   vm.runInContext('browser.storage.local.set({ enabled: true });', ctx);
   vm.runInContext(read("content.js"), ctx);
 
@@ -177,6 +178,7 @@ async function testContentLeak(pathname) {
 async function testBackgroundNoActivityAfterOff() {
   const { ctx, state, setEnabled, flush } = makeSandbox({ pathname: "/" });
   vm.runInContext(read("shared.js"), ctx);
+  vm.runInContext(read("i18n.js"), ctx);
   vm.runInContext('browser.storage.local.set({ enabled: true });', ctx);
   vm.runInContext(read("background.js"), ctx);
 
@@ -210,6 +212,7 @@ async function testFreshLoadRespectsStoredDisabled() {
   // a fresh page load where storage already says enabled:false must never start()
   const { ctx, state, flush } = makeSandbox({ pathname: "/drops/inventory" });
   vm.runInContext(read("shared.js"), ctx);
+  vm.runInContext(read("i18n.js"), ctx);
   vm.runInContext('browser.storage.local.set({ enabled: false });', ctx);
   vm.runInContext(read("content.js"), ctx);
 

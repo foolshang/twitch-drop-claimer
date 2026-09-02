@@ -929,3 +929,55 @@ public AMO listed channel via `npm run submit:listed` - lint clean
 `web-ext-artifacts/33d37586a96d443fa884-0.6.1.xpi`, recorded in
 `.amo-submitted-versions.json`. Firefox installs auto-update from the AMO
 listing.
+
+## 2026-09-02 — Popup UI language switcher (0.6.2)
+
+**Feature (requested):** the popup was Thai-only. Added a language picker
+at the top of the popup with nine languages: Thai, English, Simplified
+Chinese, Japanese, Korean, Russian, French, Portuguese, Traditional
+Chinese (Taiwan).
+
+**How it works:**
+- New `i18n.js` (loaded first in the popup and as a background script,
+  same slot as `shared.js`) holds one flat string table per language plus
+  four helpers: `i18nResolveLang(stored, navLang)`, `i18nT(lang, key,
+  params)` (`{name}` interpolation, falls back English → raw key so a
+  missing string is never blank), `i18nLocale(lang)` (BCP-47 tag for
+  `toLocaleDateString`), and `applyI18n(root, lang)` (walks `[data-i18n]`
+  / `[data-i18n-placeholder]` — text/placeholder only, never `innerHTML`,
+  so lint stays at 0 warnings).
+- The choice is stored as `browser.storage.local.uiLang`. When unset,
+  `i18nResolveLang` maps the browser's own language (`navigator.language`),
+  falling back to English; `zh-*` splits Traditional/HK/Macao → `zh-TW`,
+  everything else `zh` → `zh-CN`.
+- `popup.html` static text became `data-i18n` keys; `popup.js`'s
+  dynamically built strings (relative times, per-game badges/details,
+  campaign-check status, save confirmation) go through a local
+  `t(key, params)` bound to the current `LANG`. The picker persists and
+  re-renders live (no "save"); a `storage.onChanged` reaction keeps a
+  second open popup in sync.
+- `background.js`'s `refreshBadge()` now localizes the three toolbar
+  tooltip strings (`tt_off` / `tt_all_done` / `tt_running`) from `uiLang`,
+  and re-runs on a `uiLang` change. `navigator` is accessed defensively
+  (`typeof navigator !== "undefined"`) so the vm-based tests don't need a
+  stub.
+
+**Tests:** new `test/i18n.test.js` — key parity across all nine languages
+(same key set as `en`, no empty values, matching `{placeholder}` tokens),
+`i18nResolveLang` mapping (stored choice > browser locale > English,
+including the `zh` Simplified/Traditional split), `i18nT` interpolation
+and fallback, and a static check that every `data-i18n` key in
+`popup.html` and every `t(...)`/`i18nT(...)` key literal in `popup.js` /
+`background.js` exists in `en`. The three vm-based suites
+(`toggle-behavior`, `auto-watch-multi-tab`, `drop-verification`) now load
+`i18n.js` into the sandbox alongside `shared.js`. All seven test files
+pass; `web-ext lint` clean (0/0/0). `BUILD_MARKER` → `2026-09-02-r2`,
+`manifest.json` → 0.6.2.
+
+**Versioning going forward:** bump the patch component by exactly 0.0.1
+per release (0.6.1 → 0.6.2 → 0.6.3 …) unless told otherwise.
+
+**Dev workflow going forward:** `master` always mirrors what's live on
+AMO. New features are built on a `dev` branch (test locally with
+`npx web-ext run`), then merged to `master` with the version bump in the
+same merge, and only then submitted to AMO.

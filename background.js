@@ -173,26 +173,28 @@ function serialized(fn) {
 // badge
 // ============================================================================
 async function refreshBadge() {
-  const cfg = await browser.storage.local.get(["enabled", "watchPhase"]);
+  const cfg = await browser.storage.local.get(["enabled", "watchPhase", "uiLang"]);
   const enabled = cfg.enabled ?? true;
+  const navLang = typeof navigator !== "undefined" ? navigator.language : "";
+  const lang = i18nResolveLang(cfg.uiLang, navLang);
 
   if (!enabled) {
     browser.browserAction.setBadgeText({ text: "OFF" });
     browser.browserAction.setBadgeBackgroundColor({ color: "#6d6d75" });
-    browser.browserAction.setTitle({ title: "Twitch Drop Auto-Claimer (off)" });
+    browser.browserAction.setTitle({ title: i18nT(lang, "tt_off") });
     return;
   }
 
   if (cfg.watchPhase === "all-done") {
     browser.browserAction.setBadgeText({ text: "✓" });
     browser.browserAction.setBadgeBackgroundColor({ color: "#00f593" });
-    browser.browserAction.setTitle({ title: "Twitch Drop Auto-Claimer (all drops collected)" });
+    browser.browserAction.setTitle({ title: i18nT(lang, "tt_all_done") });
     return;
   }
 
   browser.browserAction.setBadgeText({ text: "" });
   browser.browserAction.setBadgeBackgroundColor({ color: "#00f593" });
-  browser.browserAction.setTitle({ title: "Twitch Drop Auto-Claimer (running)" });
+  browser.browserAction.setTitle({ title: i18nT(lang, "tt_running") });
 }
 
 // ============================================================================
@@ -1293,6 +1295,11 @@ browser.storage.onChanged.addListener(async (changes, area) => {
 
   if (changes.tabQuota || changes.priorityMode) {
     await serialized(autoWatchTick);
+  }
+
+  // popup's language picker writes uiLang - the toolbar tooltip is localized
+  if (changes.uiLang) {
+    await refreshBadge();
   }
 
   // popup's per-game "start watching from <date>" picker writes gameWaitUntil
