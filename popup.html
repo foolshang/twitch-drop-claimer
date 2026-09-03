@@ -310,21 +310,25 @@
   .game-status-row .g-wait {
     display: flex;
     align-items: center;
-    gap: 6px;
+    flex-wrap: wrap;
+    gap: 4px 5px;
     margin-top: 5px;
     color: var(--muted);
     font-size: 11px;
   }
-  .game-status-row .g-wait input[type="date"] {
+  /* built from plain <select>s, not <input type="date">: Firefox mispositions
+     / hides the native date-picker panel inside a browserAction popup */
+  .game-status-row .g-wait select {
     background: var(--bg);
     border: 1px solid #303036;
     border-radius: 4px;
     color: var(--text);
-    padding: 3px 5px;
+    padding: 3px 4px;
     font-size: 11px;
     font-family: inherit;
     color-scheme: dark;
   }
+  .game-status-row .g-wait .g-wait-sep { color: var(--off); }
   .game-status-row .g-wait button.g-wait-clear {
     width: auto;
     background: none;

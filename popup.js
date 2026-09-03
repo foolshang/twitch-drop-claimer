@@ -29,18 +29,18 @@ function formatDate(ts) {
   return d.toLocaleDateString(i18nLocale(LANG), { month: "short", day: "numeric" });
 }
 
-// <input type="date"> <-> epoch-ms (local midnight) conversions
-function tsToDateInput(ts) {
-  if (!ts) return "";
+// like formatDate but also shows HH:MM when the timestamp isn't local midnight
+// (the per-game "watch from" picker now carries a time of day, not just a date)
+function formatDateTime(ts) {
+  if (!ts) return null;
   const d = new Date(ts);
-  if (Number.isNaN(d.getTime())) return "";
-  const p = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
-}
-function dateInputToTs(value) {
-  if (!value) return null;
-  const d = new Date(`${value}T00:00:00`);
-  return Number.isNaN(d.getTime()) ? null : d.getTime();
+  if (Number.isNaN(d.getTime())) return null;
+  const opts = { month: "short", day: "numeric" };
+  if (d.getHours() !== 0 || d.getMinutes() !== 0) {
+    opts.hour = "2-digit";
+    opts.minute = "2-digit";
+  }
+  return d.toLocaleString(i18nLocale(LANG), opts);
 }
 
 async function setGameWaitUntil(slug, ts) {
@@ -167,39 +167,99 @@ function gameRowEl(game, index, isWatching, badge, detail, waitUntil) {
   detailLine.textContent = detail;
   row.appendChild(detailLine);
 
-  // manual "don't start auto-watch before this date" - useful for a game
-  // whose next drop campaign is announced but not open yet (Twitch's
-  // dashboard only lists campaigns that have already started), or just to
-  // delay a game you don't want farmed yet. Always available; the list is
-  // tall enough (300px) that a few rows don't need scrolling and Firefox's
-  // native date popup isn't clipped by the container.
-  {
-    const waitLine = document.createElement("div");
-    waitLine.className = "g-wait";
-    const waitLabel = document.createElement("span");
-    waitLabel.textContent = t("row_start_from");
-    const dateInput = document.createElement("input");
-    dateInput.type = "date";
-    dateInput.value = tsToDateInput(waitUntil);
-    dateInput.addEventListener("change", async () => {
-      await setGameWaitUntil(game.slug, dateInputToTs(dateInput.value));
-    });
-    waitLine.appendChild(waitLabel);
-    waitLine.appendChild(dateInput);
-    if (waitUntil) {
-      const clearBtn = document.createElement("button");
-      clearBtn.type = "button";
-      clearBtn.className = "g-wait-clear";
-      clearBtn.textContent = t("row_clear");
-      clearBtn.addEventListener("click", async () => {
-        await setGameWaitUntil(game.slug, null);
-      });
-      waitLine.appendChild(clearBtn);
-    }
-    row.appendChild(waitLine);
-  }
+  // manual "don't start auto-watch before this date/time" - useful for a game
+  // whose next drop campaign is announced but not open yet (Twitch's dashboard
+  // only lists campaigns that have already started, but the drop's release
+  // time is usually known), or just to delay a game you don't want farmed yet.
+  row.appendChild(waitControlEl(game, waitUntil));
 
   return row;
+}
+
+// The "watch from" picker. Firefox mispositions / hides the native
+// <input type="date"> calendar panel inside a browserAction popup (it opens
+// behind the popup), so this is built from plain <select>s, which do work in a
+// popup - and it carries a time of day too, so auto-watch can start right when
+// a drop is released rather than at midnight.
+function waitControlEl(game, waitUntil) {
+  const wrap = document.createElement("div");
+  wrap.className = "g-wait";
+  wrap.setAttribute("role", "group");
+  wrap.setAttribute("aria-label", t("row_wait_aria"));
+
+  const label = document.createElement("span");
+  label.textContent = t("row_start_from");
+  wrap.appendChild(label);
+
+  const d = waitUntil ? new Date(waitUntil) : null;
+  const pad = (n) => String(n).padStart(2, "0");
+  const nowYear = new Date().getFullYear();
+
+  const mkSelect = (placeholder, options, selected) => {
+    const sel = document.createElement("select");
+    const ph = document.createElement("option");
+    ph.value = "";
+    ph.textContent = placeholder;
+    sel.appendChild(ph);
+    for (const [value, text] of options) {
+      const o = document.createElement("option");
+      o.value = String(value);
+      o.textContent = text;
+      if (selected != null && String(value) === String(selected)) o.selected = true;
+      sel.appendChild(o);
+    }
+    return sel;
+  };
+  const range = (n, start, fmt) =>
+    Array.from({ length: n }, (_, i) => [i + start, fmt(i + start)]);
+
+  const yearSel = mkSelect("YYYY", range(4, nowYear - 1, (y) => y), d ? d.getFullYear() : null);
+  const monthSel = mkSelect("MM", range(12, 1, pad), d ? d.getMonth() + 1 : null);
+  const daySel = mkSelect("DD", range(31, 1, pad), d ? d.getDate() : null);
+  const hourSel = mkSelect("HH", range(24, 0, pad), d ? d.getHours() : null);
+  const minSel = mkSelect("mm", Array.from({ length: 12 }, (_, i) => [i * 5, pad(i * 5)]),
+    d ? Math.round(d.getMinutes() / 5) * 5 % 60 : null);
+
+  const sep = (txt) => {
+    const s = document.createElement("span");
+    s.className = "g-wait-sep";
+    s.textContent = txt;
+    return s;
+  };
+  wrap.append(yearSel, sep("-"), monthSel, sep("-"), daySel, hourSel, sep(":"), minSel);
+
+  const commit = async () => {
+    const y = yearSel.value, mo = monthSel.value, da = daySel.value;
+    if (!y || !mo || !da) {
+      // an incomplete date means "no gate" - clear any stored one
+      if (waitUntil) await setGameWaitUntil(game.slug, null);
+      return;
+    }
+    const h = hourSel.value ? Number(hourSel.value) : 0;
+    const mi = minSel.value ? Number(minSel.value) : 0;
+    // clamp the day to the chosen month (e.g. 31 -> 30 / 28) instead of the
+    // Date constructor silently rolling over into the next month
+    const maxDay = new Date(Number(y), Number(mo), 0).getDate();
+    const day = Math.min(Number(da), maxDay);
+    const ts = new Date(Number(y), Number(mo) - 1, day, h, mi, 0, 0).getTime();
+    if (!Number.isNaN(ts)) await setGameWaitUntil(game.slug, ts);
+  };
+  for (const sel of [yearSel, monthSel, daySel, hourSel, minSel]) {
+    sel.addEventListener("change", commit);
+  }
+
+  if (waitUntil) {
+    const clearBtn = document.createElement("button");
+    clearBtn.type = "button";
+    clearBtn.className = "g-wait-clear";
+    clearBtn.textContent = t("row_clear");
+    clearBtn.addEventListener("click", async () => {
+      await setGameWaitUntil(game.slug, null);
+    });
+    wrap.appendChild(clearBtn);
+  }
+
+  return wrap;
 }
 
 async function renderGameStatus() {
@@ -254,8 +314,8 @@ async function renderGameStatus() {
     let detail = t("detail_no_progress");
 
     if (isWaiting) {
-      badge = badgeEl(t("badge_waiting_until", { date: formatDate(waitUntil) }), "warn");
-      detail = t("detail_waiting_until", { date: formatDate(waitUntil) });
+      badge = badgeEl(t("badge_waiting_until", { date: formatDateTime(waitUntil) }), "warn");
+      detail = t("detail_waiting_until", { date: formatDateTime(waitUntil) });
     } else if (noOpenCampaign) {
       badge = badgeEl(t("badge_no_open_drop"), "warn");
       const endTxt = (campaign && campaign.endAt) || (ocEntry && ocEntry.endAt);

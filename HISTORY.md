@@ -988,3 +988,47 @@ public AMO listed channel via `npm run submit:listed` - lint clean
 `web-ext-artifacts/33d37586a96d443fa884-0.6.2.xpi`, recorded in
 `.amo-submitted-versions.json`. Firefox installs auto-update from the AMO
 listing. Created the `dev` branch off this commit for the next feature.
+
+## 2026-09-03 — Per-game "watch from" picker: popup-safe + a time of day (0.6.3)
+
+**Problem (reported):** the per-game "watch from" date picker
+(`<input type="date">`, added in 0.6.0) opened its calendar panel *behind*
+the popup and couldn't be used. This is a long-standing Firefox platform
+bug - the native date/time picker panel is mispositioned / hidden when the
+input lives inside a `browser_action` popup ([bug 1644337],
+[Mozilla Discourse]), not something the extension can fix from CSS or
+z-index. The same request also asked for a start *time*, not just a date,
+so auto-watch can begin a game the moment its drop is released instead of
+at local midnight.
+
+[bug 1644337]: https://bugzilla.mozilla.org/show_bug.cgi?id=1644337
+[Mozilla Discourse]: https://discourse.mozilla.org/t/webextensions-date-input-element-in-browser-action-does-not-work-in-desktop/27114
+
+**Fix:** replaced the single `<input type="date">` with five plain
+`<select>` dropdowns (year / month / day / hour / minute) built by a new
+`waitControlEl(game, waitUntil)` in `popup.js`. Native `<select>` popups
+render fine in a `browser_action` popup (the language and priority pickers
+already prove that) and aren't clipped by the `overflow-y: auto` game
+list. Details:
+- Year offers last year … this year + 2. Minute is 5-minute steps.
+- An incomplete date (year/month/day not all set) means "no gate" and
+  clears any stored timestamp; hour/minute default to `00:00`.
+- The chosen day is clamped to the selected month (`31` → `30` / `28`)
+  instead of letting the `Date` constructor roll over into the next month.
+- New `formatDateTime()` shows `HH:MM` alongside the date in the per-game
+  badge / detail line whenever the timestamp isn't local midnight;
+  `formatDate()` (still used for campaign end dates) is unchanged.
+- The stored value is still a single epoch-ms number in
+  `gameWaitUntil[slug]`, which `background.js` already compares as
+  `> Date.now()` - no scheduler change, and old date-only values keep
+  working.
+- `popup.html`: `.g-wait` gains `flex-wrap: wrap`; the
+  `input[type="date"]` rule becomes a `select` rule. `i18n.js`: one new
+  key `row_wait_aria` (group aria-label) across all nine languages;
+  removed the now-unused `tsToDateInput` / `dateInputToTs` helpers.
+
+**Tests:** all seven test files pass unchanged; `test/i18n.test.js`
+confirms the new key has parity across all nine languages. `web-ext lint`
+clean (0/0/0). A jsdom check of `waitControlEl` verified the five selects,
+populate/commit round-trip, and the Feb-31 → Feb-28 clamp. `BUILD_MARKER`
+→ `2026-09-03-r1`, `manifest.json` → 0.6.3.

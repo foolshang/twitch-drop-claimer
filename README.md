@@ -155,11 +155,22 @@ Listed submissions also read license/category metadata from
 | `inject.js` | Page-world script that passively observes Twitch's GraphQL traffic — game id↔name↔slug, campaign progress, and the full open-campaign list (`ViewerDropsDashboard`) |
 | `shared.js` | Helpers shared between background and content scripts (slugs + aliases, channel/directory/search URL parsing, game-name → open-campaign matching) |
 | `i18n.js` | Popup UI string tables (9 languages) + lookup/resolve/apply helpers; loaded in the popup and as a background script |
-| `popup.html` / `popup.js` | Settings UI: language picker, on/off switch, watch list with per-game campaign status and a "start from date" picker, auto-watch / tab quota / priority mode, completion-based auto-off, "check All Campaigns now", sleep warning |
+| `popup.html` / `popup.js` | Settings UI: language picker, on/off switch, watch list with per-game campaign status and a "watch from" date/time picker, auto-watch / tab quota / priority mode, completion-based auto-off, "check All Campaigns now", sleep warning |
 | `scripts/submit-amo.js` | AMO submission pipeline |
 | `test/` | Node-based tests against a stubbed `browser.*` API / jsdom |
 
 ## Changelog
+
+### 0.6.3
+
+- **Per-game "watch from" picker is popup-safe and takes a time of day.**
+  Firefox mispositions / hides the native `<input type="date">` calendar
+  panel inside a `browser_action` popup (it opened behind the popup), so
+  the picker is now built from plain `<select>` dropdowns, which work in a
+  popup. It also carries an hour:minute now, so auto-watch can start a game
+  right when a drop is released rather than at local midnight. The stored
+  value is a full timestamp; `background.js` already compared it as a
+  number, so no scheduler change.
 
 ### 0.6.2
 
