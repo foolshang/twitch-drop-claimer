@@ -1032,3 +1032,10 @@ confirms the new key has parity across all nine languages. `web-ext lint`
 clean (0/0/0). A jsdom check of `waitControlEl` verified the five selects,
 populate/commit round-trip, and the Feb-31 → Feb-28 clamp. `BUILD_MARKER`
 → `2026-09-03-r1`, `manifest.json` → 0.6.3.
+
+Authored on the `dev` branch, fast-forwarded to `master` as `de8e009`,
+pushed to GitHub. Submitted to the public AMO listed channel via
+`npm run submit:listed` - lint clean (0/0/0), signed and auto-approved to
+`web-ext-artifacts/33d37586a96d443fa884-0.6.3.xpi`, recorded in
+`.amo-submitted-versions.json`. Firefox installs auto-update from the AMO
+listing.
