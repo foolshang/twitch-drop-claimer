@@ -1121,3 +1121,10 @@ that it doesn't shield a genuinely dead channel next to healthy ones).
 window, the guarded flash, and the duplicate-tab race respectively). All
 seven test files pass; `web-ext lint` clean (0/0/0). `BUILD_MARKER` →
 `2026-09-05-r1`, `manifest.json` → 0.6.4.
+
+Committed to `master` as `1d37906`, pushed to GitHub. Submitted to the
+public AMO listed channel via `npm run submit:listed` - lint clean
+(0/0/0), signed and auto-approved to
+`web-ext-artifacts/33d37586a96d443fa884-0.6.4.xpi`, recorded in
+`.amo-submitted-versions.json`. Firefox installs auto-update from the AMO
+listing.
