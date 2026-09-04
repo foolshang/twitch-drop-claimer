@@ -135,14 +135,14 @@ async function testStuckProgressRotatesChannel() {
   const { ctx, storageData, flush, violations, tabId } = await setUpWatchingChannel("streamerA");
 
   await reportProgress(ctx, 0, 120);
-  await vm.runInContext("verifyDropStatus", ctx)("path-of-exile-2"); // captures baseline: claimed=0, timeRemainingMin=120
+  await vm.runInContext("verifySweep", ctx)(); // captures baseline: claimed=0, timeRemainingMin=120
   await flush(20);
   assert.strictEqual(storageData.watchMeta["path-of-exile-2"].baselineClaimed, 0);
   assert.strictEqual(storageData.watchMeta["path-of-exile-2"].baselineTimeRemainingMin, 120);
 
   backdateBaseline(ctx, storageData);
   await reportProgress(ctx, 0, 120); // same numbers - no movement
-  await vm.runInContext("verifyDropStatus", ctx)("path-of-exile-2");
+  await vm.runInContext("verifySweep", ctx)();
   await flush(10);
 
   assert.ok(
@@ -160,12 +160,12 @@ async function testDecreasingTimeRemainingKeepsWatching() {
   const { ctx, storageData, flush, violations } = await setUpWatchingChannel("streamerB");
 
   await reportProgress(ctx, 0, 120);
-  await vm.runInContext("verifyDropStatus", ctx)("path-of-exile-2"); // baseline: timeRemainingMin=120
+  await vm.runInContext("verifySweep", ctx)(); // baseline: timeRemainingMin=120
   await flush(20);
 
   backdateBaseline(ctx, storageData);
   await reportProgress(ctx, 0, 95); // fewer minutes left -> progressing
-  await vm.runInContext("verifyDropStatus", ctx)("path-of-exile-2");
+  await vm.runInContext("verifySweep", ctx)();
   await flush(10);
 
   assert.ok(storageData.watchMeta["path-of-exile-2"], "watchMeta must survive - channel is crediting progress");
@@ -186,12 +186,12 @@ async function testIncreasingClaimedKeepsWatching() {
   const { ctx, storageData, flush, violations } = await setUpWatchingChannel("streamerC");
 
   await reportProgress(ctx, 0, null); // timeRemainingMin never parseable for this card
-  await vm.runInContext("verifyDropStatus", ctx)("path-of-exile-2"); // baseline: claimed=0, timeRemainingMin=null
+  await vm.runInContext("verifySweep", ctx)(); // baseline: claimed=0, timeRemainingMin=null
   await flush(20);
 
   backdateBaseline(ctx, storageData);
   await reportProgress(ctx, 1, null); // a reward tier finished claiming -> progressing
-  await vm.runInContext("verifyDropStatus", ctx)("path-of-exile-2");
+  await vm.runInContext("verifySweep", ctx)();
   await flush(10);
 
   assert.ok(storageData.watchMeta["path-of-exile-2"], "watchMeta must survive - claimed count moved");
@@ -205,12 +205,12 @@ async function testNoUsableSignalFailsClosed() {
   const { ctx, storageData, flush, violations } = await setUpWatchingChannel("streamerD");
 
   await reportProgress(ctx, 0, null); // timeRemainingMin never parseable, claimed never moves either
-  await vm.runInContext("verifyDropStatus", ctx)("path-of-exile-2"); // baseline
+  await vm.runInContext("verifySweep", ctx)(); // baseline
   await flush(20);
 
   backdateBaseline(ctx, storageData);
   await reportProgress(ctx, 0, null); // still nothing usable to compare
-  await vm.runInContext("verifyDropStatus", ctx)("path-of-exile-2");
+  await vm.runInContext("verifySweep", ctx)();
   await flush(10);
 
   assert.ok(
@@ -232,13 +232,13 @@ async function testStopsProgressingAfterOneGoodWindowStillRotates() {
 
   // window 1: capture baseline
   await reportProgress(ctx, 0, 120);
-  await vm.runInContext("verifyDropStatus", ctx)("path-of-exile-2");
+  await vm.runInContext("verifySweep", ctx)();
   await flush(20);
 
   // window 1 elapses with real movement -> re-baseline, keep watching
   backdateBaseline(ctx, storageData);
   await reportProgress(ctx, 0, 90);
-  await vm.runInContext("verifyDropStatus", ctx)("path-of-exile-2");
+  await vm.runInContext("verifySweep", ctx)();
   await flush(20);
   assert.ok(storageData.watchMeta["path-of-exile-2"], "must still be watching after one good window");
   assert.strictEqual(
@@ -252,7 +252,7 @@ async function testStopsProgressingAfterOneGoodWindowStillRotates() {
   // always looks like "progress") and never reject
   backdateBaseline(ctx, storageData);
   await reportProgress(ctx, 0, 90); // unchanged since the re-baseline
-  await vm.runInContext("verifyDropStatus", ctx)("path-of-exile-2");
+  await vm.runInContext("verifySweep", ctx)();
   await flush(10);
 
   assert.ok(
@@ -331,6 +331,117 @@ async function testDifferentChannelResetsVerifyClock() {
   console.log("  OK  picking a genuinely different channel still resets the verify clock/baseline as before");
 }
 
+// same as setUpWatchingChannel, but two games/watch tabs at once (tabQuota
+// 2) - needed for verifySweep's cross-slug "all stalled together" guard,
+// which only has a signal to compare once 2+ channels are judged in the
+// same sweep.
+async function setUpWatchingTwoChannels(channelA, channelB) {
+  const { ctx, storageData, tabsById, flush, violations } = makeSandbox();
+  storageData.tabQuota = 2;
+  vm.runInContext(read("shared.js"), ctx);
+  vm.runInContext(read("i18n.js"), ctx);
+  storageData.watchList = [
+    { input: "poe2", slug: "path-of-exile-2" },
+    { input: "diablo 4", slug: "diablo-iv" },
+  ];
+
+  vm.runInContext(read("background.js"), ctx);
+  await flush(30);
+  const VERIFY_DELAY_MS = vm.runInContext("VERIFY_DELAY_MS", ctx);
+  const tabIdA = storageData.watchTabs["path-of-exile-2"];
+  const tabIdB = storageData.watchTabs["diablo-iv"];
+  assert.ok(tabIdA && tabIdB, "sanity: both watch tabs opened (tabQuota 2)");
+
+  await vm.runInContext("handleDirectoryPicked", ctx)("path-of-exile-2", channelA, { id: tabIdA });
+  await vm.runInContext("handleDirectoryPicked", ctx)("diablo-iv", channelB, { id: tabIdB });
+  await flush(10);
+  storageData.watchMeta["path-of-exile-2"].watchStartedAt = Date.now() - VERIFY_DELAY_MS - 5_000;
+  storageData.watchMeta["diablo-iv"].watchStartedAt = Date.now() - VERIFY_DELAY_MS - 5_000;
+
+  return { ctx, storageData, tabsById, flush, violations, tabIdA, tabIdB };
+}
+
+async function reportProgressFor(ctx, slug, label, claimed, timeRemainingMin) {
+  await vm.runInContext("mergeInventoryProgress", ctx)([
+    { slug, label, claimed, total: 3, timeRemainingMin },
+  ]);
+}
+
+function backdateBaselineFor(ctx, storageData, slug) {
+  const VERIFY_DELAY_MS = vm.runInContext("VERIFY_DELAY_MS", ctx);
+  storageData.watchMeta[slug].baselineCapturedAt = Date.now() - VERIFY_DELAY_MS - 5_000;
+}
+
+// The regression this guards against: a system-wide cause (reported
+// 2026-09-04 - Windows turning the monitor off, which is not sleep, but can
+// still make Firefox treat every window as occluded and suspend background
+// video) stalls every watched channel's progress at the same time. Without
+// this guard, verifySweep would reject each one in turn over successive
+// sweeps, filling blockedChannels with channels that were actually fine.
+async function testAllChannelsStalledTogetherSkipsRotation() {
+  const { ctx, storageData, flush, violations } = await setUpWatchingTwoChannels("streamerJ", "streamerK");
+
+  await reportProgressFor(ctx, "path-of-exile-2", "PoE2", 0, 120);
+  await reportProgressFor(ctx, "diablo-iv", "Diablo IV", 0, 80);
+  await vm.runInContext("verifySweep", ctx)(); // both capture baselines
+  await flush(20);
+
+  backdateBaselineFor(ctx, storageData, "path-of-exile-2");
+  backdateBaselineFor(ctx, storageData, "diablo-iv");
+  // neither game's numbers moved - both channels stalled in the same sweep
+  await reportProgressFor(ctx, "path-of-exile-2", "PoE2", 0, 120);
+  await reportProgressFor(ctx, "diablo-iv", "Diablo IV", 0, 80);
+  await vm.runInContext("verifySweep", ctx)();
+  await flush(10);
+
+  assert.ok(storageData.watchMeta["path-of-exile-2"], "streamerJ must not be rejected - both channels stalled together");
+  assert.ok(storageData.watchMeta["diablo-iv"], "streamerK must not be rejected - both channels stalled together");
+  assert.ok(
+    !(storageData.blockedChannels && storageData.blockedChannels["path-of-exile-2"]),
+    "streamerJ must not be blocklisted"
+  );
+  assert.ok(
+    !(storageData.blockedChannels && storageData.blockedChannels["diablo-iv"]),
+    "streamerK must not be blocklisted"
+  );
+  assert.deepStrictEqual(violations, [], "no tab call skipped active:false");
+
+  console.log("  OK  every watched channel stalling in the same sweep is treated as a system-wide cause, not rotated");
+}
+
+// sanity check for the opposite case, so the systemic guard above can't
+// accidentally shield a genuinely dead channel just because it happens to
+// share a sweep with a healthy one.
+async function testOneStalledAmongOthersStillRotates() {
+  const { ctx, storageData, flush, violations } = await setUpWatchingTwoChannels("streamerL", "streamerM");
+
+  await reportProgressFor(ctx, "path-of-exile-2", "PoE2", 0, 120);
+  await reportProgressFor(ctx, "diablo-iv", "Diablo IV", 0, 80);
+  await vm.runInContext("verifySweep", ctx)(); // both capture baselines
+  await flush(20);
+
+  backdateBaselineFor(ctx, storageData, "path-of-exile-2");
+  backdateBaselineFor(ctx, storageData, "diablo-iv");
+  await reportProgressFor(ctx, "path-of-exile-2", "PoE2", 0, 120); // streamerL: no movement - genuinely stuck
+  await reportProgressFor(ctx, "diablo-iv", "Diablo IV", 0, 60); // streamerM: progressing fine
+  await vm.runInContext("verifySweep", ctx)();
+  await flush(10);
+
+  assert.ok(!storageData.watchMeta["path-of-exile-2"], "streamerL must be rejected - it alone stalled while diablo-iv progressed");
+  assert.ok(storageData.watchMeta["diablo-iv"], "streamerM must survive - it was progressing normally");
+  assert.ok(
+    storageData.blockedChannels["path-of-exile-2"]["streamerl"] > Date.now(),
+    "streamerL must be recorded in blockedChannels"
+  );
+  assert.ok(
+    !(storageData.blockedChannels && storageData.blockedChannels["diablo-iv"]),
+    "streamerM must not be blocklisted"
+  );
+  assert.deepStrictEqual(violations, [], "no tab call skipped active:false");
+
+  console.log("  OK  one channel stalling while others progress normally still rotates just that one");
+}
+
 (async () => {
   console.log("Running drop-status verification tests (no real browser, no network)...\n");
   try {
@@ -342,6 +453,8 @@ async function testDifferentChannelResetsVerifyClock() {
     await testChannelLeftDoesNotRejectOnItsOwn();
     await testSameChannelRepickPreservesVerifyClock();
     await testDifferentChannelResetsVerifyClock();
+    await testAllChannelsStalledTogetherSkipsRotation();
+    await testOneStalledAmongOthersStillRotates();
     console.log("\nALL PASSED");
     process.exit(0);
   } catch (e) {

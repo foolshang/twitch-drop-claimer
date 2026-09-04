@@ -89,6 +89,57 @@ open, the popup shows a collapsible warning with the manual Windows
 power-settings steps (and a `powercfg` one-liner) to disable sleep so
 watch-time keeps accruing.
 
+## Known limitation: screen turns off, drop progress stops (even with the PC not asleep)
+
+Turning the monitor off via Windows' own idle timer (Settings → "Turn off
+screen after") is not the same as the PC sleeping - the CPU keeps running -
+but it can still stall Twitch's own video playback in a background tab,
+which stops drop watch-time from accruing. Two separate causes were
+confirmed live (2026-09-04):
+
+1. Firefox's window-occlusion tracking listens to the real display power
+   state directly (not just "is this tab visible"). When the monitor turns
+   off, Firefox can mark every window as occluded even though nothing
+   actually slept, which can suspend already-playing background video
+   after a short delay.
+2. Independently of that, Twitch's own player sometimes never starts video
+   at all in a tab that was created in the background and never once
+   became the active tab of its window - on some channels, not others,
+   with no console error.
+
+What this extension does about both, as of the version that added this
+section: every watch tab now opens in its own dedicated Firefox window
+(never the window you're actually using, so this never interrupts YouTube
+or anything else you have open) and is briefly made the active tab of
+*that* window for a few seconds right after a channel is picked, which is
+what reliably gets Twitch's player to actually start. Separately, if every
+currently-watched channel stalls in the same check (a system-wide cause
+like this, rather than one bad channel), the extension no longer rotates
+any of them away - only a channel that's stalled while others are
+progressing normally gets treated as actually dead.
+
+That fixes the "never starts at all" cause. It does **not** and cannot fix
+cause 1 (the occlusion-tracking/background-video-suspend behavior) -
+that's inside Firefox itself, and WebExtensions have no permission to
+change `about:config`. If drop progress still stalls specifically while the
+screen is off, try, in this order, in `about:config` in the Firefox profile
+you actually browse with (restart Firefox after changing any of these):
+
+1. `widget.windows.window_occlusion_tracking.enabled` → `false` (main
+   suspect - stops Firefox from treating an off display as every window
+   being occluded)
+2. `media.suspend-bkgnd-video.enabled` → `false` (the background-video-
+   suspend behavior itself, in case #1 alone isn't enough - its delay is
+   `media.suspend-bkgnd-video.delay-ms`, a few seconds by default)
+3. `network.http.throttle.enable` → `false` (background-tab network
+   throttling, if 1-2 still aren't enough)
+
+Or skip prefs entirely: `powercfg /change monitor-timeout-ac 0` (disables
+Windows' own idle-driven display-off) and turn the monitor off yourself via
+its own physical power button/input-source switch instead - Windows still
+reports the display "on" internally that way, so nothing (Firefox's
+occlusion tracker included) ever sees a display-off event.
+
 ## Install (development)
 
 1. Install dependencies: `npm install`

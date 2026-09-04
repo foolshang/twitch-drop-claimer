@@ -77,27 +77,34 @@
  *
  * Tab etiquette (verified below, not just assumed):
  *   - every tabs.create/tabs.update call below passes an explicit
- *     `active: false` - never omitted, never `true`.
+ *     `active: false`, with ONE deliberate, narrow exception:
+ *     flashTabToStartPlayback() briefly sets `active: true` then back to
+ *     `false` a few seconds later, and ONLY after the caller has confirmed
+ *     (via tab.windowId) the tab is inside the dedicated watch window from
+ *     getOrCreateWatchWindow() - never the window the user is actually
+ *     using. It exists because live RDP capture (2026-09-04) found Twitch's
+ *     own player sometimes never starts video at all in a tab that was
+ *     created active:false and never once became its window's active tab -
+ *     no console error, intermittent per channel. A background window kept
+ *     minimized was tried first instead (avoids ever touching `active` at
+ *     all) but live-verified NOT to work: `document.visibilityState` stays
+ *     `"hidden"` for a minimized window (also for one positioned off-screen
+ *     - Firefox's occlusion tracking, not just the `minimized` flag,
+ *     decides this) and Twitch's player never starts either way. The flash
+ *     was the only thing confirmed to reliably fix it.
  *   - muting is done at the browser level via tabs.update({muted:true})
  *     right after a watch tab is created - never by clicking Twitch's own
  *     mute button (that part was removed from content.js).
  *   - windows.update({focused:true}) is never called anywhere in this file.
+ *     The one window-focus-adjacent call, getOrCreateWatchWindow()'s
+ *     windows.create(), is a one-time (per browser session) creation of the
+ *     dedicated watch window - not a per-tab focus grab.
  *   - content.js's own same-tab `location.href = ...` navigation (picking a
  *     channel from the directory, bouncing back to the directory on
  *     offline/raid) never changes tab activation - navigating a page's own
  *     location is not a WebExtension action and has no "active" concept, so
  *     a background tab navigating itself stays in the background. This is
  *     inherent browser behavior, not something this file needs to enforce.
- *   - a background window kept minimized was considered for a "separate
- *     window" mode, but is NOT implemented: whether Firefox keeps counting
- *     Twitch watch-time for a fully minimized window (as opposed to a
- *     background tab in a visible window, which is what this extension
- *     already relies on) could not be verified without hours of live
- *     watching on a real, logged-in Twitch account with an active Drops
- *     campaign - not something this environment can do. Rather than ship an
- *     option that might silently not work, only "current window" mode
- *     exists. If you test it yourself and confirm minimized windows still
- *     accrue watch time, this is the place to add it.
  */
 
 // unconditional, first thing this script does on every load/reload - proves
@@ -198,13 +205,69 @@ async function refreshBadge() {
 }
 
 // ============================================================================
+// dedicated watch window - isolates every tab this extension opens from
+// whatever the user is actually doing (see the tab-etiquette comment at the
+// top of this file). Needed for the brief active:true flash in
+// handleDirectoryPicked below: Twitch's own player does not reliably start
+// video in a tab that has never been the active tab of its window (live RDP
+// capture, 2026-09-04 - some channels' players simply never issue the
+// PlaybackAccessToken/usher fetch otherwise, no console error). A flash is
+// the only thing confirmed to fix that, so it must happen somewhere the
+// user is never looking - a separate window they didn't ask to see, not a
+// tab switch in whatever window they're using for YouTube/anything else.
+// ============================================================================
+// Returns { id, freshlyCreated }. freshlyCreated tells callers whether this
+// call's window is the one that just got its initial tab navigated to
+// INVENTORY_URL right here - openInventoryIfMissing() relies on that
+// instead of re-querying browser.tabs right after, because whether
+// browser.tabs.query() reflects a just-created/just-navigated tab by the
+// very next call is not guaranteed (produced a real duplicate inventory tab
+// in a live test, 2026-09-04).
+let watchWindowCreateInFlight = null;
+async function getOrCreateWatchWindow() {
+  const cfg = await browser.storage.local.get("watchWindowId");
+  if (cfg.watchWindowId) {
+    try {
+      await browser.windows.get(cfg.watchWindowId);
+      return { id: cfg.watchWindowId, freshlyCreated: false };
+    } catch {
+      // closed by the user (or gone) - fall through and make a new one
+    }
+  }
+  if (watchWindowCreateInFlight) return watchWindowCreateInFlight;
+  watchWindowCreateInFlight = (async () => {
+    try {
+      const win = await browser.windows.create({ type: "normal" }); // blank - navigated below
+      await browser.storage.local.set({ watchWindowId: win.id });
+      const initialTab = win.tabs && win.tabs[0];
+      if (initialTab) {
+        try { await browser.tabs.update(initialTab.id, { url: INVENTORY_URL }); } catch { /* best-effort */ }
+      }
+      return { id: win.id, freshlyCreated: true };
+    } catch (e) {
+      log("getOrCreateWatchWindow: could not create a dedicated window, falling back to the current window:", e);
+      return { id: null, freshlyCreated: false };
+    } finally {
+      watchWindowCreateInFlight = null;
+    }
+  })();
+  return watchWindowCreateInFlight;
+}
+
+// ============================================================================
 // inventory tab upkeep
 // ============================================================================
 async function openInventoryIfMissing() {
   const tabs = await browser.tabs.query({ url: "*://www.twitch.tv/drops/inventory*" });
   if (tabs.length === 0) {
-    await browser.tabs.create({ url: INVENTORY_URL, active: false, pinned: true });
-    log("opened inventory tab");
+    const { id: watchWindowId, freshlyCreated } = await getOrCreateWatchWindow();
+    if (freshlyCreated) {
+      // its initial tab was already navigated to INVENTORY_URL
+      log("dedicated watch window created with the inventory tab already open");
+    } else {
+      await browser.tabs.create({ url: INVENTORY_URL, active: false, pinned: true, ...(watchWindowId ? { windowId: watchWindowId } : {}) });
+      log("opened inventory tab");
+    }
   }
 }
 
@@ -258,7 +321,8 @@ async function refreshOpenCampaigns({ maxAgeMs = 0 } = {}) {
   campaignsRefreshInFlight = (async () => {
     let tab = null;
     try {
-      tab = await browser.tabs.create({ url: CAMPAIGNS_URL, active: false, pinned: true });
+      const { id: watchWindowId } = await getOrCreateWatchWindow();
+      tab = await browser.tabs.create({ url: CAMPAIGNS_URL, active: false, pinned: true, ...(watchWindowId ? { windowId: watchWindowId } : {}) });
       await new Promise((resolve) => {
         const timer = setTimeout(resolve, 30_000);
         campaignsSignalWaiters.push(() => { clearTimeout(timer); resolve(); });
@@ -562,7 +626,8 @@ async function autoWatchTick() {
     if (openCount >= quota) break;
     if (watchTabs[game.slug]) continue; // already has a tab
 
-    const tab = await browser.tabs.create({ url: directoryUrl(game.slug), active: false, pinned: true });
+    const { id: watchWindowId } = await getOrCreateWatchWindow();
+    const tab = await browser.tabs.create({ url: directoryUrl(game.slug), active: false, pinned: true, ...(watchWindowId ? { windowId: watchWindowId } : {}) });
     await browser.tabs.update(tab.id, { active: false, muted: true });
     watchTabs[game.slug] = tab.id;
     openCount++;
@@ -663,7 +728,8 @@ async function handleDirectoryUnknownCategory(msg) {
   const found = await new Promise((resolve) => {
     const timer = setTimeout(() => resolve(null), 25_000);
     pendingSlugResolves.set(key, (slug) => { clearTimeout(timer); resolve(slug); });
-    browser.tabs.create({ url: searchUrl(gameName), active: false, pinned: true })
+    getOrCreateWatchWindow()
+      .then(({ id: watchWindowId }) => browser.tabs.create({ url: searchUrl(gameName), active: false, pinned: true, ...(watchWindowId ? { windowId: watchWindowId } : {}) }))
       .then((t) => { searchTab = t; })
       .catch((e) => { clearTimeout(timer); log("slug-resolve: could not open search tab:", e); resolve(null); });
   });
@@ -941,16 +1007,73 @@ async function verifyDropStatus(slug) {
     "[verify]", slug, "channel", meta.channel, "- no progress for a full verify window",
     `(claimed ${meta.baselineClaimed} -> ${progress.claimed},`,
     `timeRemainingMin ${meta.baselineTimeRemainingMin} -> ${progress.timeRemainingMin})`,
-    "- rotating"
+    "- flagged stalled"
   );
-  await rejectChannel(slug, meta.channel, tabId);
+  return { stalled: true, channelName: meta.channel, tabId };
 }
 
+// Every slug reaching a stalled verdict in the SAME sweep - with 2+ slugs
+// actually judged - points at a system-wide cause (network/GPU/OS hiccup,
+// e.g. the display-power-off/window-occlusion interaction reported
+// 2026-09-04: Windows turning the monitor off is not sleep, but Firefox's
+// window-occlusion tracking can still treat every window as invisible and
+// suspend background video, which would stall every watched channel at
+// once) rather than any one channel actually going bad. rejectChannel()
+// blocklists by channel NAME, so blindly rejecting every slug in that
+// situation would fill blockedChannels with channels that were fine,
+// working through them one sweep at a time until nothing usable is left.
+// Only reject when it's not unanimous - a single stalled slug alongside
+// others still progressing normally is real evidence against that one
+// channel specifically.
 async function verifySweep() {
   const cfg = await browser.storage.local.get(["watchMeta"]);
-  for (const slug of Object.keys(cfg.watchMeta || {})) {
-    await verifyDropStatus(slug);
+  const slugs = Object.keys(cfg.watchMeta || {});
+  const verdicts = [];
+  for (const slug of slugs) {
+    const verdict = await verifyDropStatus(slug);
+    if (verdict) verdicts.push({ slug, ...verdict });
   }
+
+  const allStalledTogether = verdicts.length >= 2 && verdicts.every((v) => v.stalled);
+  if (allStalledTogether) {
+    log(
+      "[verify] all", verdicts.length, "watched channels stalled in the same sweep",
+      `(${verdicts.map((v) => v.slug).join(", ")})`,
+      "- treating as a system-wide cause, not rotating any of them this sweep"
+    );
+    return;
+  }
+
+  for (const v of verdicts) {
+    if (v.stalled) await rejectChannel(v.slug, v.channelName, v.tabId);
+  }
+}
+
+// How long a freshly-picked watch tab is briefly brought to the foreground
+// of the dedicated watch window (getOrCreateWatchWindow above) so Twitch's
+// own player actually starts. Live RDP capture (2026-09-04) found
+// video.readyState/currentTime stuck at 0 indefinitely without this on some
+// channels - Twitch's player never issues the PlaybackAccessToken/usher
+// fetch for a tab that has never been the active tab of its window. Only
+// ever called after confirming (via tab.windowId, in the caller) the tab is
+// actually inside the isolated watch window - never anywhere the user could
+// be looking. holdMs is a parameter (not just the constant) purely so tests
+// can exercise the revert without a real 8s wait.
+const PLAYBACK_FLASH_HOLD_MS = 8_000;
+async function flashTabToStartPlayback(tabId, holdMs = PLAYBACK_FLASH_HOLD_MS) {
+  try {
+    await browser.tabs.update(tabId, { active: true });
+  } catch (e) {
+    log("flashTabToStartPlayback: could not activate tab", tabId, e);
+    return;
+  }
+  setTimeout(async () => {
+    try {
+      await browser.tabs.update(tabId, { active: false });
+    } catch {
+      // tab already gone/rotated away - nothing to revert
+    }
+  }, holdMs);
 }
 
 async function handleDirectoryPicked(slug, channel, tab) {
@@ -962,6 +1085,7 @@ async function handleDirectoryPicked(slug, channel, tab) {
     const watchMeta = { ...(cfg.watchMeta || {}) };
     const dropSignals = { ...(cfg.dropSignals || {}) };
     const prev = watchMeta[slug];
+    let freshChannel = false;
 
     if (prev && prev.channel === channel) {
       // Same channel re-picked - happens when content.js's DOM offline/raid
@@ -979,10 +1103,25 @@ async function handleDirectoryPicked(slug, channel, tab) {
     } else {
       watchMeta[slug] = { channel, tabId: tab.id, watchStartedAt: Date.now() };
       delete dropSignals[slug]; // fresh channel, fresh signals
+      freshChannel = true;
       log("watch tab for", slug, `tab=${tab.id}`, "now on channel", channel);
     }
 
     await browser.storage.local.set({ watchMeta, dropSignals });
+
+    if (freshChannel) {
+      // fire-and-forget - never block picking the channel on this
+      (async () => {
+        const { id: watchWindowId } = await getOrCreateWatchWindow();
+        if (watchWindowId == null) return; // no isolated window - never flash in the user's own
+        try {
+          const liveTab = await browser.tabs.get(tab.id);
+          if (liveTab.windowId === watchWindowId) await flashTabToStartPlayback(tab.id);
+        } catch {
+          // tab already gone
+        }
+      })();
+    }
   });
 }
 
@@ -1126,7 +1265,7 @@ async function applyEnabledState(enabled) {
     browser.alarms.create(RELOAD_ALARM, { periodInMinutes: RELOAD_PERIOD_MIN });
     browser.alarms.create(AUTO_OFF_ALARM, { periodInMinutes: AUTO_OFF_PERIOD_MIN });
     browser.alarms.create(AUTO_WATCH_ALARM, { periodInMinutes: AUTO_WATCH_PERIOD_MIN });
-    await openInventoryIfMissing();
+    await serialized(openInventoryIfMissing);
     await serialized(autoWatchTick);
     refreshOpenCampaigns({ maxAgeMs: OPEN_CAMPAIGNS_REFRESH_MS })
       .then(annotateWatchListFromCampaigns)
@@ -1148,7 +1287,7 @@ browser.alarms.onAlarm.addListener(async (alarm) => {
     try {
       const tabs = await browser.tabs.query({ url: "*://www.twitch.tv/drops/inventory*" });
       if (tabs.length === 0) {
-        await openInventoryIfMissing();
+        await serialized(openInventoryIfMissing);
         return;
       }
       for (const tab of tabs) {

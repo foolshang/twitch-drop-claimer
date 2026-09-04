@@ -289,6 +289,39 @@
   }
 
   // =========================================================================
+  // Channel page: recover a player that never started (BEST-EFFORT)
+  //
+  // Live RDP capture (2026-09-04) found Twitch's own player intermittently
+  // never issues the PlaybackAccessToken/usher fetch that sets video.src on
+  // a tab this extension opened in the background (active:false) - the
+  // <video> element sits at readyState 0 / currentTime 0 indefinitely (10+
+  // min observed), with no console error, on some channels but not others -
+  // looks like a race in Twitch's own lazy-mount logic for a tab that was
+  // never actually visible, not something this extension's navigation
+  // triggers deliberately. A manual click on the player overlay plus
+  // video.play() reliably unstuck it in that capture. Only ever called on a
+  // tab already confirmed to be our own watch tab (never the user's).
+  // =========================================================================
+  function nudgeStalledPlayer() {
+    try {
+      const v = document.querySelector("video");
+      if (!v || v.readyState > 0 || v.currentTime > 0) return; // already started, nothing to do
+      const overlay = document.querySelector('[data-a-target="player-overlay-click-handler"]');
+      if (overlay) {
+        const r = overlay.getBoundingClientRect();
+        overlay.dispatchEvent(new MouseEvent("click", {
+          bubbles: true, cancelable: true, view: window,
+          clientX: r.x + r.width / 2, clientY: r.y + r.height / 2,
+        }));
+      }
+      v.play().catch(() => {});
+      log("nudged a stalled player (readyState was 0)");
+    } catch (e) {
+      log("nudgeStalledPlayer failed:", e);
+    }
+  }
+
+  // =========================================================================
   // Inventory page: parse campaign progress (BEST-EFFORT, needs verification)
   // =========================================================================
   // Real /drops/inventory capture (see HISTORY.md) found each campaign
@@ -496,6 +529,7 @@
   let channelWatchIntervalId = null;
   let directoryIntervalId = null;
   let searchResolveTimeoutId = null;
+  let playerNudgeTimeoutId = null;
 
   function start() {
     if (running) return; // avoid stacking duplicate timers when toggled ON/OFF rapidly
@@ -635,6 +669,14 @@
       let qualityApplied = false;
       let handled = false;
 
+      // fast first recovery attempt - don't make a stalled player wait a
+      // full 60s (channelWatchIntervalId below) for its first nudge
+      playerNudgeTimeoutId = setTimeout(async () => {
+        if (!enabled || handled) return;
+        const wt = await getWatchTabInfo();
+        if (wt.isWatchTab) nudgeStalledPlayer();
+      }, 20_000);
+
       channelWatchIntervalId = setInterval(async () => {
         if (!enabled || handled) return;
 
@@ -642,6 +684,7 @@
         if (!wt.isWatchTab) return; // not our tab - never touch the user's own viewing
 
         if (!qualityApplied) qualityApplied = applyLowQuality();
+        nudgeStalledPlayer();
 
         const expectedSlug = wt.activeGame && wt.activeGame.slug;
         const currentChannel = channelFromUrl(location.href);
@@ -683,10 +726,11 @@
     clearInterval(channelWatchIntervalId);
     clearInterval(directoryIntervalId);
     clearTimeout(searchResolveTimeoutId);
+    clearTimeout(playerNudgeTimeoutId);
     scanIntervalId = inventoryIntervalId = inventoryScanIntervalId =
       inventoryWaitTimeoutId = inventoryFirstScanTimeoutId =
       initialScanTimeoutId = channelWatchIntervalId = directoryIntervalId =
-      searchResolveTimeoutId = null;
+      searchResolveTimeoutId = playerNudgeTimeoutId = null;
 
     log("stopped");
   }

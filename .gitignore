@@ -7,6 +7,9 @@
 # local record of already-submitted versions (not secret, but not source either)
 .amo-submitted-versions.json
 
+# personal machine-specific helper scripts - never distribute these
+*.local.bat
+
 # build output
 web-ext-artifacts/
 

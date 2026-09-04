@@ -501,6 +501,167 @@ async function testNoTabViolations() {
   console.log("  OK  tab-etiquette audit: every tabs.create/update passed active:false, no windows.update anywhere");
 }
 
+// Adds a browser.windows mock (the base sandbox above has none, so
+// getOrCreateWatchWindow always fails closed and never flashes - that's
+// what testNoTabViolations locks in for the no-windows-API case). With
+// windows.create/get available, background.js should route every tab it
+// opens into one dedicated window, and flashTabToStartPlayback's brief
+// active:true is only ever allowed on a tab confirmed to be inside it -
+// see the "Tab etiquette" comment at the top of background.js.
+function makeSandboxWithWatchWindow() {
+  const MAIN_WINDOW_ID = 1; // stands in for "whatever window the user is using"
+  const storageData = {
+    enabled: true, autoWatchEnabled: true, tabQuota: 2,
+    openCampaigns: { fetchedAt: Date.now(), bySlug: {} },
+  };
+  const changeListeners = [];
+  const alarmListeners = [];
+  const tabsById = new Map();
+  const windowsById = new Map([[MAIN_WINDOW_ID, { id: MAIN_WINDOW_ID, focused: true, type: "normal" }]]);
+  let nextTabId = 1;
+  let nextWindowId = MAIN_WINDOW_ID + 1;
+  // any active:true call on a tab NOT inside the dedicated watch window
+  // would be a real focus-stealing bug in the window the user is using
+  let unsafeActivations = [];
+
+  const sandbox = {
+    console: { log: () => {}, error: () => {}, warn: () => {} },
+    setTimeout, clearTimeout, setInterval, clearInterval,
+    browser: {
+      storage: {
+        local: {
+          get: (keys) => {
+            if (keys == null) return Promise.resolve({ ...storageData });
+            if (typeof keys === "string") return Promise.resolve({ [keys]: storageData[keys] });
+            const out = {};
+            for (const k of keys) out[k] = storageData[k];
+            return Promise.resolve(out);
+          },
+          set: (obj) => { Object.assign(storageData, obj); return Promise.resolve(); },
+        },
+        onChanged: { addListener: (fn) => changeListeners.push(fn) },
+      },
+      runtime: { onMessage: { addListener: () => {} }, getManifest: () => ({ version: "0.0.0-test" }) },
+      windows: {
+        create: (opts) => {
+          const id = nextWindowId++;
+          windowsById.set(id, { id, focused: true, type: opts.type || "normal" });
+          // real windows.create() always returns the window's initial tab
+          // (blank/new-tab-page when no url is given) - mirror that so
+          // getOrCreateWatchWindow's tabs.update(initialTab.id, ...) has a
+          // real tab to navigate, same as in Firefox
+          const tabId = nextTabId++;
+          tabsById.set(tabId, { url: opts.url || "about:blank", active: false, pinned: false, muted: false, windowId: id });
+          return Promise.resolve({ id, tabs: [{ id: tabId, windowId: id }] });
+        },
+        get: (id) => windowsById.has(id) ? Promise.resolve({ ...windowsById.get(id) }) : Promise.reject(new Error("no such window")),
+      },
+      tabs: {
+        create: (opts) => {
+          const id = nextTabId++;
+          const windowId = opts.windowId != null ? opts.windowId : MAIN_WINDOW_ID;
+          tabsById.set(id, { url: opts.url, active: false, pinned: !!opts.pinned, muted: !!opts.muted, windowId });
+          return Promise.resolve({ id, windowId });
+        },
+        update: (id, opts) => {
+          const t = tabsById.get(id);
+          if (t) {
+            if (opts.active === true && t.windowId !== storageData.watchWindowId) {
+              unsafeActivations.push(`tab ${id} in window ${t.windowId} (watch window is ${storageData.watchWindowId})`);
+            }
+            Object.assign(t, opts);
+          }
+          return Promise.resolve();
+        },
+        remove: (id) => {
+          if (!tabsById.has(id)) return Promise.reject(new Error("no such tab"));
+          tabsById.delete(id);
+          return Promise.resolve();
+        },
+        get: (id) => tabsById.has(id) ? Promise.resolve({ id, ...tabsById.get(id) }) : Promise.reject(new Error("no such tab")),
+        query: () => Promise.resolve([]),
+        reload: () => {},
+      },
+      alarms: {
+        create: () => {},
+        clear: () => Promise.resolve(true),
+        onAlarm: { addListener: (fn) => alarmListeners.push(fn) },
+      },
+      browserAction: { setBadgeText: () => {}, setBadgeBackgroundColor: () => {}, setTitle: () => {} },
+    },
+  };
+
+  const ctx = vm.createContext(sandbox);
+  function flush(ms = 15) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+  return { ctx, storageData, tabsById, flush, get unsafeActivations() { return unsafeActivations; }, MAIN_WINDOW_ID };
+}
+
+async function testWatchTabsIsolatedInDedicatedWindow() {
+  const { ctx, storageData, tabsById, flush, MAIN_WINDOW_ID } = makeSandboxWithWatchWindow();
+  vm.runInContext(read("shared.js"), ctx);
+  vm.runInContext(read("i18n.js"), ctx);
+  storageData.watchList = [{ input: "poe2", slug: "path-of-exile-2" }];
+
+  vm.runInContext(read("background.js"), ctx);
+  await flush(30);
+
+  assert.ok(storageData.watchWindowId, "a dedicated watch window must have been created");
+  assert.notStrictEqual(storageData.watchWindowId, MAIN_WINDOW_ID, "the watch window must not be the user's own window");
+
+  const watchTabId = storageData.watchTabs["path-of-exile-2"];
+  assert.strictEqual(tabsById.get(watchTabId).windowId, storageData.watchWindowId, "the watch tab must be opened inside the dedicated window, not the user's");
+
+  console.log("  OK  watch tabs open inside a dedicated window, never the user's own");
+}
+
+async function testFreshChannelPickFlashesOnlyInsideWatchWindowThenReverts() {
+  const { ctx, storageData, tabsById, flush, unsafeActivations } = makeSandboxWithWatchWindow();
+  vm.runInContext(read("shared.js"), ctx);
+  vm.runInContext(read("i18n.js"), ctx);
+  storageData.watchList = [{ input: "poe2", slug: "path-of-exile-2" }];
+
+  vm.runInContext(read("background.js"), ctx);
+  await flush(30);
+  const tabId = storageData.watchTabs["path-of-exile-2"];
+
+  await vm.runInContext("handleDirectoryPicked", ctx)("path-of-exile-2", "streamerZ", { id: tabId });
+  await flush(20); // long enough for the fire-and-forget flash to activate, well under any real hold
+
+  assert.strictEqual(tabsById.get(tabId).active, true, "a freshly-picked channel's tab must be briefly activated to start Twitch's player");
+  assert.deepStrictEqual(unsafeActivations, [], "active:true must only ever happen on a tab inside the dedicated watch window");
+
+  // exercise the revert directly with a short hold instead of waiting out
+  // the real ~8s default - same function, just a smaller holdMs
+  await vm.runInContext("flashTabToStartPlayback", ctx)(tabId, 20);
+  await flush(60);
+  assert.strictEqual(tabsById.get(tabId).active, false, "the tab must be switched back to active:false after the hold");
+
+  console.log("  OK  a freshly-picked channel is briefly activated inside the watch window only, then reverted");
+}
+
+// Regression test: a live run (2026-09-04) opened two /drops/inventory tabs
+// - the dedicated watch window's own freshly-created initial tab (navigated
+// to INVENTORY_URL by getOrCreateWatchWindow), plus a second one from
+// openInventoryIfMissing's own explicit tabs.create fallback, because it
+// re-queried browser.tabs right after window creation instead of trusting
+// getOrCreateWatchWindow's freshlyCreated flag - a real TOCTOU gap.
+async function testNoDuplicateInventoryTabOnFirstWatchWindowCreation() {
+  const { ctx, storageData, tabsById, flush } = makeSandboxWithWatchWindow();
+  vm.runInContext(read("shared.js"), ctx);
+  vm.runInContext(read("i18n.js"), ctx);
+  storageData.watchList = [{ input: "poe2", slug: "path-of-exile-2" }];
+
+  vm.runInContext(read("background.js"), ctx);
+  await flush(30);
+
+  const inventoryTabs = [...tabsById.values()].filter((t) => (t.url || "").includes("drops/inventory"));
+  assert.strictEqual(inventoryTabs.length, 1, `expected exactly 1 inventory tab, got ${inventoryTabs.length}`);
+
+  console.log("  OK  creating the dedicated watch window for the first time opens exactly one inventory tab, not two");
+}
+
 (async () => {
   console.log("Running multi-tab auto-watch tests (no real browser, no network)...\n");
   try {
@@ -517,6 +678,9 @@ async function testNoTabViolations() {
     await testUnknownCategoryFallsBackToInvalidWhenSearchFails();
     await testGqlActiveOverridesDomExpiredFalsePositive();
     await testNoTabViolations();
+    await testWatchTabsIsolatedInDedicatedWindow();
+    await testFreshChannelPickFlashesOnlyInsideWatchWindowThenReverts();
+    await testNoDuplicateInventoryTabOnFirstWatchWindowCreation();
     console.log("\nALL PASSED");
     process.exit(0);
   } catch (e) {

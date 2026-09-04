@@ -1039,3 +1039,85 @@ pushed to GitHub. Submitted to the public AMO listed channel via
 `web-ext-artifacts/33d37586a96d443fa884-0.6.3.xpi`, recorded in
 `.amo-submitted-versions.json`. Firefox installs auto-update from the AMO
 listing.
+
+## 2026-09-05 — Drop progress can stall while the monitor is off (0.6.4)
+
+**Problem (reported):** with the display turned off via Windows' own idle
+timer ("Turn off screen after") - not the PC sleeping, which stayed active
+the whole time - drop watch-time on `/drops/inventory` stopped moving.
+
+**Investigation (live, via `web-ext run` + Firefox RDP against a real
+logged-in profile):** found two separate, real causes.
+
+1. Twitch's own player sometimes never starts video at all in a tab this
+   extension opened in the background (`active: false`) - `video.readyState`
+   stuck at 0 / `currentTime` at 0 indefinitely (10+ minutes observed),
+   intermittently, on some channels but not others, with no console error.
+   A content-script nudge (synthetic click + `video.play()`) did not fix
+   it. Only `browser.tabs.update(tabId, {active:true})` - making the tab
+   genuinely the active tab of its window - reliably started playback
+   within ~20s. This is independent of screen state; it can happen with
+   the screen on too.
+2. Separately, Firefox's own window-occlusion tracking listens to the real
+   display power state, not just tab visibility - when the monitor turns
+   off, Firefox can mark every window occluded even though nothing slept,
+   which can suspend already-playing background video after a short delay
+   (`media.suspend-bkgnd-video.enabled`). This is inside Firefox itself;
+   WebExtensions have no permission to change `about:config`, so it can't
+   be fixed from this extension - documented instead as a user-side
+   troubleshooting section in `README.md` (three `about:config` prefs to
+   try, or a `powercfg`+physical-monitor-button workaround that avoids
+   needing any of them).
+
+**Fix (cause 1, and its knock-on effect):**
+- New `getOrCreateWatchWindow()` (`background.js`): every tab this
+  extension opens (inventory, campaigns, watch, search) now opens inside
+  one dedicated Firefox window, created once and remembered in
+  `storage.local.watchWindowId` - never the window the user is actually
+  using, so this can never interrupt YouTube or anything else they have
+  open. `windows.update({focused:true})` is still never called anywhere.
+- `flashTabToStartPlayback()`: right after `handleDirectoryPicked` picks a
+  genuinely new channel, that tab is briefly set `active: true` for
+  `PLAYBACK_FLASH_HOLD_MS` (8s) then back to `false` - but only after
+  confirming, via `tab.windowId`, that the tab is actually inside the
+  dedicated watch window. This is what reliably starts Twitch's player.
+  Two alternatives that would have avoided touching `active` at all were
+  tried first and live-verified NOT to work: a minimized window and a
+  window positioned off-screen both leave `document.visibilityState`
+  stuck at `"hidden"` (Firefox's real occlusion tracking, not just the
+  `minimized` flag, decides this), and Twitch's player never starts
+  either way.
+- A real race found while live-testing this: re-querying `browser.tabs`
+  right after `browser.windows.create()` isn't guaranteed to reflect the
+  new window's own initial tab yet, which produced a genuine duplicate
+  `/drops/inventory` tab. Fixed by having `getOrCreateWatchWindow()`
+  return `{id, freshlyCreated}` so `openInventoryIfMissing()` never has to
+  guess, and by navigating the new window's initial tab to `INVENTORY_URL`
+  in place instead of passing a `url` to `windows.create()` (whose own
+  tab isn't reliably queryable immediately either).
+
+**Fix (system-wide stalls in general, not just cause 2):**
+`verifySweep()` no longer rejects/blocklists each stalled watched channel
+independently. It now collects a verdict per slug in the same sweep; if
+2+ slugs were judged and ALL came back stalled, that's treated as a
+system-wide cause (screen-off/occlusion, a network hiccup, anything that
+would stall everything at once) and none are rotated that sweep - avoids
+filling `blockedChannels` with channels that were actually fine while the
+whole system was stalled. A single channel stalled while others progress
+normally is still rotated exactly as before.
+
+**Docs:** new README section "Known limitation: screen turns off, drop
+progress stops (even with the PC not asleep)" explains both causes, what
+the extension now does about cause 1, and the `about:config`/`powercfg`
+options for cause 2.
+
+**Tests:** `test/drop-verification.test.js` -
+`testAllChannelsStalledTogetherSkipsRotation` /
+`testOneStalledAmongOthersStillRotates` (the systemic-stall guard, and
+that it doesn't shield a genuinely dead channel next to healthy ones).
+`test/auto-watch-multi-tab.test.js` - `testWatchTabsIsolatedInDedicatedWindow`,
+`testFreshChannelPickFlashesOnlyInsideWatchWindowThenReverts`,
+`testNoDuplicateInventoryTabOnFirstWatchWindowCreation` (the dedicated
+window, the guarded flash, and the duplicate-tab race respectively). All
+seven test files pass; `web-ext lint` clean (0/0/0). `BUILD_MARKER` →
+`2026-09-05-r1`, `manifest.json` → 0.6.4.
