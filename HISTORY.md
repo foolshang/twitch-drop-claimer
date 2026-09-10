@@ -1212,3 +1212,10 @@ seven test files pass; `web-ext lint` clean (0/0/0). A jsdom check of
 `waitControlEl` covered the calendar grid, `DD/MM/YYYY`, the 12h/24h time
 parser, invalid-time rejection, and the round-trip from a stored timestamp.
 `BUILD_MARKER` → `2026-09-10-r1`, `manifest.json` → 0.6.5.
+
+Committed to `master` as `2c3980b`, pushed to GitHub (`dev` fast-forwarded
+to match, local and remote). Submitted to the public AMO listed channel
+via `npm run submit:listed` - lint clean (0/0/0), signed and auto-approved
+to `web-ext-artifacts/33d37586a96d443fa884-0.6.5.xpi`, recorded in
+`.amo-submitted-versions.json`. Firefox installs auto-update from the AMO
+listing.
