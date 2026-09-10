@@ -206,11 +206,33 @@ Listed submissions also read license/category metadata from
 | `inject.js` | Page-world script that passively observes Twitch's GraphQL traffic — game id↔name↔slug, campaign progress, and the full open-campaign list (`ViewerDropsDashboard`) |
 | `shared.js` | Helpers shared between background and content scripts (slugs + aliases, channel/directory/search URL parsing, game-name → open-campaign matching) |
 | `i18n.js` | Popup UI string tables (9 languages) + lookup/resolve/apply helpers; loaded in the popup and as a background script |
-| `popup.html` / `popup.js` | Settings UI: language picker, on/off switch, watch list with per-game campaign status and a "watch from" date/time picker, auto-watch / tab quota / priority mode, completion-based auto-off, "check All Campaigns now", sleep warning |
+| `popup.html` / `popup.js` | Settings UI: language picker, on/off switch, watch list with per-game campaign status and a "watch from" picker (inline month calendar for the date, shown DD/MM/YYYY, plus a typed HH:MM field), auto-watch / tab quota / priority mode, completion-based auto-off, "check All Campaigns now", sleep warning |
 | `scripts/submit-amo.js` | AMO submission pipeline |
 | `test/` | Node-based tests against a stubbed `browser.*` API / jsdom |
 
 ## Changelog
+
+### 0.6.5
+
+- **"Watch from" picker: a real calendar for the date, a typed field for
+  the time.** The five `<select>` dropdowns from 0.6.3 became an inline
+  month-grid calendar (click a day; it's ordinary in-flow popup DOM, so it
+  can't render behind the popup the way the native `<input type="date">`
+  panel did) shown as `DD/MM/YYYY`, plus a free-text time field that
+  accepts 24-hour (`14:30`, `1430`) or 12-hour (`2:30pm`, `2pm`) and
+  echoes back the parsed 24-hour form. Blank time = midnight; an
+  unparseable time turns the field red and isn't saved.
+- **Fix: a lone finished/expired campaign was never detected as done.**
+  Once every other tracked game's drops were claimed or expired, the
+  `/drops/inventory` page shows a single "In Progress" card, and
+  `findCampaignCardBoundary` (which delimits a card by finding a sibling
+  card) then returned a too-small element with no progress bars on
+  Twitch's real deep DOM — so the last game read as `total: 0` and could
+  never be marked complete. Its watch tab, and the whole run
+  (`watchPhase` → `all-done` → auto-off, and the inventory/campaigns
+  helper tabs), never ended. Added a fallback boundary (first ancestor
+  that also encloses a reward-tier progress bar) and a guard so a
+  no-signal parse can't overwrite a good earlier reading with zeros.
 
 ### 0.6.3
 

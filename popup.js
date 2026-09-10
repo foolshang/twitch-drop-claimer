@@ -176,12 +176,17 @@ function gameRowEl(game, index, isWatching, badge, detail, waitUntil) {
   return row;
 }
 
-// The "watch from" picker. Firefox mispositions / hides the native
-// <input type="date"> calendar panel inside a browserAction popup (it opens
-// behind the popup), so this is built from plain <select>s, which do work in a
-// popup - and it carries a time of day too, so auto-watch can start right when
-// a drop is released rather than at midnight.
+// The "watch from" picker: a month-grid calendar the user clicks a day in
+// (date shown as DD/MM/YYYY), plus a free-text HH:MM field they type into.
+// Both are ordinary popup DOM. The old build used <input type="date"> and a
+// row of <select>s; Firefox opens the native date panel *behind* the
+// browserAction popup, and the 24x12 time selects were too long to scroll -
+// so the calendar here is drawn inline in the row (it can never render
+// "behind" anything) and the time is typed, not picked.
 function waitControlEl(game, waitUntil) {
+  const box = document.createElement("div");
+  box.className = "g-wait-box";
+
   const wrap = document.createElement("div");
   wrap.className = "g-wait";
   wrap.setAttribute("role", "group");
@@ -191,62 +196,184 @@ function waitControlEl(game, waitUntil) {
   label.textContent = t("row_start_from");
   wrap.appendChild(label);
 
-  const d = waitUntil ? new Date(waitUntil) : null;
   const pad = (n) => String(n).padStart(2, "0");
-  const nowYear = new Date().getFullYear();
+  const locale = i18nLocale(LANG);
+  const initial = waitUntil ? new Date(waitUntil) : null;
+  const hasInitial = !!initial && !Number.isNaN(initial.getTime());
 
-  const mkSelect = (placeholder, options, selected) => {
-    const sel = document.createElement("select");
-    const ph = document.createElement("option");
-    ph.value = "";
-    ph.textContent = placeholder;
-    sel.appendChild(ph);
-    for (const [value, text] of options) {
-      const o = document.createElement("option");
-      o.value = String(value);
-      o.textContent = text;
-      if (selected != null && String(value) === String(selected)) o.selected = true;
-      sel.appendChild(o);
+  // the day the user has selected (null until they pick one), and the month
+  // the grid is currently showing
+  let sel = hasInitial
+    ? { y: initial.getFullYear(), m: initial.getMonth(), d: initial.getDate() }
+    : null;
+  const viewFrom = hasInitial ? initial : new Date();
+  let viewY = viewFrom.getFullYear();
+  let viewM = viewFrom.getMonth();
+
+  // --- date field: click to toggle the calendar ---
+  const dateField = document.createElement("button");
+  dateField.type = "button";
+  dateField.className = "g-date-field";
+  dateField.setAttribute("aria-label", t("wait_date_aria"));
+  const paintDateField = () => {
+    dateField.textContent = sel
+      ? `${pad(sel.d)}/${pad(sel.m + 1)}/${sel.y}`
+      : t("wait_pick_date");
+    dateField.classList.toggle("set", !!sel);
+  };
+  paintDateField();
+
+  const atSep = document.createElement("span");
+  atSep.className = "g-wait-sep";
+  atSep.textContent = t("wait_at");
+
+  // --- time field: free text, typed not picked ---
+  const timeField = document.createElement("input");
+  timeField.type = "text";
+  timeField.className = "g-time";
+  timeField.maxLength = 8;
+  timeField.placeholder = t("wait_time_ph");
+  timeField.setAttribute("aria-label", t("wait_time_aria"));
+  if (hasInitial && (initial.getHours() || initial.getMinutes())) {
+    timeField.value = `${pad(initial.getHours())}:${pad(initial.getMinutes())}`;
+  }
+
+  // Forgiving about how the time is typed, so neither a 24-hour nor a
+  // 12-hour habit is wrong. Case-insensitive, optional space before am/pm:
+  //   "14:30" "1430" "14" "24:00"     -> 24-hour (24:00 == 00:00)
+  //   "2:30pm" "2.30 pm" "2pm" "12am" -> 12-hour (12am -> 00:00, 12pm -> 12:00)
+  // -> {h, mi} | "empty" | null (unparseable)
+  const parseTime = () => {
+    let raw = timeField.value.trim().toLowerCase();
+    if (!raw) return "empty";
+    let mer = null;
+    const ap = raw.match(/([ap])\.?\s?m\.?$/);
+    if (ap) { mer = ap[1]; raw = raw.slice(0, ap.index).trim(); }
+    const m = raw.match(/^(\d{1,2})(?:[:.h\s]?(\d{2}))?$/);
+    if (!m) return null;
+    let h = Number(m[1]);
+    const mi = m[2] != null ? Number(m[2]) : 0;
+    if (mi > 59) return null;
+    if (mer) {
+      if (h < 1 || h > 12) return null;
+      h = mer === "a" ? (h === 12 ? 0 : h) : (h === 12 ? 12 : h + 12);
+    } else if (h === 24 && mi === 0) {
+      h = 0;
+    } else if (h > 23) {
+      return null;
     }
-    return sel;
+    return { h, mi };
   };
-  const range = (n, start, fmt) =>
-    Array.from({ length: n }, (_, i) => [i + start, fmt(i + start)]);
-
-  const yearSel = mkSelect("YYYY", range(4, nowYear - 1, (y) => y), d ? d.getFullYear() : null);
-  const monthSel = mkSelect("MM", range(12, 1, pad), d ? d.getMonth() + 1 : null);
-  const daySel = mkSelect("DD", range(31, 1, pad), d ? d.getDate() : null);
-  const hourSel = mkSelect("HH", range(24, 0, pad), d ? d.getHours() : null);
-  const minSel = mkSelect("mm", Array.from({ length: 12 }, (_, i) => [i * 5, pad(i * 5)]),
-    d ? Math.round(d.getMinutes() / 5) * 5 % 60 : null);
-
-  const sep = (txt) => {
-    const s = document.createElement("span");
-    s.className = "g-wait-sep";
-    s.textContent = txt;
-    return s;
-  };
-  wrap.append(yearSel, sep("-"), monthSel, sep("-"), daySel, hourSel, sep(":"), minSel);
 
   const commit = async () => {
-    const y = yearSel.value, mo = monthSel.value, da = daySel.value;
-    if (!y || !mo || !da) {
-      // an incomplete date means "no gate" - clear any stored one
+    if (!sel) {
+      // no date chosen -> no gate; drop any stored one
       if (waitUntil) await setGameWaitUntil(game.slug, null);
       return;
     }
-    const h = hourSel.value ? Number(hourSel.value) : 0;
-    const mi = minSel.value ? Number(minSel.value) : 0;
+    const time = parseTime();
+    timeField.classList.toggle("invalid", time === null);
+    if (time === null) return; // keep the stored gate until they fix the time
+    const { h, mi } = time === "empty" ? { h: 0, mi: 0 } : time;
+    // echo back the parsed time in one canonical 24-hour form, so whatever
+    // shorthand was typed ("2pm", "1430") the user sees exactly what stuck
+    if (time !== "empty") timeField.value = `${pad(h)}:${pad(mi)}`;
     // clamp the day to the chosen month (e.g. 31 -> 30 / 28) instead of the
     // Date constructor silently rolling over into the next month
-    const maxDay = new Date(Number(y), Number(mo), 0).getDate();
-    const day = Math.min(Number(da), maxDay);
-    const ts = new Date(Number(y), Number(mo) - 1, day, h, mi, 0, 0).getTime();
+    const maxDay = new Date(sel.y, sel.m + 1, 0).getDate();
+    const day = Math.min(sel.d, maxDay);
+    const ts = new Date(sel.y, sel.m, day, h, mi, 0, 0).getTime();
     if (!Number.isNaN(ts)) await setGameWaitUntil(game.slug, ts);
   };
-  for (const sel of [yearSel, monthSel, daySel, hourSel, minSel]) {
-    sel.addEventListener("change", commit);
-  }
+  timeField.addEventListener("change", commit);
+  timeField.addEventListener("blur", commit);
+
+  // --- calendar, drawn inline below the row ---
+  const cal = document.createElement("div");
+  cal.className = "g-cal";
+  cal.hidden = true;
+
+  const wdFmt = new Intl.DateTimeFormat(locale, { weekday: "narrow" });
+  const monthFmt = new Intl.DateTimeFormat(locale, { month: "long" });
+
+  const renderCal = () => {
+    cal.replaceChildren();
+
+    const head = document.createElement("div");
+    head.className = "g-cal-head";
+    const prev = document.createElement("button");
+    prev.type = "button";
+    prev.className = "g-cal-nav";
+    prev.textContent = "‹";
+    prev.setAttribute("aria-label", t("wait_cal_prev"));
+    prev.addEventListener("click", () => {
+      if (--viewM < 0) { viewM = 11; viewY--; }
+      renderCal();
+    });
+    const title = document.createElement("span");
+    // year shown as a plain Gregorian number so it matches the DD/MM/YYYY field
+    title.textContent = `${monthFmt.format(new Date(viewY, viewM, 1))} ${viewY}`;
+    const next = document.createElement("button");
+    next.type = "button";
+    next.className = "g-cal-nav";
+    next.textContent = "›";
+    next.setAttribute("aria-label", t("wait_cal_next"));
+    next.addEventListener("click", () => {
+      if (++viewM > 11) { viewM = 0; viewY++; }
+      renderCal();
+    });
+    head.append(prev, title, next);
+    cal.appendChild(head);
+
+    const grid = document.createElement("div");
+    grid.className = "g-cal-grid";
+
+    // weekday header, week starting Sunday (2023-01-01 was a Sunday)
+    for (let i = 0; i < 7; i++) {
+      const wd = document.createElement("div");
+      wd.className = "g-cal-wd";
+      wd.textContent = wdFmt.format(new Date(2023, 0, 1 + i));
+      grid.appendChild(wd);
+    }
+
+    const firstDow = new Date(viewY, viewM, 1).getDay(); // 0 = Sunday
+    const daysInMonth = new Date(viewY, viewM + 1, 0).getDate();
+    const now = new Date();
+
+    for (let i = 0; i < firstDow; i++) {
+      const blank = document.createElement("span");
+      blank.className = "g-cal-day blank";
+      grid.appendChild(blank);
+    }
+    for (let dn = 1; dn <= daysInMonth; dn++) {
+      const day = document.createElement("button");
+      day.type = "button";
+      day.className = "g-cal-day";
+      day.textContent = String(dn);
+      if (now.getFullYear() === viewY && now.getMonth() === viewM && now.getDate() === dn) {
+        day.classList.add("today");
+      }
+      if (sel && sel.y === viewY && sel.m === viewM && sel.d === dn) {
+        day.classList.add("selected");
+      }
+      day.addEventListener("click", async () => {
+        sel = { y: viewY, m: viewM, d: dn };
+        paintDateField();
+        renderCal();
+        cal.hidden = true;
+        await commit();
+      });
+      grid.appendChild(day);
+    }
+    cal.appendChild(grid);
+  };
+
+  dateField.addEventListener("click", () => {
+    if (cal.hidden) renderCal();
+    cal.hidden = !cal.hidden;
+  });
+
+  wrap.append(dateField, atSep, timeField);
 
   if (waitUntil) {
     const clearBtn = document.createElement("button");
@@ -259,7 +386,8 @@ function waitControlEl(game, waitUntil) {
     wrap.appendChild(clearBtn);
   }
 
-  return wrap;
+  box.append(wrap, cal);
+  return box;
 }
 
 async function renderGameStatus() {

@@ -212,6 +212,59 @@ async function testMultipleCardsStayIndependent() {
   console.log("  OK  two adjacent campaign cards are correctly separated, tiers never bleed across cards");
 }
 
+async function testLoneDeeplyNestedCardStillGetsItsTiers() {
+  // Once every other tracked game's drops are claimed/expired, the inventory
+  // page's "In Progress" section is down to a single campaign card. On Twitch's
+  // real, deeply-nested DOM the "walk up until a parent holds 2+ boxart images"
+  // boundary search then runs out of steps still inside the boxart column and
+  // returns a tiny wrapper with no progress bars - so the campaign is read as
+  // total:0 and can never be marked complete/expired, and its watch tab (plus
+  // the whole run) never ends. Reproduce that shape: one card, buried deep,
+  // only one boxart image on the page.
+  const card = cardHtml({
+    gameId: "1264310518",
+    campaignName: "Ignite MSF 2026 Final Day",
+    tiers: [
+      { now: 100, label: "Tier 1", durationText: "" },
+      { now: 100, label: "Tier 2", durationText: "" },
+    ],
+  });
+  const deep = new Array(16).fill(null).reduce((acc) => `<div class="pageChrome">${acc}</div>`, card);
+  const { ctx } = makeSandbox(deep);
+  const watchList = [{ input: "marvel rivals", slug: "marvel-rivals" }];
+  const gameIdMap = { "1264310518": "Marvel Rivals" };
+
+  const result = callParse(ctx, watchList, gameIdMap);
+  assert.strictEqual(result.length, 1, "the lone card must still be found");
+  assert.strictEqual(result[0].total, 2, "both tier progress bars must be counted, not lost to a too-small boundary");
+  assert.strictEqual(result[0].claimed, 2, "a fully-watched lone campaign must read as complete");
+
+  console.log("  OK  a single deeply-nested campaign card (page's last one) still yields its tiers, so completion is detectable");
+}
+
+async function testEmptyReadingIsNotEmitted() {
+  // A card whose tiers haven't rendered yet (React is async) and that carries
+  // no expired / not-connected text has nothing usable - emitting claimed:0
+  // total:0 would overwrite a real earlier reading in campaignProgress and
+  // read as "not done" forever. It must be skipped, not reported as zeros.
+  const bare = `
+    <div class="cardBoundary">
+      <div class="imgWrap">
+        <img data-test-selector="DropsCampaignInProgressDescription-game-card-image"
+             src="https://static-cdn.jtvnw.net/ttv-boxart/1264310518_IGDB-285x380.jpg">
+      </div>
+      <div class="campaignInfo"><div>Ignite MSF 2026 Day 4</div></div>
+    </div>`;
+  const { ctx } = makeSandbox(bare);
+  const watchList = [{ input: "marvel rivals", slug: "marvel-rivals" }];
+  const gameIdMap = { "1264310518": "Marvel Rivals" };
+
+  const result = callParse(ctx, watchList, gameIdMap);
+  assert.strictEqual(result.length, 0, "a no-bars, no-status reading must be dropped so it can't clobber good prior data");
+
+  console.log("  OK  a card that parsed to nothing usable is skipped, leaving any earlier reading intact");
+}
+
 async function testExpiredAndAccountNotConnectedTextDetection() {
   const html = cardHtml({
     gameId: "1264310518",
@@ -320,6 +373,8 @@ async function testSameSlugTwoCampaignsActiveFirstStillWins() {
     await testMatchesByBoxartIdNotText();
     await testUnknownBoxartIdSkippedNotGuessed();
     await testPercentAndClaimedFromProgressbar();
+    await testLoneDeeplyNestedCardStillGetsItsTiers();
+    await testEmptyReadingIsNotEmitted();
     await testMultipleCardsStayIndependent();
     await testExpiredAndAccountNotConnectedTextDetection();
     await testExpiresAtParsedFromEndDateFormat();

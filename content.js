@@ -336,12 +336,27 @@
 
   function findCampaignCardBoundary(img) {
     let node = img;
-    for (let i = 0; i < 10 && node; i++) {
+    for (let i = 0; i < 12 && node; i++) {
       if (node.querySelectorAll(GAME_CARD_IMAGE_SELECTOR).length === 1) {
         const parent = node.parentElement;
         const parentImageCount = parent ? parent.querySelectorAll(GAME_CARD_IMAGE_SELECTOR).length : 99;
         if (!parent || parentImageCount >= 2) return node;
       }
+      node = node.parentElement;
+    }
+    // The count-the-images walk above needs a sibling card to delimit against.
+    // When the whole page has only ONE campaign left in "In Progress" (the
+    // normal end state once every other game's drops are claimed/expired) that
+    // delimiter never appears, and on Twitch's real, deeply-nested DOM the walk
+    // runs out of steps still inside the boxart column - so fall back to the
+    // first ancestor that also encloses a reward-tier progress bar. That node
+    // is where the boxart column and the tier column meet: the card root.
+    // Without this, a lone finished/expired campaign is read as total:0 and can
+    // never be marked complete, so its watch tab (and the whole run) never ends.
+    node = img;
+    for (let i = 0; i < 8 && node; i++) {
+      if (node.querySelectorAll(GAME_CARD_IMAGE_SELECTOR).length >= 2) break;
+      if (node.querySelector('[role="progressbar"]')) return node;
       node = node.parentElement;
     }
     return img.parentElement || img;
@@ -482,6 +497,14 @@
           foundDuration = true;
         }
       }
+
+      // A reading with no tier bars and no expired/not-connected text carries
+      // nothing usable - the card almost certainly didn't finish rendering
+      // (React is async) or the boundary walk missed. Emitting it anyway would
+      // overwrite a real earlier reading in campaignProgress with claimed:0
+      // total:0, which reads as "not done" forever. Skip it and let the prior
+      // reading stand; the next scan picks it up once the DOM settles.
+      if (bars.length === 0 && !expired && !accountNotConnected) continue;
 
       results.push({
         slug,

@@ -307,18 +307,35 @@
     color: var(--muted);
     margin-top: 2px;
   }
+  .game-status-row .g-wait-box { margin-top: 5px; }
   .game-status-row .g-wait {
     display: flex;
     align-items: center;
     flex-wrap: wrap;
     gap: 4px 5px;
-    margin-top: 5px;
     color: var(--muted);
     font-size: 11px;
   }
-  /* built from plain <select>s, not <input type="date">: Firefox mispositions
-     / hides the native date-picker panel inside a browserAction popup */
-  .game-status-row .g-wait select {
+  .game-status-row .g-wait .g-wait-sep { color: var(--off); }
+  /* an inline month grid, not <input type="date">: Firefox opens the native
+     date panel behind the browserAction popup */
+  .game-status-row .g-wait button.g-date-field {
+    width: auto;
+    background: var(--bg);
+    border: 1px solid #303036;
+    border-radius: 4px;
+    color: var(--muted);
+    padding: 3px 8px;
+    font-size: 11px;
+    font-weight: 400;
+    font-family: inherit;
+    cursor: pointer;
+  }
+  .game-status-row .g-wait button.g-date-field.set { color: var(--text); }
+  .game-status-row .g-wait button.g-date-field:hover { border-color: var(--accent); }
+  .game-status-row .g-wait .g-time {
+    width: 52px;
+    box-sizing: border-box;
     background: var(--bg);
     border: 1px solid #303036;
     border-radius: 4px;
@@ -326,9 +343,10 @@
     padding: 3px 4px;
     font-size: 11px;
     font-family: inherit;
-    color-scheme: dark;
+    text-align: center;
   }
-  .game-status-row .g-wait .g-wait-sep { color: var(--off); }
+  .game-status-row .g-wait .g-time:focus { outline: none; border-color: var(--accent); }
+  .game-status-row .g-wait .g-time.invalid { border-color: var(--err); }
   .game-status-row .g-wait button.g-wait-clear {
     width: auto;
     background: none;
@@ -337,6 +355,69 @@
     padding: 2px 7px;
     font-size: 11px;
     font-weight: 400;
+  }
+
+  .game-status-row .g-cal {
+    margin-top: 6px;
+    background: var(--bg);
+    border: 1px solid #303036;
+    border-radius: 6px;
+    padding: 6px;
+    user-select: none;
+  }
+  .game-status-row .g-cal-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 4px;
+  }
+  .game-status-row .g-cal-head span {
+    font-weight: 600;
+    color: var(--text);
+    font-size: 11px;
+  }
+  .game-status-row .g-cal-head button.g-cal-nav {
+    width: auto;
+    background: none;
+    border: 1px solid #303036;
+    color: var(--muted);
+    border-radius: 4px;
+    padding: 1px 8px;
+    font-size: 12px;
+    font-weight: 400;
+  }
+  .game-status-row .g-cal-grid {
+    display: grid;
+    grid-template-columns: repeat(7, 1fr);
+    gap: 2px;
+  }
+  .game-status-row .g-cal-wd {
+    text-align: center;
+    color: var(--off);
+    font-size: 9.5px;
+    padding: 2px 0;
+  }
+  .game-status-row .g-cal-day {
+    padding: 3px 0;
+    text-align: center;
+    font-size: 11px;
+  }
+  .game-status-row button.g-cal-day {
+    width: auto;
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    color: var(--text);
+    font-weight: 400;
+    cursor: pointer;
+  }
+  .game-status-row button.g-cal-day:hover { background: #303036; }
+  .game-status-row .g-cal-day.blank { visibility: hidden; }
+  .game-status-row button.g-cal-day.today { border-color: var(--off); }
+  .game-status-row button.g-cal-day.selected {
+    background: var(--accent);
+    color: #0e0e10;
+    font-weight: 600;
   }
   #campaignsCheck {
     width: auto;

@@ -1128,3 +1128,87 @@ public AMO listed channel via `npm run submit:listed` - lint clean
 `web-ext-artifacts/33d37586a96d443fa884-0.6.4.xpi`, recorded in
 `.amo-submitted-versions.json`. Firefox installs auto-update from the AMO
 listing.
+
+## 2026-09-10 — "Watch from" picker gets a calendar; a lone finished campaign was never detected as done (0.6.5)
+
+### Watch-from picker: calendar for the date, typed field for the time (requested)
+
+**Problem (reported):** the five `<select>` dropdowns from 0.6.3 (year /
+month / day / hour / minute) worked but were awkward - the user wanted to
+see a calendar to pick the date, and found the hour+minute selects "too
+long" to scroll. They also asked that the date read day-then-month-then-year.
+
+**Fix:** `waitControlEl(game, waitUntil)` in `popup.js` rebuilt.
+- **Date:** an inline month-grid calendar drawn in the row itself. It is
+  ordinary in-flow popup DOM (`position: static`), not the native
+  `<input type="date">` panel, so it cannot render behind the popup (the
+  0.6.3 problem) - verified live in `web-ext run` that the rendered `.g-cal`
+  computes to `position: static`. `‹` / `›` change month, today is
+  outlined, the selected day is filled; weekday header is
+  `Intl.DateTimeFormat(locale, {weekday:"narrow"})`, week starts Sunday;
+  the month title is the locale month name + a plain Gregorian year (so it
+  matches the field, no Buddhist-era mismatch for `th`). The trigger button
+  shows the choice as `DD/MM/YYYY`.
+- **Time:** a free-text field, not a picker. `parseTime()` accepts 24-hour
+  (`14:30`, `1430`, `14`, `24:00`→`00:00`) and 12-hour (`2:30pm`,
+  `2.30 PM`, `2pm`, `12am`→`00:00`, `12pm`→`12:00`), case-insensitive,
+  optional space before am/pm. On a good parse the field is rewritten to
+  the canonical `HH:MM` so the user sees what stuck; an unparseable
+  non-empty value turns the field red (`.g-time.invalid`) and is not
+  committed (the stored gate stands); blank = midnight.
+- The day is still clamped to the chosen month, the stored value is still
+  a single epoch-ms `gameWaitUntil[slug]`, and `formatDateTime()` /
+  `background.js` are unchanged.
+- `popup.html`: the `.g-wait select` rule replaced by `.g-date-field` /
+  `.g-time` / `.g-cal*` rules (`.g-wait` now sits in a `.g-wait-box` so the
+  calendar can be a block sibling below the flex row). `i18n.js`: seven new
+  keys (`wait_pick_date`, `wait_time_ph`, `wait_time_aria`,
+  `wait_date_aria`, `wait_cal_prev`, `wait_cal_next`, `wait_at`) across all
+  nine languages.
+
+### Fix: a lone finished / expired campaign was never marked done (reported)
+
+**Problem (reported, confirmed live):** with every switch on and drops
+collected, the Twitch tabs never closed, no "all claimed" badge appeared,
+and the master switch never auto-off'd - even though Twitch's own inventory
+showed everything done.
+
+**Root cause (found via `web-ext run` + Firefox RDP against the reporter's
+real logged-in profile):** all three symptoms share one signal,
+`campaignProgress[slug].allComplete`, set from the `/drops/inventory` DOM
+scrape. `findCampaignCardBoundary()` delimits a campaign card by walking up
+from its boxart `<img>` until an ancestor's parent holds 2+ boxart images
+(i.e. a sibling card). Once every *other* tracked game's drops are
+claimed/expired - the normal end state - the "In Progress" section is down
+to a single card, that delimiter never appears, and on Twitch's real deeply
+nested DOM the 12-step walk runs out still inside the boxart column and
+returns `img.parentElement`: a wrapper with **no progress bars and no
+text**. So the last remaining game parses to `total: 0` →
+`allComplete` / `expired` can never be true → its watch tab never closes →
+`watchPhase` never reaches `all-done` → auto-off never fires → the
+inventory / campaigns helper tabs stay open. Reproduced exactly against the
+reporter's live inventory (one expired "2026 BDO Drops" card): old boundary
+→ `total: 0`; new boundary → `total: 1, expired: true`, and after feeding
+it through the real pipeline `campaignProgress['black-desert']` updated to
+`expired: true`.
+
+**Fix (`content.js`):**
+- `findCampaignCardBoundary()`: after the existing count-the-images walk
+  fails, a second walk up from the `<img>` returns the first ancestor that
+  also encloses a `[role="progressbar"]` - the node where the boxart column
+  and the reward-tier column meet, i.e. the card root - capped at 8 levels
+  and stopping if it would span 2+ cards. The proven multi-card path is
+  untouched; this only runs when the old logic returned nothing.
+- `parseInventoryCampaigns()`: a reading with no tier bars and no
+  expired / not-connected text is skipped instead of pushed, so a card that
+  didn't finish rendering can't overwrite a real earlier
+  `campaignProgress` entry with `claimed: 0, total: 0` ("not done" forever).
+
+**Tests:** `test/inventory-parse.test.js` +
+`testLoneDeeplyNestedCardStillGetsItsTiers` (one card buried ~16 levels
+deep, only one boxart image on the page - still yields its tiers) and
+`testEmptyReadingIsNotEmitted` (a no-bars, no-status card is dropped). All
+seven test files pass; `web-ext lint` clean (0/0/0). A jsdom check of
+`waitControlEl` covered the calendar grid, `DD/MM/YYYY`, the 12h/24h time
+parser, invalid-time rejection, and the round-trip from a stored timestamp.
+`BUILD_MARKER` → `2026-09-10-r1`, `manifest.json` → 0.6.5.
