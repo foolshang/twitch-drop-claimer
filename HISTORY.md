@@ -1414,3 +1414,10 @@ ran against throwaway copies of `D:\ff-twitch-profile`.
 Docs/i18n/popup only - no `background.js`/`content.js` changes, so
 `BUILD_MARKER` stays `2026-09-10-r1`. `web-ext lint` clean (0/0/0);
 `node -c i18n.js` clean. `manifest.json` → 0.6.6.
+
+Committed to `master` as `34e2a05`, pushed to GitHub (`dev` fast-forwarded
+to match, local and remote). Submitted to the public AMO listed channel
+via `npm run submit:listed` - lint clean (0/0/0), signed and auto-approved
+to `web-ext-artifacts/33d37586a96d443fa884-0.6.6.xpi`, recorded in
+`.amo-submitted-versions.json`. Firefox installs auto-update from the AMO
+listing.
