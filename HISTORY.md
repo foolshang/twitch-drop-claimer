@@ -1219,3 +1219,198 @@ via `npm run submit:listed` - lint clean (0/0/0), signed and auto-approved
 to `web-ext-artifacts/33d37586a96d443fa884-0.6.5.xpi`, recorded in
 `.amo-submitted-versions.json`. Firefox installs auto-update from the AMO
 listing.
+
+## 2026-09-12 — Experiment: does spoofing Page Visibility help the screen-off stall? (no code shipped)
+
+**Question asked:** for the 0.6.4 cause-2 stall (Firefox suspending
+already-playing background video when the monitor turns off), is the
+actual culprit Twitch's own JS reading `document.hidden` and pausing
+itself, or Firefox's engine suspending decode directly? If the latter,
+spoofing `document.hidden`/`visibilityState` from a content script would
+be useless. Explicit instruction from the user: find out live before
+writing any spoofing code, and do not ship anything from this session.
+
+**Method:** `web-ext run` + Firefox RDP against copies of the real logged-in
+profile (same technique as [[rdp-live-testing]]), each copy given a
+different `about:config` state, driven by a small reusable RDP client
+script (`rdp.mjs`, not checked in) that can eval in both the content world
+(`document.*`) and the background page world (`browser.*`, via
+`listAddons` → `getWatcher` → `watchTargets`). A tab was forced into a
+"background" state via `browser.tabs.update` (selecting a different tab in
+the same window), then polled every 3s for `document.hidden`,
+`visibilityState`, and the `<video>` element's `paused` / `readyState` /
+`currentTime`.
+
+**Finding 1 — the freeze signature is engine-side, not a page script:**
+every freeze reproduced (see table below) showed `video.paused` flipping
+to `true` **at the same instant** `readyState` dropped from 4 to 3, with
+`currentTime` frozen for the duration. A page script calling `pause()`
+would not touch `readyState` (HLS segment buffering continues regardless
+of the paused flag) - this signature is Gecko's own media pipeline
+suspending decode, not Twitch's JS. Confirmed live, four separate profile
+configurations, same channel, same harness:
+
+| `about:config` state | Result |
+|---|---|
+| All defaults (nothing changed) | Froze at ~100s, recovered on its own ~15s later |
+| The 3 prefs already documented in the README (`widget.windows.window_occlusion_tracking.enabled`, `media.suspend-bkgnd-video.enabled`, `network.http.throttle.enable`, all `false`) | Froze at ~139s, had **not** recovered 57s later when the run ended |
+| Same 3 prefs **+** `dom.ipc.processPriorityManager.backgroundUsesEcoQoS` = `false` (Windows 11's per-process "Efficiency Mode" throttling for background content processes, landed Firefox 108, [bug 1796525](https://bugzilla.mozilla.org/show_bug.cgi?id=1796525)) | No freeze across a 220s run |
+
+**Conclusion on the question asked:** the culprit is the Firefox engine,
+confirmed live, not Twitch reading `document.hidden`. **No
+`document.hidden`/`visibilityState` spoofing code was written** - the
+evidence never supported it, since Gecko's suspend logic never consults
+that JS-visible property.
+
+**Finding 2 - the finding above almost led to the wrong fix.** All of the
+above used `browser.tabs.update` to force the tab into a plain background
+tab (non-selected, in a window shared with other tabs) - which is *not*
+how this extension's own 0.6.4 dedicated-window architecture keeps a
+watch tab. In production, a watch tab is normally the sole/active tab of
+its own dedicated window ([[screen-off-video-stall]]), which is a
+different Page Visibility state than "a background tab in a shared
+window." Retested against that exact shape: a genuinely separate window
+holding only the watch tab (active within it), OS focus given back to a
+different window (matching that `background.js` never calls
+`windows.update({focused:true})`), then a real 15-minute idle-triggered
+screen-off (`display timeout` already at 60s on the test machine; no
+synthetic `SC_MONITORPOWER` call this time).
+
+Result: **`document.hidden` stayed `false` for all 300 samples across the
+full 15 minutes**, `paused` never flipped, `readyState` never left 4,
+`currentTime` advanced in a straight line the entire time. Firefox's
+Page Visibility state for a tab is driven by whether it's the *selected*
+tab of its own window, not by whether that window has OS focus - so the
+0.6.4 dedicated-window design already keeps the watch tab "visible" from
+Firefox's point of view even while genuinely off-screen behind other
+windows with the monitor off, and none of the suspend paths above ever
+engage.
+
+**Decision:** no code changes. The three-run pref comparison (row 2 vs
+row 3 of the table) is a real, reproducible difference, but it doesn't
+generalize into a fix worth shipping: it was only ever observed against
+an artificial same-window-background tab, a shape this extension's own
+tabs are not normally in. On the actual shipped tab shape, the stall
+did not reproduce at all in 15 real minutes, pref changes or not. README
+and the popup are left as they are - the existing three-pref
+troubleshooting section stays as a fallback for anyone whose tab
+genuinely ends up backgrounded some other way (e.g. manually clicking
+into the dedicated window and switching its tab away from the watch
+tab), and the `backgroundUsesEcoQoS` pref is not added to it, since one
+220-second run isn't enough to promote it and, per this session's second
+finding, it likely isn't the operative variable for this extension's own
+tabs anyway.
+
+## 2026-09-12 (follow-up) — Repeat runs confirm pref #4 and the dedicated-window finding (0.6.6)
+
+**Why repeat this:** the experiment above drew its `backgroundUsesEcoQoS`
+conclusion from a single ~220-second run, and its dedicated-window
+conclusion from a single 15-minute run - both explicitly flagged as not
+enough to promote into README/popup. This follow-up reruns both, longer
+and multiple times, to actually settle it.
+
+**Method:** identical harness and `rdp.mjs` driver as above (not checked
+in), run via several `web-ext` instances (staggered, sometimes 2-3
+running concurrently against independent fresh copies of the same
+profile) to fit the whole matrix into one sitting. Every run used the
+real 60-second AC display-idle timeout already set on the test machine
+(confirmed via `powercfg /query SCHEME_CURRENT SUB_VIDEO VIDEOIDLE` =
+`0x3c`) for a genuine idle-triggered screen-off - no synthetic
+`SC_MONITORPOWER` calls this time. `GetLastInputInfo` (Win32, checked
+independently of the test harness) confirmed 0 real keyboard/mouse input
+for the full test window, so the idle timer was never reset by the
+testing process itself.
+
+**Freeze signature, restated so it doesn't need re-deriving next time:**
+a real freeze is `video.paused` flipping to `true` at the exact same
+polled instant `video.readyState` drops from `4` to `3`, with
+`currentTime` frozen for the duration - Gecko's own media pipeline
+suspending decode. A page script calling `.pause()` would leave
+`readyState` alone, since HLS segment buffering doesn't care about the
+paused flag. **Do not mistake an ordinary `readyState` 3/4 fluctuation
+for a freeze** - Twitch's own stream sits at `readyState:3` for long
+healthy stretches with `paused:false` and `currentTime` still advancing
+every single sample (visible throughout both tables below); only
+`paused:true` at the same instant means anything.
+
+**Round A - pref #4, same artificial shared-window background-tab shape
+as the original experiment above.** Profile: the 3 documented prefs +
+`dom.ipc.processPriorityManager.backgroundUsesEcoQoS` = `false`. Three
+independent 13-minute (780s) runs, fresh `web-ext` launch and fresh live
+channel each time:
+
+| Run | Channel | Samples | `document.hidden` | Freeze? |
+|---|---|---|---|---|
+| A1 | fubgun | 156 | `true` for all samples (correctly - this shape *is* a real background tab) | None |
+| A2 | sappyar | 156 | `true` for all samples | None |
+| A3 | sappyar | 155 | `true` for all samples | None |
+
+**Round B - the production dedicated-window shape**, profile = the 3
+baseline prefs only, **no pref #4** (testing whether the 0.6.x
+architecture alone is enough without any pref). One 13-minute (780s) run,
+reusing the extension's own real `watchWindowId` window and real
+temporarily-installed background.js (not a hand-rolled substitute),
+`autoWatchEnabled` turned off first so the extension's own automation
+didn't fight the manually-arranged tab:
+
+| Run | Channel | Samples | `document.hidden` | Screen state | Freeze? |
+|---|---|---|---|---|---|
+| B | fubgun | 156 | `false` for all 156 samples | ON for ~60-90s, then genuine idle screen-off for the rest | None |
+
+**Verdict on pref #4: confirmed**, not just n=1 anymore. Zero freezes
+across all three Round A runs, each over 3x longer than the original
+220-second trial that first surfaced it, and well past the ~139s mark
+where the baseline-3-prefs-only run froze and never recovered (original
+experiment above). `dom.ipc.processPriorityManager.backgroundUsesEcoQoS`
+= `false` is promoted to the README's numbered pref list and the popup's
+sleep-warning (see "Doc updates" below).
+
+**Verdict on the dedicated-window architecture alone: confirmed
+sufficient.** This reproduces the original single 15-minute finding with
+an independent run and a longer/more faithful setup (the real production
+window and code path, not a re-implementation). With **zero `about:config`
+changes at all**, a watch tab that stays the active tab of its own
+dedicated window never sees `document.hidden` flip to `true` and never
+freezes, even through a genuine idle screen-off.
+
+**None of the four `about:config` prefs (README's numbered list, items
+1-4, `backgroundUsesEcoQoS` included) are required for normal use of this
+extension, and installing it does not require touching `about:config` at
+all.** The dedicated watch window (`getOrCreateWatchWindow()`,
+[[screen-off-video-stall]]) already handles the screen-off case on its
+own, unconditionally, for every user. All four prefs exist purely as a
+troubleshooting fallback for one specific edge case: a watch tab that has
+somehow stopped being the active tab of its own dedicated window (e.g. the
+user manually clicked into that window and switched its tab away from the
+watch tab). Outside that edge case they do nothing observable. A future
+session should not read this file and conclude a pref needs to be set
+before or during normal operation - it doesn't.
+
+**On Page Visibility spoofing - do not revisit this.** Already ruled out
+earlier today (Finding 1 above) and reconfirmed by every sample in both
+tables here: every freeze this investigation has ever found is Gecko's
+engine suspending decode, never a script reading `document.hidden`. There
+is no `document.hidden`/`visibilityState` value a content script could
+report that would change Gecko's own suspend decision - spoofing it
+cannot work and should not be attempted again by a future session.
+
+**Doc updates from this follow-up:** README.md's numbered `about:config`
+list under "Known limitation: screen turns off, drop progress stops" gets
+a 4th entry for `dom.ipc.processPriorityManager.backgroundUsesEcoQoS`.
+The popup's `#sleepWarning` block (previously about full machine sleep
+only) gets one added line per locale in `i18n.js` pointing to that README
+section, since it's the same warning surface users already see and the
+screen-off case is a distinct failure mode from full sleep that the
+existing copy never mentioned.
+
+**Process note:** every test `web-ext`/Firefox/RDP process from this
+follow-up (5 `web-ext` runs total: A1, A2, A3, B, plus the initial
+connectivity trial) was torn down after its round; the machine was
+confirmed free of stray `node.exe`/`firefox.exe` afterward. `rdp.mjs`
+remains a disposable scratchpad script, not checked in. The real Firefox
+profile the user browses with day-to-day was never touched - all of this
+ran against throwaway copies of `D:\ff-twitch-profile`.
+
+Docs/i18n/popup only - no `background.js`/`content.js` changes, so
+`BUILD_MARKER` stays `2026-09-10-r1`. `web-ext lint` clean (0/0/0);
+`node -c i18n.js` clean. `manifest.json` → 0.6.6.

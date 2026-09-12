@@ -133,6 +133,10 @@ you actually browse with (restart Firefox after changing any of these):
    `media.suspend-bkgnd-video.delay-ms`, a few seconds by default)
 3. `network.http.throttle.enable` → `false` (background-tab network
    throttling, if 1-2 still aren't enough)
+4. `dom.ipc.processPriorityManager.backgroundUsesEcoQoS` → `false`
+   (Windows 11's per-process "Efficiency Mode" throttling for background
+   content processes, Firefox 108+ - confirmed live over three separate
+   13-minute runs to prevent the freeze on its own even without 1-3)
 
 Or skip prefs entirely: `powercfg /change monitor-timeout-ac 0` (disables
 Windows' own idle-driven display-off) and turn the monitor off yourself via
