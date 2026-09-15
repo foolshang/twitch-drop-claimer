@@ -1421,3 +1421,51 @@ via `npm run submit:listed` - lint clean (0/0/0), signed and auto-approved
 to `web-ext-artifacts/33d37586a96d443fa884-0.6.6.xpi`, recorded in
 `.amo-submitted-versions.json`. Firefox installs auto-update from the AMO
 listing.
+
+## 2026-09-15 — Fix: a fully-claimed campaign's vanished card never marked the game done (0.6.7)
+
+**Problem (reported):** with every drop for a game actually claimed
+(confirmed by the user directly on `/drops/inventory`), the popup kept
+showing stale progress (e.g. "5/6") indefinitely, and the game's watch tab
+never closed.
+
+**Root cause:** `campaignProgress[slug].allComplete` (the single signal
+`isGameDone()` and the popup's "all claimed" badge both key off) is only
+ever set inside `mergeInventoryProgress()`, and only for slugs actually
+present in the `campaigns` array `content.js` reports. `parseInventoryCampaigns()`
+finds cards via a selector scoped to Twitch's "In Progress" section
+(`DropsCampaignInProgressDescription-game-card-image`) - once every reward
+tier of a campaign is claimed, Twitch removes that card from this section
+entirely (it has nothing left "in progress" to show), so the card simply
+stops appearing in any future scan. Compounding this, `content.js`'s
+`scanInventory()` only sent its `inventoryProgress` message when
+`campaigns.length > 0`, so the case where a watched game's card disappeared
+- including the common end state where every remaining watched game just
+finished at once, leaving zero cards at all - was silently dropped before
+it ever reached `background.js`. The last real reading (`claimed: 5, total:
+6`) had no path to ever being overwritten.
+
+**Fix:**
+- `content.js`: `scanInventory()` now always sends the `inventoryProgress`
+  message, even with an empty `campaigns` array - a watched game's card
+  being missing is itself a signal, not something to swallow.
+- `background.js`: `mergeInventoryProgress()` no longer early-returns on an
+  empty `campaigns` array. New reconciliation pass: for every game still on
+  `watchList` that has a prior reading with real progress (`total > 0`, not
+  already `allComplete`/`expired`) but is absent from the current scan,
+  track a per-slug `missingScans` counter. Once a slug has been missing for
+  `REQUIRED_MISSING_SCANS` (2) consecutive scans (~2 minutes apart,
+  `content.js`'s `inventoryScanIntervalId`), it's inferred `allComplete:
+  true` and its watch tab closes - matching the badge Twitch's own
+  inventory page already shows. Requiring 2 consecutive misses (not 1)
+  keeps this fail-closed against a single mid-render hiccup, the same
+  posture as every other DOM-scrape heuristic in this file.
+
+**Tests:** `test/auto-watch-multi-tab.test.js` -
+`testCardVanishedFromInProgressMarksComplete` (two watched games; one
+game's card vanishes for 2 consecutive scans while the other keeps
+reporting normally - asserts the tab stays open after 1 miss, only closes
+after the 2nd, and the still-reporting game is untouched throughout). All
+seven test files pass; `web-ext lint` clean (0/0/0).
+
+`BUILD_MARKER` → `2026-09-15-r1`, `manifest.json` → 0.6.7.

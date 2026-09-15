@@ -164,6 +164,15 @@ const INVALID_SLUG_RETRY_MS = 45 * 60 * 1000;
 const VERIFY_DELAY_MS = (RELOAD_PERIOD_MIN + 2) * 60 * 1000; // 17 min
 const CHANNEL_BLOCK_COOLDOWN_MS = 45 * 60 * 1000; // don't immediately re-pick a channel we just rejected
 
+// A watched game's card vanishing from /drops/inventory's "In Progress"
+// section (parseInventoryCampaigns returning nothing for its slug) usually
+// means every reward tier just got claimed and Twitch moved/removed the card
+// - but a single miss could just be a mid-render hiccup. Require this many
+// consecutive scans (each ~60s apart, content.js's inventoryScanIntervalId)
+// with the card absent before inferring allComplete, matching the fail-closed
+// posture used everywhere else in this file.
+const REQUIRED_MISSING_SCANS = 2;
+
 const log = (...args) => console.log("[DropClaimer]", ...args);
 
 // serializes every auto-watch mutation so concurrent tab events (multiple
@@ -794,16 +803,21 @@ async function applyResolvedSlug(badSlug, goodSlug) {
 }
 
 async function mergeInventoryProgress(campaigns) {
-  if (!campaigns || campaigns.length === 0) return;
+  // campaigns may legitimately be [] (every watched game's card is gone from
+  // "In Progress") - still need to run so the missing-card reconciliation
+  // below gets a chance to fire. Only a genuinely missing/malformed message
+  // short-circuits.
+  if (!campaigns) return;
 
   return serialized(async () => {
     const cfg = await browser.storage.local.get([
-      "campaignProgress", "watchTabs", "watchMeta", "dropSignals", "gameIdMap", "gameActiveIds",
+      "campaignProgress", "watchTabs", "watchMeta", "dropSignals", "gameIdMap", "gameActiveIds", "watchList",
     ]);
     const progress = cfg.campaignProgress || {};
     const watchTabs = { ...(cfg.watchTabs || {}) };
     const watchMeta = { ...(cfg.watchMeta || {}) };
     const dropSignals = { ...(cfg.dropSignals || {}) };
+    const watchList = cfg.watchList || [];
     let anyJustFinished = false;
 
     // GQL's own campaign.status ("ACTIVE"/"EXPIRED", learned alongside
@@ -833,6 +847,7 @@ async function mergeInventoryProgress(campaigns) {
         expiresAt: typeof c.expiresAt === "number" ? c.expiresAt : null,
         timeRemainingMin: c.timeRemainingMin ?? null,
         updatedAt: Date.now(),
+        missingScans: 0,
       };
       if ((allComplete || expired) && watchTabs[c.slug]) {
         await closeWatchTab(watchTabs, c.slug);
@@ -840,6 +855,34 @@ async function mergeInventoryProgress(campaigns) {
         delete dropSignals[c.slug];
         anyJustFinished = true;
         log(c.slug, allComplete ? "fully claimed" : "expired", "- closed its tab");
+      }
+    }
+
+    // Reconcile watched games whose card wasn't in this scan at all. Only
+    // acts on a slug that: is still on the watch list, has a prior reading
+    // with real progress (total > 0 - never invent completion for a game we
+    // never actually saw a card for), and isn't already resolved. See
+    // REQUIRED_MISSING_SCANS above for why this waits for corroboration
+    // instead of acting on the first miss.
+    const seenSlugs = new Set(campaigns.map((c) => c.slug));
+    for (const game of watchList) {
+      const slug = game.slug;
+      if (seenSlugs.has(slug)) continue;
+      const p = progress[slug];
+      if (!p || p.allComplete || p.expired || !(p.total > 0)) continue;
+
+      const missingScans = (p.missingScans || 0) + 1;
+      if (missingScans >= REQUIRED_MISSING_SCANS) {
+        progress[slug] = { ...p, allComplete: true, missingScans: 0, updatedAt: Date.now() };
+        if (watchTabs[slug]) {
+          await closeWatchTab(watchTabs, slug);
+          delete watchMeta[slug];
+          delete dropSignals[slug];
+          anyJustFinished = true;
+        }
+        log(slug, "card vanished from In Progress across", missingScans, "scans - treating as fully claimed");
+      } else {
+        progress[slug] = { ...p, missingScans };
       }
     }
 

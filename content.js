@@ -584,9 +584,12 @@
         const watchList = cfg.watchList || [];
         if (watchList.length === 0) return;
         const campaigns = parseInventoryCampaigns(watchList, cfg.gameIdMap || {});
-        if (campaigns.length > 0) {
-          browser.runtime.sendMessage({ type: "inventoryProgress", campaigns }).catch(() => {});
-        }
+        // Sent even when empty: a watched game's card missing from this scan
+        // is itself a signal (see mergeInventoryProgress's missing-card
+        // reconciliation) - gating on campaigns.length here would silently
+        // swallow the case where every watched game's card is gone from "In
+        // Progress" (the common end state once the last one is claimed).
+        browser.runtime.sendMessage({ type: "inventoryProgress", campaigns }).catch(() => {});
       };
       // React renders async - wait for campaign cards before the first read
       waitFor(

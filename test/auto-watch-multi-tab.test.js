@@ -662,6 +662,59 @@ async function testNoDuplicateInventoryTabOnFirstWatchWindowCreation() {
   console.log("  OK  creating the dedicated watch window for the first time opens exactly one inventory tab, not two");
 }
 
+// Regression test: once every reward tier of a campaign is claimed, Twitch
+// moves/removes that game's card from /drops/inventory's "In Progress"
+// section entirely (parseInventoryCampaigns has no selector scoped to
+// wherever it goes) - so a real live report (2026-09-15) never sees a
+// "claimed >= total" reading for it at all, and its watch tab/badge stayed
+// stuck at its last real numbers forever. mergeInventoryProgress's
+// missing-card reconciliation must infer allComplete once a watched game
+// with prior real progress goes missing from REQUIRED_MISSING_SCANS
+// consecutive scans - but not react to just one (a mid-render hiccup).
+async function testCardVanishedFromInProgressMarksComplete() {
+  const { ctx, storageData, tabsById, flush } = makeSandbox();
+  vm.runInContext(read("shared.js"), ctx);
+  vm.runInContext(read("i18n.js"), ctx);
+
+  storageData.watchList = [
+    { input: "poe2", slug: "path-of-exile-2" },
+    { input: "diablo 4", slug: "diablo-iv" },
+  ];
+
+  vm.runInContext(read("background.js"), ctx);
+  await flush(30);
+  assert.ok(storageData.watchTabs["path-of-exile-2"], "sanity: poe2 tab open");
+
+  // both cards still show real, incomplete progress
+  await vm.runInContext("mergeInventoryProgress", ctx)([
+    { slug: "path-of-exile-2", label: "PoE2", claimed: 2, total: 3, accountNotConnected: false, expired: false },
+    { slug: "diablo-iv", label: "Diablo IV", claimed: 1, total: 2, accountNotConnected: false, expired: false },
+  ]);
+  await flush(20);
+
+  // poe2's card is gone from this scan (1st miss) - must not act yet
+  await vm.runInContext("mergeInventoryProgress", ctx)([
+    { slug: "diablo-iv", label: "Diablo IV", claimed: 1, total: 2, accountNotConnected: false, expired: false },
+  ]);
+  await flush(20);
+  assert.ok(storageData.watchTabs["path-of-exile-2"], "a single missed scan must not close the tab yet");
+  assert.strictEqual(storageData.campaignProgress["path-of-exile-2"].allComplete, false);
+
+  // poe2's card still missing (2nd consecutive miss) - now infer complete
+  await vm.runInContext("mergeInventoryProgress", ctx)([
+    { slug: "diablo-iv", label: "Diablo IV", claimed: 1, total: 2, accountNotConnected: false, expired: false },
+  ]);
+  await flush(20);
+
+  assert.strictEqual(storageData.campaignProgress["path-of-exile-2"].allComplete, true,
+    "two consecutive misses must mark the vanished card's campaign complete");
+  assert.ok(!storageData.watchTabs["path-of-exile-2"], "poe2's tab must close once inferred complete");
+  assert.ok(storageData.watchTabs["diablo-iv"], "diablo-iv, still reporting normally, must be untouched");
+  assert.strictEqual(storageData.campaignProgress["diablo-iv"].allComplete, false);
+
+  console.log("  OK  a watched game's card vanishing from In Progress across 2 scans is inferred as fully claimed, closing its tab");
+}
+
 (async () => {
   console.log("Running multi-tab auto-watch tests (no real browser, no network)...\n");
   try {
@@ -681,6 +734,7 @@ async function testNoDuplicateInventoryTabOnFirstWatchWindowCreation() {
     await testWatchTabsIsolatedInDedicatedWindow();
     await testFreshChannelPickFlashesOnlyInsideWatchWindowThenReverts();
     await testNoDuplicateInventoryTabOnFirstWatchWindowCreation();
+    await testCardVanishedFromInProgressMarksComplete();
     console.log("\nALL PASSED");
     process.exit(0);
   } catch (e) {
