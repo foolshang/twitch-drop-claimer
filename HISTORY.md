@@ -1523,3 +1523,10 @@ names, name-in-Claimed-with-bar-below-100%, and missing vs. empty Claimed
 section. All seven test files pass; `web-ext lint` clean (0/0/0).
 
 `BUILD_MARKER` -> `2026-09-25-r1`, `manifest.json` -> 0.6.8.
+
+Committed to `master` as `7fa3508`, pushed to GitHub (`dev` fast-forwarded
+to match, local and remote). Submitted to the public AMO listed channel
+via `npm run submit:listed` - lint clean (0/0/0), signed and auto-approved
+to `web-ext-artifacts/33d37586a96d443fa884-0.6.8.xpi`, recorded in
+`.amo-submitted-versions.json`. Firefox installs auto-update from the AMO
+listing.
