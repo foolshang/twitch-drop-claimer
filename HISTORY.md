@@ -1476,3 +1476,50 @@ via `npm run submit:listed` - lint clean (0/0/0), signed and auto-approved
 to `web-ext-artifacts/33d37586a96d443fa884-0.6.7.xpi`, recorded in
 `.amo-submitted-versions.json`. Firefox installs auto-update from the AMO
 listing.
+
+## 2026-09-25 — Fix: a reward counted as claimed at 100% progress, before the claim actually happened (0.6.8)
+
+**Problem (found while checking what a drop card actually shows):** a live
+capture of `/drops/inventory` showed a nopixel card with four reward tiers all
+at 100% but each still carrying a "Claim Now" button - none of them were in
+the page's own Claimed list yet. `parseInventoryCampaigns()` counted any tier
+whose `[role="progressbar"]` was at 100% as claimed, so this card read as
+4/4 -> `allComplete`, closing its watch tab and marking the game done while
+the rewards were still unclaimed.
+
+**Fix:** a tier now counts as claimed only when its reward name is present in
+the inventory's Claimed section AND its bar is at 100%.
+- `content.js`: `extractTierName(bar)` reads the reward name (real card: name
+  `<p>` and bar sit in sibling divs under a per-tier wrapper). New
+  `extractClaimedCounts()` reads the Claimed section into a `Map<name, count>`.
+  Located structurally, not by text (heading "Claimed" and "N hours ago" are
+  locale-dependent): the `<h5>` after the last campaign card, up to the next
+  `<h4>`, taking each `<p>` whose parent's previous sibling holds another `<p>`
+  (a claimed row is `(div (div time+qty) (div (p NAME)))`).
+- Same-named tiers match Claimed entries one-for-one (the nopixel card has two
+  "GTA$250K" tiers, so it needs two entries). The 100% guard stops a same-named
+  reward from an older campaign marking an unfinished tier claimed.
+- `scanInventory()` skips the scan when the Claimed section isn't rendered yet
+  (`null` = can't tell) instead of reporting every tier unclaimed; the next
+  60s scan retries. Twitch's `DropsListPresentation` (read out of the live JS
+  bundle) renders the heading + description whenever it is not loading, and an
+  empty-state message (not a list row) for an account with no claims, so an
+  empty Map is distinguishable from "not loaded" and the empty-state text is
+  never mistaken for a drop name.
+- Known limits: Claimed shows only the first page (a "Load More" button we
+  never click) so a very old claim can read as unclaimed; a game whose card
+  has vanished from In Progress is still handled by the 0.6.7 inference.
+
+**Verified live** against the real page: 20 Claimed entries; WoW BlizzCon
+card -> "Cuddly Blue Grrgle" and "200 Trader's Tender" claimed (2 of 4),
+nopixel card -> 0 of 4 (all pending "Claim Now"). Noted in passing: campaign
+cards still show no game name, and the WoW boxart URL (`ttv-boxart/18122-285x380.jpg`)
+has no `_IGDB-` segment, which `extractGameIdFromBoxart()`'s regex would not
+match - not changed here, worth a separate look.
+
+**Tests:** `test/inventory-parse.test.js` fixtures rebuilt to the real tier
+and Claimed-row structure; added a 100%-but-not-in-Claimed case, duplicate
+names, name-in-Claimed-with-bar-below-100%, and missing vs. empty Claimed
+section. All seven test files pass; `web-ext lint` clean (0/0/0).
+
+`BUILD_MARKER` -> `2026-09-25-r1`, `manifest.json` -> 0.6.8.

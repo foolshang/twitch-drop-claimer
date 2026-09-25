@@ -450,18 +450,76 @@
     return null;
   }
 
-  // Only ever counts a reward as "claimed" when we find explicit, unambiguous
-  // evidence (a progress bar at 100%). Anything we can't confirm is left as
-  // "not yet claimed" - wrongly marking a campaign complete would make the
-  // extension abandon a game that still has drops left, which is worse than
-  // watching a finished campaign a little longer.
+  // A reward tier's own name (e.g. "Cuddly Blue Grrgle"): the first <p> in the
+  // tier that isn't the "N% of X hours" line. Tier root = the highest ancestor
+  // of the bar that still holds only this one bar (real capture, 2026-09-25:
+  // name <p> and bar sit in sibling divs under a per-tier wrapper), stopping
+  // before the card root (which also holds the boxart).
+  function extractTierName(bar) {
+    let node = bar;
+    for (let i = 0; i < 10; i++) {
+      const parent = node.parentElement;
+      if (!parent) break;
+      if (parent.querySelectorAll('[role="progressbar"]').length !== 1) break;
+      if (parent.querySelector(GAME_CARD_IMAGE_SELECTOR)) break;
+      node = parent;
+    }
+    for (const p of node.querySelectorAll("p")) {
+      const text = (p.innerText || "").replace(/\s+/g, " ").trim();
+      if (text && !/%\s*of\b/i.test(text)) return text;
+    }
+    return null;
+  }
+
+  // "Claimed" section of /drops/inventory: a plain list of every drop the
+  // account already holds (last six months, newest first, paged behind a
+  // "Load More" button we never click). Each entry is
+  // (div (div (div (p "4 hours ago")) (div qty)) (div (p NAME))) - located
+  // structurally (a <p> whose parent's previous sibling holds another <p>)
+  // because the heading text and the time wording are locale-dependent.
+  // Returns Map<name, count> (counts, since a name can repeat), or null when
+  // the section isn't rendered yet - "can't tell" must not read as "nothing
+  // claimed".
+  function extractClaimedCounts() {
+    const cardImgs = [...document.querySelectorAll(GAME_CARD_IMAGE_SELECTOR)];
+    const lastImg = cardImgs[cardImgs.length - 1] || null;
+    // DOCUMENT_POSITION_FOLLOWING = 4, PRECEDING = 2 (no Node global in tests' vm)
+    const heading = [...document.querySelectorAll("h5")].find(
+      (h) => !lastImg || (lastImg.compareDocumentPosition(h) & 4)
+    );
+    if (!heading) return null;
+    const endHeading = [...document.querySelectorAll("h4")].find((h) => heading.compareDocumentPosition(h) & 4) || null;
+
+    const counts = new Map();
+    for (const p of document.querySelectorAll("p")) {
+      if (!(heading.compareDocumentPosition(p) & 4)) continue;
+      if (endHeading && !(endHeading.compareDocumentPosition(p) & 2)) continue;
+      const prev = p.parentElement && p.parentElement.previousElementSibling;
+      if (!prev || !prev.querySelector("p")) continue;
+      const name = (p.innerText || "").replace(/\s+/g, " ").trim();
+      if (name) counts.set(name, (counts.get(name) || 0) + 1);
+    }
+    return counts;
+  }
+
+  // A reward counts as "claimed" only when its name is in the inventory's
+  // Claimed list (claimedCounts, see extractClaimedCounts) AND its bar is at
+  // 100%. The bar alone isn't proof: a tier sits at 100% with a "Claim Now"
+  // button until the claim actually goes through (real nopixel card, 2026-09-25:
+  // four 100% tiers, none in Claimed). The 100% guard keeps a same-named reward
+  // from an older campaign from marking a still-unfinished tier as claimed.
+  // Anything we can't confirm is left as "not yet claimed" - wrongly marking a
+  // campaign complete would make the extension abandon a game that still has
+  // drops left, which is worse than watching a finished campaign a little longer.
+  // A name appearing twice in one card (two "GTA$250K" tiers) needs two
+  // Claimed entries.
   //
   // gameIdMap: browser.storage.local's game.id -> game.name map, learned
   // by background.js from real GQL traffic (see inject.js/background.js) -
   // required now that no card shows a game name as text at all. A card
   // whose boxart id isn't in the map yet is skipped, not guessed at - it
   // picks itself back up the next scan once background.js has learned it.
-  function parseInventoryCampaigns(watchList, gameIdMap) {
+  function parseInventoryCampaigns(watchList, gameIdMap, claimedCounts) {
     const imgs = [...document.querySelectorAll(GAME_CARD_IMAGE_SELECTOR)];
     if (imgs.length === 0) return [];
 
@@ -483,13 +541,22 @@
       const expired = /expired|no longer available|unavailable|หมดอายุ/i.test(cardText);
 
       const bars = [...card.querySelectorAll('[role="progressbar"]')];
+      const unclaimedLeft = new Map(claimedCounts || []);
       let claimed = 0;
       let timeRemainingMin = 0;
       let foundDuration = false;
       for (const bar of bars) {
         const percent = extractTierPercent(bar);
         if (percent == null) continue; // can't confirm -> doesn't count toward claimed or remaining time
-        if (percent >= 100) { claimed++; continue; }
+        if (percent >= 100) {
+          const tierName = extractTierName(bar);
+          const left = tierName ? unclaimedLeft.get(tierName) || 0 : 0;
+          if (left > 0) {
+            unclaimedLeft.set(tierName, left - 1);
+            claimed++;
+          }
+          continue; // 100% but not in Claimed yet (e.g. "Claim Now" pending): not claimed, no time left either
+        }
         const tierEl = bar.closest(".tw-tower") || bar.parentElement || bar;
         const durationMin = extractTierDurationMin(tierEl);
         if (durationMin != null) {
@@ -583,7 +650,11 @@
         const cfg = await browser.storage.local.get(["watchList", "gameIdMap"]);
         const watchList = cfg.watchList || [];
         if (watchList.length === 0) return;
-        const campaigns = parseInventoryCampaigns(watchList, cfg.gameIdMap || {});
+        // Claimed section not rendered yet -> can't tell, skip this scan (the
+        // next one retries) rather than report every tier as unclaimed
+        const claimedCounts = extractClaimedCounts();
+        if (!claimedCounts) return;
+        const campaigns = parseInventoryCampaigns(watchList, cfg.gameIdMap || {}, claimedCounts);
         // Sent even when empty: a watched game's card missing from this scan
         // is itself a signal (see mergeInventoryProgress's missing-card
         // reconciliation) - gating on campaigns.length here would silently

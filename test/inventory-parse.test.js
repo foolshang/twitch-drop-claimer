@@ -56,11 +56,12 @@ function readContentJsUnwrapped() {
 // under a per-campaign boundary div, sharing a parent with sibling cards -
 // exactly what findCampaignCardBoundary's "count the images" walk needs.
 function cardHtml({ gameId, campaignName, tiers, extraCardText = "" }) {
+  // Tier shape from the real 2026-09-25 capture: a per-tier wrapper holding
+  // (icon img + name <p>) and (progressbar + "N% of X hours" <p>) in sibling divs.
   const tiersHtml = tiers.map(({ now, max = 100, label, durationText }) => `
-    <div class="ScTower-sc-1sjzzes-0 tw-tower">
-      <div class="wrap"><div role="progressbar" aria-valuenow="${now}" aria-valuemin="0" aria-valuemax="${max}"></div></div>
-      <div>${label}</div>
-      <div>${durationText || ""}</div>
+    <div class="tier">
+      <div><div><img alt="Reward Image Icon"><div><div><p>${label}</p></div></div></div></div>
+      <div><div role="progressbar" aria-valuenow="${now}" aria-valuemin="0" aria-valuemax="${max}"></div><div><p>${durationText || ""}</p></div></div>
     </div>
   `).join("\n");
 
@@ -77,6 +78,21 @@ function cardHtml({ gameId, campaignName, tiers, extraCardText = "" }) {
       </div>
     </div>
   `;
+}
+
+// Real Claimed-section shape (2026-09-25 capture): h5 heading + description,
+// then one (div (div (div (p time)) (div qty)) (div (p NAME))) per claimed drop,
+// then the next section's h4.
+function claimedHtml(names) {
+  const items = names.map((n) => `
+    <div><div><div><p>4 hours ago</p></div><div><div><div>1</div></div></div></div><div><p>${n}</p></div></div>`).join("");
+  // Twitch's DropsListPresentation (read out of the live JS bundle, 2026-09-25)
+  // always renders the heading + description once loaded, and for an account
+  // with no claims adds an empty state (icon wrapper, then <p> text) instead of items.
+  const empty = names.length === 0
+    ? `<div><div><svg></svg></div><div><p>There are no items in your inventory yet. Stay tuned for upcoming Drops campaigns.</p><span>You could score in-game loot...</span></div></div>`
+    : "";
+  return `<div><div><h5>Claimed</h5></div><div><p>Depending on the number of claims...</p></div>${empty}${items}<button>Load More</button></div><h4>Rewards</h4><div><p>There are no rewards.</p></div>`;
 }
 
 function makeSandbox(bodyHtml) {
@@ -121,7 +137,9 @@ function makeSandbox(bodyHtml) {
 }
 
 function callParse(ctx, watchList, gameIdMap) {
-  return vm.runInContext("parseInventoryCampaigns", ctx)(watchList, gameIdMap);
+  // same path scanInventory takes: read the Claimed section off the page, hand it to the parser
+  const claimedCounts = vm.runInContext("extractClaimedCounts", ctx)();
+  return vm.runInContext("parseInventoryCampaigns", ctx)(watchList, gameIdMap, claimedCounts);
 }
 
 async function testMatchesByBoxartIdNotText() {
@@ -167,14 +185,14 @@ async function testPercentAndClaimedFromProgressbar() {
       { now: 43, label: "Tier C", durationText: "43% of 2 hours" },
     ],
   });
-  const { ctx } = makeSandbox(html);
+  const { ctx } = makeSandbox(html + claimedHtml(["Tier B (done)"]));
   const watchList = [{ input: "marvel rivals", slug: "marvel-rivals" }];
   const gameIdMap = { "1264310518": "Marvel Rivals" };
 
   const result = callParse(ctx, watchList, gameIdMap);
   assert.strictEqual(result.length, 1);
   assert.strictEqual(result[0].total, 3, "must count every progressbar as a tier");
-  assert.strictEqual(result[0].claimed, 1, "only the tier at 100% counts as claimed");
+  assert.strictEqual(result[0].claimed, 1, "only the 100% tier whose name is in Claimed counts as claimed");
   // 4h * (100-21)/100 = 189.6 -> 190, 2h * (100-43)/100 = 68.4 -> 68 (100% tier contributes 0)
   assert.strictEqual(result[0].timeRemainingMin, 190 + 68, "remaining minutes summed from the non-complete tiers' own percent+duration text");
 
@@ -195,7 +213,7 @@ async function testMultipleCardsStayIndependent() {
       { now: 100, label: "B tier 2", durationText: "" },
     ],
   });
-  const { ctx } = makeSandbox(`<div id="wrapper">${cardA}${cardB}</div>`);
+  const { ctx } = makeSandbox(`<div id="wrapper">${cardA}${cardB}</div>` + claimedHtml(["B tier 2"]));
   const watchList = [
     { input: "marvel rivals", slug: "marvel-rivals" },
     { input: "the division 2", slug: "tom-clancys-the-division-2" },
@@ -230,7 +248,7 @@ async function testLoneDeeplyNestedCardStillGetsItsTiers() {
     ],
   });
   const deep = new Array(16).fill(null).reduce((acc) => `<div class="pageChrome">${acc}</div>`, card);
-  const { ctx } = makeSandbox(deep);
+  const { ctx } = makeSandbox(deep + claimedHtml(["Tier 1", "Tier 2"]));
   const watchList = [{ input: "marvel rivals", slug: "marvel-rivals" }];
   const gameIdMap = { "1264310518": "Marvel Rivals" };
 
@@ -367,6 +385,72 @@ async function testSameSlugTwoCampaignsActiveFirstStillWins() {
   console.log("  OK  a slug with both an active and an expired campaign card only reports the active one (active-first DOM order)");
 }
 
+async function testHundredPercentNotInClaimedIsNotClaimed() {
+  // real nopixel card: four tiers at 100% with a "Claim Now" button, none in Claimed
+  const html = cardHtml({
+    gameId: "1264310518",
+    campaignName: "Pending claims",
+    tiers: [
+      { now: 100, label: "Burger Shot Tracksuit" },
+      { now: 100, label: "GTA$1M" },
+    ],
+  });
+  const { ctx } = makeSandbox(html + claimedHtml(["Some Other Drop"]));
+  const watchList = [{ input: "marvel rivals", slug: "marvel-rivals" }];
+  const result = callParse(ctx, watchList, { "1264310518": "Marvel Rivals" });
+  assert.strictEqual(result[0].total, 2);
+  assert.strictEqual(result[0].claimed, 0, "100% bar without a Claimed entry must not count as claimed");
+
+  console.log("  OK  a 100% tier absent from the Claimed list (Claim Now pending) is not claimed");
+}
+
+async function testDuplicateNamesNeedOneClaimedEntryEach() {
+  const html = cardHtml({
+    gameId: "1264310518",
+    campaignName: "Dup names",
+    tiers: [
+      { now: 100, label: "GTA$250K" },
+      { now: 100, label: "GTA$250K" },
+    ],
+  });
+  const watchList = [{ input: "marvel rivals", slug: "marvel-rivals" }];
+  const ids = { "1264310518": "Marvel Rivals" };
+
+  let { ctx } = makeSandbox(html + claimedHtml(["GTA$250K"]));
+  assert.strictEqual(callParse(ctx, watchList, ids)[0].claimed, 1, "one Claimed entry covers only one of two same-named tiers");
+  ({ ctx } = makeSandbox(html + claimedHtml(["GTA$250K", "GTA$250K"])));
+  assert.strictEqual(callParse(ctx, watchList, ids)[0].claimed, 2, "two Claimed entries cover both");
+
+  console.log("  OK  same-named tiers are matched against Claimed entries one-for-one");
+}
+
+async function testClaimedNameWithoutFullBarIsNotClaimed() {
+  // an older campaign's reward with the same name must not mark an unfinished tier claimed
+  const html = cardHtml({
+    gameId: "1264310518",
+    campaignName: "Unfinished",
+    tiers: [{ now: 60, label: "Common Name", durationText: "60% of 2 hours" }],
+  });
+  const { ctx } = makeSandbox(html + claimedHtml(["Common Name"]));
+  const watchList = [{ input: "marvel rivals", slug: "marvel-rivals" }];
+  const result = callParse(ctx, watchList, { "1264310518": "Marvel Rivals" });
+  assert.strictEqual(result[0].claimed, 0);
+
+  console.log("  OK  a name present in Claimed does not count when the tier's bar is below 100%");
+}
+
+async function testClaimedSectionMissingIsUnknown() {
+  const html = cardHtml({ gameId: "1264310518", campaignName: "x", tiers: [{ now: 100, label: "T" }] });
+  const { ctx } = makeSandbox(html); // no Claimed section rendered
+  assert.strictEqual(vm.runInContext("extractClaimedCounts", ctx)(), null, "not rendered = unknown (null), not an empty list");
+
+  const { ctx: ctx2 } = makeSandbox(html + claimedHtml([]));
+  const counts = vm.runInContext("extractClaimedCounts", ctx2)();
+  assert.ok(counts && counts.size === 0, "rendered but empty (account with no claims, empty-state text shown) = known-empty Map, empty-state text is not a drop name");
+
+  console.log("  OK  a missing Claimed section reads as unknown (null), an empty one as an empty Map");
+}
+
 (async () => {
   console.log("Running inventory-parse tests (real jsdom DOM, no real browser/network)...\n");
   try {
@@ -380,6 +464,10 @@ async function testSameSlugTwoCampaignsActiveFirstStillWins() {
     await testExpiresAtParsedFromEndDateFormat();
     await testSameSlugTwoCampaignsExpiredFirstStaysExpired();
     await testSameSlugTwoCampaignsActiveFirstStillWins();
+    await testHundredPercentNotInClaimedIsNotClaimed();
+    await testDuplicateNamesNeedOneClaimedEntryEach();
+    await testClaimedNameWithoutFullBarIsNotClaimed();
+    await testClaimedSectionMissingIsUnknown();
     console.log("\nALL PASSED");
     process.exit(0);
   } catch (e) {
