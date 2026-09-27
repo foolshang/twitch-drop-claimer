@@ -1602,3 +1602,9 @@ blocked ~20 min.
 changed, link missing, no baseline yet). All test files pass.
 
 `BUILD_MARKER` -> `2026-09-27-r2`, `manifest.json` -> 0.6.10.
+
+Committed to `master` as `9345155`, pushed to GitHub (`dev` fast-forwarded
+to match). Submitted to the public AMO listed channel via
+`npm run submit:listed` - lint clean (0/0/0), signed and auto-approved to
+`web-ext-artifacts/33d37586a96d443fa884-0.6.10.xpi`, recorded in
+`.amo-submitted-versions.json`.
