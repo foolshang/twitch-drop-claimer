@@ -1651,3 +1651,11 @@ format with no credentials/tokens.
 languages. All test files pass; lint clean (0/0/0).
 
 `BUILD_MARKER` -> `2026-09-27-r3`, `manifest.json` -> 0.6.11.
+
+Committed to `master` as `e63aec3`, pushed to GitHub (`dev` fast-forwarded to
+match). Submitted to the public AMO listed channel via `npm run
+submit:listed` - lint clean (0/0/0), signed and auto-approved to
+`web-ext-artifacts/33d37586a96d443fa884-0.6.11.xpi`, recorded in
+`.amo-submitted-versions.json`. Firefox installs auto-update from the AMO
+listing; existing users will see a permission-upgrade prompt for the new
+`downloads` permission.
