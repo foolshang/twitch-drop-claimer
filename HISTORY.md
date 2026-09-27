@@ -1570,3 +1570,10 @@ marker (was live / never live / content gate / explicit offline) cases. All
 test files pass.
 
 `BUILD_MARKER` -> `2026-09-27-r1`, `manifest.json` -> 0.6.9.
+
+Committed to `master` as `53ffe98`, pushed to GitHub (`dev` fast-forwarded to
+match, local and remote). Submitted to the public AMO listed channel via
+`npm run submit:listed` - lint clean (0/0/0), signed and auto-approved to
+`web-ext-artifacts/33d37586a96d443fa884-0.6.9.xpi`, recorded in
+`.amo-submitted-versions.json`. Firefox installs auto-update from the AMO
+listing.
