@@ -170,6 +170,33 @@
     return !!document.querySelector('[data-a-target="animated-channel-viewers-count"]');
   }
 
+  // slug of the category the viewed channel is currently streaming, or null
+  // if the stream-info link isn't rendered (yet)
+  function currentStreamGameSlug() {
+    const a = document.querySelector('[data-a-target="stream-game-link"]');
+    const m = a && (a.getAttribute("href") || "").match(/\/directory\/(?:category|game)\/([^/?#]+)/);
+    if (!m) return null;
+    try { return decodeURIComponent(m[1]).toLowerCase(); } catch { return m[1].toLowerCase(); }
+  }
+
+  // "offline" | "game:<slug>" | null. Game slug comes from the stream info's
+  // own category link (live DOM capture 2026-09-27:
+  // <a data-a-target="stream-game-link" href="/directory/category/just-chatting">),
+  // compared with the game the watch tab was picked for. A page that was
+  // showing the live viewer count (seenLive) and then loses it also counts
+  // as offline - Twitch doesn't always add an offline marker when a stream
+  // just ends.
+  function channelProblem(expectedSlug, seenLive) {
+    if (!looksLive()) {
+      if (looksOffline()) return "offline";
+      if (seenLive && !document.querySelector('[data-a-target="player-overlay-content-gate"]')) return "offline";
+      return null;
+    }
+    const g = currentStreamGameSlug();
+    if (g && expectedSlug && g !== String(expectedSlug).toLowerCase()) return `game:${g}`;
+    return null;
+  }
+
   function looksOffline() {
     // content gate (subscriber-only / mature / rerun) is NOT "offline"
     if (document.querySelector('[data-a-target="player-overlay-content-gate"]')) return false;
@@ -765,6 +792,8 @@
       const initialChannel = channelFromUrl(location.href);
       let qualityApplied = false;
       let handled = false;
+      let seenLive = false;
+      const CHANNEL_PROBLEM_RECHECK_MS = 10_000;
 
       // fast first recovery attempt - don't make a stalled player wait a
       // full 60s (channelWatchIntervalId below) for its first nudge
@@ -795,12 +824,25 @@
           return;
         }
 
-        if (!looksLive() && looksOffline()) {
-          handled = true;
-          log("channel offline:", initialChannel);
-          browser.runtime.sendMessage({ type: "channelOffline", slug: expectedSlug }).catch(() => {});
-          if (expectedSlug) location.href = directoryUrl(expectedSlug);
-        }
+        // offline / stream switched to a different game. A transient DOM
+        // state (page mid-transition, category link not yet re-rendered) must
+        // not bounce a good channel, so the same problem has to show up again
+        // after CHANNEL_PROBLEM_RECHECK_MS before acting on it.
+        if (looksLive()) seenLive = true;
+        const first = channelProblem(expectedSlug, seenLive);
+        if (!first) return;
+        await new Promise((r) => setTimeout(r, CHANNEL_PROBLEM_RECHECK_MS));
+        if (!enabled || channelProblem(expectedSlug, seenLive) !== first) return;
+
+        handled = true;
+        log("channel", initialChannel, "no longer usable:", first, "- back to the directory");
+        browser.runtime.sendMessage({
+          type: first === "offline" ? "channelOffline" : "channelGameChanged",
+          slug: expectedSlug,
+          channel: initialChannel,
+          reason: first,
+        }).catch(() => {});
+        if (expectedSlug) location.href = directoryUrl(expectedSlug);
       }, 60_000);
     }
 

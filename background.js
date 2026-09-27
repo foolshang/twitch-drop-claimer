@@ -163,6 +163,7 @@ const INVALID_SLUG_RETRY_MS = 45 * 60 * 1000;
 // comfortably outlast one full reload cycle.
 const VERIFY_DELAY_MS = (RELOAD_PERIOD_MIN + 2) * 60 * 1000; // 17 min
 const CHANNEL_BLOCK_COOLDOWN_MS = 45 * 60 * 1000; // don't immediately re-pick a channel we just rejected
+const UNUSABLE_CHANNEL_COOLDOWN_MS = 20 * 60 * 1000; // offline / switched game (see handleChannelUnusable)
 
 // A watched game's card vanishing from /drops/inventory's "In Progress"
 // section (parseInventoryCampaigns returning nothing for its slug) usually
@@ -1184,6 +1185,28 @@ async function handleChannelLeft(slug) {
   log(slug, "- DOM check reported offline/redirected (informational only, does not reject the channel)");
 }
 
+// Exception to the rule above: an offline channel, or one whose own stream
+// info now names a different game, is confirmed twice by content.js
+// (channelProblem(), 10s apart) and is unambiguous, not a heuristic - and the
+// tab is already on its way back to the directory, where Twitch's listing
+// often still shows the channel for a while and pickBestChannel() would
+// re-pick it. So it only gets a short block (not rejectChannel's 45 min, and
+// watchMeta/dropSignals stay untouched).
+async function handleChannelUnusable(msg) {
+  const { slug, channel, reason } = msg;
+  if (!slug || !channel) return;
+  return serialized(async () => {
+    const cfg = await browser.storage.local.get(["blockedChannels"]);
+    const blockedChannels = { ...(cfg.blockedChannels || {}) };
+    blockedChannels[slug] = {
+      ...(blockedChannels[slug] || {}),
+      [channel.toLowerCase()]: Date.now() + UNUSABLE_CHANNEL_COOLDOWN_MS,
+    };
+    await browser.storage.local.set({ blockedChannels });
+    log(slug, "- channel", channel, "unusable (" + reason + "), skipped for", UNUSABLE_CHANNEL_COOLDOWN_MS / 60000, "min");
+  });
+}
+
 async function handleGqlDropSignal(msg, tab) {
   if (!tab) return;
 
@@ -1396,6 +1419,9 @@ browser.runtime.onMessage.addListener((msg, sender) => {
       return handleDirectoryPicked(msg.slug, msg.channel, sender.tab);
 
     case "channelOffline":
+    case "channelGameChanged":
+      return handleChannelUnusable(msg);
+
     case "channelRedirected":
       return handleChannelLeft(msg.slug);
 

@@ -93,6 +93,14 @@ const LIVE_CHANNEL_MAIN = `
   </div>
 `;
 
+// live channel whose stream info carries the category link - markup captured
+// live 2026-09-27 (twitch.tv/yuki_nuki, Just Chatting)
+const liveWithGame = (slug) => LIVE_CHANNEL_MAIN.replace(
+  '<span data-a-target="animated-channel-viewers-count">',
+  `<a data-a-target="stream-game-link" class="ScCoreLink tw-link" href="/directory/category/${slug}"><span>Game</span></a>` +
+  '<span data-a-target="animated-channel-viewers-count">'
+);
+
 const OFFLINE_CHANNEL_MAIN = `
   <div class="root-scrollable__wrapper">
     <div class="channel-root channel-root--unanimated">
@@ -258,6 +266,31 @@ async function testWrongSlugDetectedAsUnknownCategory() {
   console.log("  OK  a wrong slug (no redirect, but no category title/heading either) is detected as unknown");
 }
 
+async function testGameChangeIsDetected() {
+  const problem = (html, expected, seen) =>
+    vm.runInContext("channelProblem", makeCtx(html))(expected, seen);
+  assert.strictEqual(problem(liveWithGame("path-of-exile-2"), "path-of-exile-2", true), null,
+    "same game as picked -> no problem");
+  assert.strictEqual(problem(liveWithGame("Path-of-Exile-2"), "path-of-exile-2", true), null,
+    "slug comparison is case-insensitive");
+  assert.strictEqual(problem(liveWithGame("just-chatting"), "path-of-exile-2", true), "game:just-chatting",
+    "streamer switched to another category -> game change");
+  assert.strictEqual(problem(LIVE_CHANNEL_MAIN, "path-of-exile-2", true), null,
+    "category link not rendered yet -> can't tell, no problem");
+  console.log("  OK  a stream switching to another game is detected (and a missing link is not)");
+}
+
+async function testEndedStreamWithoutOfflineMarkerIsDetected() {
+  const problem = (html, expected, seen) =>
+    vm.runInContext("channelProblem", makeCtx(html))(expected, seen);
+  const bare = '<div class="channel-root"><div class="channel-root__player"></div></div>';
+  assert.strictEqual(problem(bare, "x", true), "offline", "was live, viewer count gone, no marker -> offline");
+  assert.strictEqual(problem(bare, "x", false), null, "never seen live yet (still loading) -> not offline");
+  assert.strictEqual(problem(CONTENT_GATE_MAIN, "x", true), null, "content gate stays not-offline even after being live");
+  assert.strictEqual(problem(OFFLINE_CHANNEL_MAIN, "x", false), "offline", "explicit offline page");
+  console.log("  OK  a stream that just ended (no offline marker) is detected, a loading page is not");
+}
+
 (async () => {
   console.log("Running channel-live-detection tests (real jsdom DOM, no real browser/network)...\n");
   try {
@@ -268,6 +301,8 @@ async function testWrongSlugDetectedAsUnknownCategory() {
     await testStaleOfflineBannerClassNoLongerRelied();
     await testRealCategoryPageIsNotUnknown();
     await testWrongSlugDetectedAsUnknownCategory();
+    await testGameChangeIsDetected();
+    await testEndedStreamWithoutOfflineMarkerIsDetected();
     console.log("\nALL PASSED");
     process.exit(0);
   } catch (e) {
