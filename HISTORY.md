@@ -1671,3 +1671,96 @@ xpi stays available locally for the user's own private testing at
 `about:addons` -> gear icon -> "Install Add-on From File..."). Re-enabling
 later (if the debug-log feature is confirmed working and meant for
 everyone) is the same PATCH with `is_disabled: false`.
+
+## 0.6.12 - pin a specific channel with `@name`; one-click bug reports
+
+**Why:** two separate user requests. First: auto-watch always auto-picked
+the lowest-viewer live channel in a game's directory - no way to say "watch
+*this* streamer specifically" (e.g. a trusted channel known to reliably run
+the drop). Second: reporting a bug meant exporting the local debug log file
+and manually attaching/pasting it somewhere - more friction than necessary,
+and no standard way for other users to get diagnostics back to the
+developer at all.
+
+**What was added - pinned channels:**
+- `parseWatchList` (shared.js) now treats a line starting with `@` (e.g.
+  `@somestreamer`) as a pinned channel instead of a game. It starts under a
+  synthetic `channel:<name>` slug (a stable, unique storage key before the
+  played game is known) and shares the same priority-ordered list / tab
+  quota as game entries - no separate pool.
+- `autoWatchTick` (background.js) opens a pinned entry's tab straight at
+  `channelUrl(channel)`, never the directory, and immediately populates
+  `watchMeta` + fires the existing fresh-tab playback flash (previously only
+  reachable via `handleDirectoryPicked`, which pinned tabs never go
+  through).
+- `lacksOpenCampaign` and `annotateWatchListFromCampaigns` skip pinned
+  entries entirely - trusted by virtue of being pinned, never gated on
+  whether the campaigns snapshot happens to know about the game yet.
+- content.js's channel-page monitor gained a pinned branch: never bounces
+  to the directory for offline/game-changed (both expected states, not
+  failures - it just keeps waiting/tracking in place), and on a raid/
+  redirect returns to the pinned channel itself rather than following the
+  raid or falling back to a directory pick. It reports the currently-played
+  game via a new `currentStreamGame()` (name -> `toSlug()` the *same* way
+  `parseInventoryCampaigns` derives its own card slug, not the channel
+  page's raw category href, so a renamed game like Rainbow Six Siege still
+  lines up with the ALIASES-corrected slug the inventory page uses).
+- `handleChannelPlayingGame` (background.js) rebinds a pinned entry's slug
+  from the synthetic key to the real game slug the first time it's learned,
+  and again if the channel later switches to a different game - migrating
+  `watchTabs`/`watchMeta`/`invalidSlugs`/`emptyUntil`/`gameWaitUntil`/
+  `blockedChannels` to the new key without touching the tab itself, always
+  resetting `watchMeta` fresh (never carrying a stale baseline from before
+  the game was known) and dropping `campaignProgress` for the old slug on a
+  genuine game switch (never misattributing one game's progress to
+  another). Refuses to bind onto a slug another watch-list entry already
+  owns rather than corrupting either entry.
+- `verifySweep` excludes pinned entries from both channel rotation and the
+  "all stalled together" system-wide heuristic - a pinned channel that
+  stalls is only logged, never rejected/rotated.
+- Popup: heading changed to "game/@channel list", hint documents the `@`
+  syntax, preview line and per-row status handle pinned entries (showing
+  `@name (Detected Game)` once resolved, never a bogus "no open drop"
+  badge).
+
+**What was added - one-click bug reports:**
+- A small stdlib-only Python HTTP relay (`report-service/`, not part of the
+  extension bundle - excluded via `submit-amo.js`'s `EXTENSION_FILES`
+  whitelist) deployed on an existing always-on GCE VM (`poe-bot-vm`,
+  project `poe-discord-bot-501417`; its ephemeral IP was promoted to a
+  static reservation so the endpoint address never changes under the
+  extension). Accepts a POST'd log + version + UI language, rate-limits
+  itself (20/hour, in-memory), and creates a GitHub issue on this repo via
+  a fine-grained PAT (scoped to only this repo, Issues: Read/write) that
+  lives solely in the VM's `/opt/report-service/.env` - never inside the
+  extension's own public, fully-inspectable source. Verified end-to-end
+  live: a test POST created and was confirmed at
+  github.com/foolshang/twitch-drop-claimer/issues/1, then deleted via
+  `gh issue delete`.
+- New "Send bug report" button next to "Export debug log" in the popup:
+  posts the same log-buffer text `reportBugToGitHub()` (background.js) and
+  shows the resulting issue link (or error) inline - no file to attach, no
+  GitHub account needed, one click.
+- README's "Debug log" section corrected: the previous "never leaves your
+  computer, no server involved" claim no longer holds for this one new
+  button (it was accurate for the local export/auto-export, which is
+  unchanged) - split into its own paragraph naming exactly what this button
+  sends and why a server is involved at all (avoiding a shipped write
+  token).
+
+**Tests:** new `test/pinned-channel.test.js` (7 cases: `@channel` parsing/
+dedup, direct-to-channel tab opening bypassing the campaigns gate, shared
+tab quota across games and pinned channels, slug resolution + rebinding
+in place without touching the tab, dropping stale progress on a game
+switch, refusing a colliding slug, and stalled-pinned-channel never being
+rotated/blocklisted). All 8 test files pass; lint clean (0/0/0).
+
+`BUILD_MARKER` -> `2026-09-27-r5`, `manifest.json` -> 0.6.12.
+
+Committed to `master` as `9e8bad0`, pushed to GitHub (`dev` fast-forwarded
+to match). Submitted to the public AMO listed channel via `npm run
+submit:listed` - lint clean (0/0/0), signed and auto-approved to
+`web-ext-artifacts/33d37586a96d443fa884-0.6.12.xpi`, recorded in
+`.amo-submitted-versions.json`. Firefox installs auto-update from the AMO
+listing; existing users will see a permission-upgrade prompt for the new
+host permission to the bug-report relay's address.
