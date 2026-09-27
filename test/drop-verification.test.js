@@ -82,7 +82,13 @@ function makeSandbox() {
         onAlarm: { addListener: (fn) => alarmListeners.push(fn) },
       },
       browserAction: { setBadgeText: () => {}, setBadgeBackgroundColor: () => {}, setTitle: () => {} },
+      downloads: {
+        download: () => Promise.resolve(1),
+        search: () => Promise.resolve([{ state: "complete", filename: "TEST/twitch-drop-claimer-debug.log" }]),
+      },
     },
+    URL: globalThis.URL,
+    Blob: globalThis.Blob,
   };
 
   const ctx = vm.createContext(sandbox);

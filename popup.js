@@ -84,6 +84,8 @@ const $priorityMode = document.getElementById("priorityMode");
 const $gameStatusList = document.getElementById("gameStatusList");
 const $gameStatusEmpty = document.getElementById("gameStatusEmpty");
 
+const $exportDebugLog = document.getElementById("exportDebugLog");
+const $exportDebugLogStatus = document.getElementById("exportDebugLogStatus");
 const $autoOff = document.getElementById("autooff");
 const $status = document.getElementById("status");
 const $uiLang = document.getElementById("uiLang");
@@ -607,6 +609,27 @@ $campaignsCheck.addEventListener("click", async () => {
     $campaignsCheckStatus.textContent = t("campaigns_failed_err", { err: e });
   } finally {
     $campaignsCheck.disabled = false;
+  }
+});
+
+// writes background.js's in-memory log ring buffer to a plain-text file
+// (see exportDebugLogToFile() in background.js, which resolves and reports
+// back the real on-disk path - Firefox's configured download folder isn't
+// necessarily one literally named "Downloads") - lets a diagnosis read what
+// actually happened (e.g. a "no longer usable:" line) without needing
+// remote-debugging access to this real, logged-in profile.
+$exportDebugLog.addEventListener("click", async () => {
+  $exportDebugLog.disabled = true;
+  $exportDebugLogStatus.textContent = t("export_debug_log_working");
+  try {
+    const res = await browser.runtime.sendMessage({ type: "exportDebugLog" });
+    $exportDebugLogStatus.textContent = res && res.ok
+      ? t("export_debug_log_done", { path: res.path || "?" })
+      : t("export_debug_log_failed", { err: (res && res.error) || "?" });
+  } catch (e) {
+    $exportDebugLogStatus.textContent = t("export_debug_log_failed", { err: e });
+  } finally {
+    $exportDebugLog.disabled = false;
   }
 });
 

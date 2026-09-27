@@ -174,7 +174,75 @@ const UNUSABLE_CHANNEL_COOLDOWN_MS = 20 * 60 * 1000; // offline / switched game 
 // posture used everywhere else in this file.
 const REQUIRED_MISSING_SCANS = 2;
 
-const log = (...args) => console.log("[DropClaimer]", ...args);
+// In-memory ring buffer of every log() line this file emits (rejectChannel,
+// handleChannelUnusable's "unusable (offline|game:<slug>)" line, verify, ...).
+// exportDebugLogToFile() below writes it to a plain-text file so it can be
+// read without needing remote-debugging access to the user's real, logged-in
+// browser profile - see HISTORY.md 2026-09-27.
+const DEBUG_LOG_MAX_LINES = 1000;
+const debugLogBuffer = [];
+function pushDebugLog(line) {
+  debugLogBuffer.push(line);
+  if (debugLogBuffer.length > DEBUG_LOG_MAX_LINES) debugLogBuffer.shift();
+}
+
+const log = (...args) => {
+  const rendered = args.map((a) => {
+    if (typeof a === "string") return a;
+    try { return JSON.stringify(a); } catch { return String(a); }
+  }).join(" ");
+  pushDebugLog(`[${new Date().toISOString()}] [bg] ${rendered}`);
+  console.log("[DropClaimer]", ...args);
+};
+
+// Firefox's downloads API resolves a bare relative filename against whatever
+// folder the browser is actually configured to save downloads to
+// (browser.download.dir) - NOT necessarily a folder literally named
+// "Downloads" (confirmed live: this project's own test profile has it set to
+// D:\Browser). conflictAction "overwrite" + a fixed name keeps this one file
+// up to date across writes instead of piling up "(1)", "(2)", ... copies.
+// exportDebugLogToFile() resolves the real on-disk path via
+// downloads.search() rather than asserting one, so the popup can show where
+// the file actually landed instead of guessing wrong.
+const DEBUG_LOG_FILENAME = "twitch-drop-claimer-debug.log";
+async function exportDebugLogToFile() {
+  const text = debugLogBuffer.length ? debugLogBuffer.join("\n") + "\n" : "(no log lines yet)\n";
+  const url = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
+  try {
+    const id = await browser.downloads.download({
+      url,
+      filename: DEBUG_LOG_FILENAME,
+      conflictAction: "overwrite",
+      saveAs: false,
+    });
+    for (let i = 0; i < 20; i++) {
+      const [item] = await browser.downloads.search({ id });
+      if (item && item.state === "complete") return { ok: true, path: item.filename };
+      if (item && item.state === "interrupted") return { ok: false, error: item.error || "interrupted" };
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return { ok: true, path: null }; // still in progress - unusual for a small text blob, don't block on it forever
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  } finally {
+    // give the download time to actually read the blob before revoking
+    setTimeout(() => URL.revokeObjectURL(url), 30_000);
+  }
+}
+
+// Auto-export is throttled (rather than firing on every single event) so a
+// burst of channel rotations doesn't spam the user's Downloads folder/toolbar
+// with repeated overwrites of the same file.
+const AUTO_EXPORT_MIN_INTERVAL_MS = 5 * 60 * 1000;
+let lastAutoExportAt = 0;
+function maybeAutoExportDebugLog() {
+  const now = Date.now();
+  if (now - lastAutoExportAt < AUTO_EXPORT_MIN_INTERVAL_MS) return;
+  lastAutoExportAt = now;
+  exportDebugLogToFile().then((r) => {
+    if (!r.ok) log("auto debug-log export failed:", r.error);
+  });
+}
 
 // serializes every auto-watch mutation so concurrent tab events (multiple
 // games finishing/going offline near-simultaneously) can't race each other
@@ -939,6 +1007,7 @@ async function rejectChannel(slug, channelName, tabId) {
   delete dropSignals[slug];
 
   await browser.storage.local.set({ blockedChannels, watchMeta, dropSignals });
+  maybeAutoExportDebugLog();
 
   try {
     // same tab, bounced back to the directory - cheaper than closing and
@@ -1204,6 +1273,7 @@ async function handleChannelUnusable(msg) {
     };
     await browser.storage.local.set({ blockedChannels });
     log(slug, "- channel", channel, "unusable (" + reason + "), skipped for", UNUSABLE_CHANNEL_COOLDOWN_MS / 60000, "min");
+    maybeAutoExportDebugLog();
   });
 }
 
@@ -1414,6 +1484,10 @@ browser.runtime.onMessage.addListener((msg, sender) => {
 
     case "searchCategoryResult":
       return handleSearchCategoryResult(msg);
+
+    // manual export button in popup.js - see exportDebugLogToFile() above
+    case "exportDebugLog":
+      return exportDebugLogToFile();
 
     case "directoryPicked":
       return handleDirectoryPicked(msg.slug, msg.channel, sender.tab);

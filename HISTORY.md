@@ -1608,3 +1608,46 @@ to match). Submitted to the public AMO listed channel via
 `npm run submit:listed` - lint clean (0/0/0), signed and auto-approved to
 `web-ext-artifacts/33d37586a96d443fa884-0.6.10.xpi`, recorded in
 `.amo-submitted-versions.json`.
+
+## 0.6.11 - local debug log export (no remote-debugging access needed)
+
+**Why:** diagnosing a live "no longer usable:" report (see 0.6.9/0.6.10)
+required either remote-debugging access to the user's real, logged-in
+Firefox profile (opens a debugger port capable of controlling that browser
+session - too much access for reading one log line) or asking the user to
+manually copy console output. Neither scales, and this extension has other
+users too, so what gets captured needed to be documented plainly.
+
+**What was added:**
+- `background.js` keeps an in-memory ring buffer (last 1000 lines) of its
+  own log() output: channel/game names it watched or rejected, timestamps,
+  drop-campaign progress numbers, and its own rotation decisions (e.g.
+  `channel X unusable (offline)`). Nothing in these lines reads Twitch
+  login/session/token data in the first place - confirmed by inspecting
+  every `log(...)` call site.
+- A popup button ("Export debug log") and an automatic, throttled
+  (at most every 5 min) write right after a channel is dropped, both write
+  this buffer to a plain text file via `browser.downloads.download`
+  (new `downloads` permission). The real on-disk path is resolved via
+  `downloads.search()` and shown back to the user - Firefox's configured
+  download folder isn't necessarily one literally named "Downloads" (this
+  project's own test profile has it set to `D:\Browser`, confirmed live).
+- **Never leaves the device.** No server involved, nothing uploaded
+  automatically - a user shares the local file only if they choose to.
+  Documented in README.md (new "Debug log" section) and in the popup
+  itself (a hint under the button, localized in all 9 languages).
+
+**Verified live** (web-ext + RDP): `exportDebugLogToFile()` returned
+`{ok:true, path:"D:\Browser\twitch-drop-claimer-debug.log"}` matching the
+test profile's actual configured download folder (not a hardcoded guess),
+and the file on disk contained real recent log lines in the documented
+format with no credentials/tokens.
+
+**Tests:** the three test files that load background.js in a vm sandbox
+(`auto-watch-multi-tab`, `drop-verification`, `toggle-behavior`) gained
+`browser.downloads` + `URL`/`Blob` stubs so `rejectChannel`/
+`handleChannelUnusable`'s new auto-export call doesn't crash under test.
+`test/i18n.test.js` key-parity extended to the 4 new strings across all 9
+languages. All test files pass; lint clean (0/0/0).
+
+`BUILD_MARKER` -> `2026-09-27-r3`, `manifest.json` -> 0.6.11.
