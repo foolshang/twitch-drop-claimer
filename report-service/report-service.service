@@ -1,0 +1,36 @@
+# systemd unit as deployed on poe-bot-vm (project poe-discord-bot-501417,
+# us-central1-a) at /etc/systemd/system/report-service.service. Reference
+# copy only - editing this file does nothing until it's copied back to the
+# VM and `systemctl daemon-reload`'d.
+#
+# Deploy steps (already done once; only needed again for a fresh VM/token):
+#   1. mkdir -p /opt/report-service, copy main.py there
+#   2. write /opt/report-service/.env (chmod 600):
+#        GITHUB_TOKEN=<fine-grained PAT, Issues: Read and write on this repo only>
+#        GITHUB_REPO=foolshang/twitch-drop-claimer
+#        PORT=8090
+#   3. copy this file to /etc/systemd/system/report-service.service
+#   4. systemctl daemon-reload && systemctl enable --now report-service
+#   5. open the firewall: gcloud compute firewall-rules create
+#        allow-report-service --network=default --direction=INGRESS
+#        --action=ALLOW --rules=tcp:8090 --source-ranges=0.0.0.0/0
+
+[Unit]
+Description=twitch-drop-claimer bug-report -> GitHub issue relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=Winai
+WorkingDirectory=/opt/report-service
+EnvironmentFile=/opt/report-service/.env
+ExecStart=/usr/bin/python3 /opt/report-service/main.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=report-service
+
+[Install]
+WantedBy=multi-user.target

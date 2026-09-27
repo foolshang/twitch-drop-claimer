@@ -18,6 +18,13 @@
  *    from the list - the other tabs are unaffected. Once every game in the
  *    list is done, all watch tabs close and the badge shows "done".
  *
+ *    An entry typed as "@channel" (see parseWatchList in shared.js) pins a
+ *    specific channel instead of a game: its tab goes straight to that
+ *    channel (never the directory), waits for it to go live rather than
+ *    rotating to another channel, and is never blocklisted/rotated by
+ *    verifyDropStatus for stalling - see handleChannelPlayingGame for how
+ *    it gets bound to whatever game the channel is actually playing.
+ *
  * 3. Drop-status verification: a channel a watch tab is parked on might
  *    never credit us - either it's a "fake category" stream (listed under a
  *    game's drops directory without that game's drop campaign actually
@@ -128,6 +135,15 @@ const INVENTORY_URL = "https://www.twitch.tv/drops/inventory";
 // enough to capture that one GQL response, then closed - see
 // refreshOpenCampaigns().
 const CAMPAIGNS_URL = "https://www.twitch.tv/drops/campaigns";
+// small always-on relay (Python stdlib HTTP server on a GCE VM, see
+// scripts/ - not checked into this repo) that turns a POST'd debug log into
+// a GitHub issue on foolshang/twitch-drop-claimer. Exists so "send bug
+// report" can be one click without ever shipping a GitHub write token
+// inside this extension's own public, fully-inspectable source - the token
+// lives only in that relay's environment. X-Client is not a secret, just a
+// noise filter against generic internet scanners hitting the endpoint.
+const REPORT_BUG_URL = "http://35.188.24.245:8090/report";
+const REPORT_BUG_CLIENT_HEADER = "twitch-drop-claimer";
 // how stale the openCampaigns snapshot may be before autoWatchTick refuses
 // to act on "this game has no open campaign" (fail open on older data)
 const OPEN_CAMPAIGNS_MAX_AGE_MS = 6 * 60 * 60 * 1000;
@@ -227,6 +243,34 @@ async function exportDebugLogToFile() {
   } finally {
     // give the download time to actually read the blob before revoking
     setTimeout(() => URL.revokeObjectURL(url), 30_000);
+  }
+}
+
+// manual "send bug report" button in popup.js - posts the same log text
+// exportDebugLogToFile() writes locally to REPORT_BUG_URL instead, which
+// creates a GitHub issue and hands back its number/URL. Never sends
+// anything except this log text (channel/game names, timestamps, internal
+// decisions - never login/tokens, same content as the local export).
+async function reportBugToGitHub() {
+  const text = debugLogBuffer.length ? debugLogBuffer.join("\n") : "(no log lines yet)";
+  const cfg = await browser.storage.local.get("uiLang");
+  try {
+    const res = await fetch(REPORT_BUG_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Client": REPORT_BUG_CLIENT_HEADER },
+      body: JSON.stringify({
+        log: text,
+        version: browser.runtime.getManifest().version,
+        lang: cfg.uiLang || "?",
+      }),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data || !data.ok) {
+      return { ok: false, error: (data && data.error) || `HTTP ${res.status}` };
+    }
+    return { ok: true, issue: data.issue, url: data.url };
+  } catch (e) {
+    return { ok: false, error: String(e) };
   }
 }
 
@@ -466,6 +510,12 @@ async function annotateWatchListFromCampaigns() {
     let listChanged = false;
 
     const next = list.map((g) => {
+      // pinned-channel entries have no typed game name to match against a
+      // campaign display name (g.input is "@channelname") - their slug is
+      // resolved dynamically from what the channel is actually playing (see
+      // handleChannelPlayingGame), never from this snapshot
+      if (g.pinnedChannel) return g;
+
       const match =
         matchOpenCampaign(g.input, activeCampaigns) ||
         (oc.bySlug[g.slug] && oc.bySlug[g.slug].active ? oc.bySlug[g.slug] : null);
@@ -532,6 +582,11 @@ function isGameDone(slug, campaignProgress, invalidSlugs) {
 // stale data (fail open), and never overriding a per-game campaign
 // annotation that already says one is open.
 function lacksOpenCampaign(game, openCampaigns) {
+  // a pinned channel is trusted to be worth watching by virtue of being
+  // pinned - never gated on the /drops/campaigns snapshot, which has no way
+  // to know in advance what game an unresolved (or just-switched) pinned
+  // channel is even playing
+  if (game.pinnedChannel) return false;
   if (!openCampaigns || !openCampaigns.bySlug || !openCampaigns.fetchedAt) return false;
   // an empty snapshot is a failed/partial capture, not "Twitch has no
   // campaigns" - a real one always lists 100+ - so don't act on it
@@ -705,11 +760,31 @@ async function autoWatchTick() {
     if (watchTabs[game.slug]) continue; // already has a tab
 
     const { id: watchWindowId } = await getOrCreateWatchWindow();
-    const tab = await browser.tabs.create({ url: directoryUrl(game.slug), active: false, pinned: true, ...(watchWindowId ? { windowId: watchWindowId } : {}) });
+    const url = game.pinnedChannel ? channelUrl(game.channel) : directoryUrl(game.slug);
+    const tab = await browser.tabs.create({ url, active: false, pinned: true, ...(watchWindowId ? { windowId: watchWindowId } : {}) });
     await browser.tabs.update(tab.id, { active: false, muted: true });
     watchTabs[game.slug] = tab.id;
     openCount++;
     log("opened watch tab for", game.slug, `tab=${tab.id}`, `(${openCount}/${quota})`);
+
+    if (game.pinnedChannel) {
+      // the destination channel is already known (no directory pick to wait
+      // on) - go straight to tracking it, same shape handleDirectoryPicked
+      // uses for a freshly-picked channel
+      watchMeta[game.slug] = { channel: game.channel, tabId: tab.id, watchStartedAt: Date.now() };
+      // fire-and-forget - never block opening the tab on this (see
+      // flashTabToStartPlayback's top comment for why a fresh tab needs it)
+      (async () => {
+        const { id: wwId } = await getOrCreateWatchWindow();
+        if (wwId == null) return;
+        try {
+          const liveTab = await browser.tabs.get(tab.id);
+          if (liveTab.windowId === wwId) await flashTabToStartPlayback(tab.id);
+        } catch {
+          // tab already gone
+        }
+      })();
+    }
   }
 
   await browser.storage.local.set({ watchTabs, watchPhase: "watching", watchMeta, dropSignals });
@@ -869,6 +944,98 @@ async function applyResolvedSlug(badSlug, goodSlug) {
     }
   });
   await serialized(autoWatchTick);
+}
+
+// ============================================================================
+// pinned-channel resolution - a watch-list entry typed as "@channel" starts
+// with a synthetic "channel:<name>" slug (see parseWatchList). Once
+// content.js's channel-page monitor sees that channel live and reports what
+// game it's playing (msg.slug, already run through toSlug()+ALIASES the same
+// way parseInventoryCampaigns derives its own card slug - see
+// currentStreamGame() in content.js), rewrite the entry's slug to that real
+// category slug so every existing per-slug system (inventory-progress
+// matching, badges, isGameDone, verifyDropStatus) treats it exactly like an
+// ordinary typed-game entry from here on. Also fires again if a pinned
+// channel later switches to a genuinely different game - campaign progress
+// belongs to a specific game and is never carried across that switch, but
+// the tab itself is untouched (it's already sitting on the right channel).
+// ============================================================================
+async function handleChannelPlayingGame(msg, tab) {
+  const { channel, slug, gameName } = msg;
+  if (!tab || !channel || !slug) return;
+
+  const changed = await serialized(async () => {
+    const cfg = await browser.storage.local.get([
+      "watchList", "watchTabs", "watchMeta", "dropSignals", "campaignProgress",
+      "invalidSlugs", "emptyUntil", "gameWaitUntil", "blockedChannels",
+    ]);
+    const watchTabs = cfg.watchTabs || {};
+    const fromSlug = Object.keys(watchTabs).find((s) => watchTabs[s] === tab.id);
+    if (!fromSlug || fromSlug === slug) return false;
+
+    const watchList = cfg.watchList || [];
+    const game = watchList.find((g) => g.slug === fromSlug);
+    if (!game || !game.pinnedChannel) return false; // not a pinned-channel watch tab
+
+    if (watchList.some((g) => g.slug === slug)) {
+      log("pinned channel", channel, "- won't bind to", slug, "- already tracked by another watch-list entry");
+      return false;
+    }
+
+    const nextWatchList = watchList.map((g) =>
+      g.slug === fromSlug ? { ...g, slug, pinnedGameName: gameName || null } : g
+    );
+
+    const rekey = (obj) => {
+      if (!obj || typeof obj !== "object" || Array.isArray(obj) || !(fromSlug in obj)) return obj || {};
+      const next = { ...obj, [slug]: obj[fromSlug] };
+      delete next[fromSlug];
+      return next;
+    };
+    const nextWatchTabs = rekey(watchTabs);
+    const nextInvalidSlugs = rekey(cfg.invalidSlugs && !Array.isArray(cfg.invalidSlugs) ? cfg.invalidSlugs : {});
+    const nextEmptyUntil = rekey(cfg.emptyUntil || {});
+    const nextGameWaitUntil = rekey(cfg.gameWaitUntil || {});
+    const nextBlockedChannels = rekey(cfg.blockedChannels || {});
+
+    // campaign progress is game-specific - never carried across a pinned
+    // channel binding to a game for the first time (nothing to carry) or
+    // switching to a different one (would misattribute the old game's numbers)
+    const nextCampaignProgress = { ...(cfg.campaignProgress || {}) };
+    delete nextCampaignProgress[fromSlug];
+
+    // fresh verify clock - can't judge progress against a baseline from
+    // before this game was even known
+    const nextWatchMeta = { ...(cfg.watchMeta || {}) };
+    delete nextWatchMeta[fromSlug];
+    nextWatchMeta[slug] = { channel, tabId: tab.id, watchStartedAt: Date.now() };
+    const nextDropSignals = { ...(cfg.dropSignals || {}) };
+    delete nextDropSignals[fromSlug];
+
+    suppressWatchListReaction = true;
+    try {
+      await browser.storage.local.set({
+        watchList: nextWatchList,
+        watchTabs: nextWatchTabs,
+        watchMeta: nextWatchMeta,
+        dropSignals: nextDropSignals,
+        campaignProgress: nextCampaignProgress,
+        invalidSlugs: nextInvalidSlugs,
+        emptyUntil: nextEmptyUntil,
+        gameWaitUntil: nextGameWaitUntil,
+        blockedChannels: nextBlockedChannels,
+      });
+    } finally {
+      suppressWatchListReaction = false;
+    }
+    log(
+      "pinned channel", channel, fromSlug.startsWith("channel:") ? "resolved to game" : "switched game to",
+      slug, gameName ? `(${gameName})` : ""
+    );
+    return true;
+  });
+
+  if (changed) await serialized(autoWatchTick);
 }
 
 async function mergeInventoryProgress(campaigns) {
@@ -1139,25 +1306,39 @@ async function verifyDropStatus(slug) {
 // others still progressing normally is real evidence against that one
 // channel specifically.
 async function verifySweep() {
-  const cfg = await browser.storage.local.get(["watchMeta"]);
+  const cfg = await browser.storage.local.get(["watchMeta", "watchList"]);
   const slugs = Object.keys(cfg.watchMeta || {});
+  const pinnedSlugs = new Set(
+    (cfg.watchList || []).filter((g) => g.pinnedChannel).map((g) => g.slug)
+  );
   const verdicts = [];
   for (const slug of slugs) {
     const verdict = await verifyDropStatus(slug);
     if (verdict) verdicts.push({ slug, ...verdict });
   }
 
-  const allStalledTogether = verdicts.length >= 2 && verdicts.every((v) => v.stalled);
+  // a user-pinned channel is never rotated away for stalling - they chose it
+  // deliberately, so just note it and leave it watching. Excluded from both
+  // the rotation below AND the "stalled together" system-wide heuristic,
+  // which is about deciding whether to rotate at all.
+  for (const v of verdicts) {
+    if (v.stalled && pinnedSlugs.has(v.slug)) {
+      log("[verify]", v.slug, "channel", v.channelName, "- stalled, but it's a pinned channel, not rotating away");
+    }
+  }
+  const rotatable = verdicts.filter((v) => !pinnedSlugs.has(v.slug));
+
+  const allStalledTogether = rotatable.length >= 2 && rotatable.every((v) => v.stalled);
   if (allStalledTogether) {
     log(
-      "[verify] all", verdicts.length, "watched channels stalled in the same sweep",
-      `(${verdicts.map((v) => v.slug).join(", ")})`,
+      "[verify] all", rotatable.length, "watched channels stalled in the same sweep",
+      `(${rotatable.map((v) => v.slug).join(", ")})`,
       "- treating as a system-wide cause, not rotating any of them this sweep"
     );
     return;
   }
 
-  for (const v of verdicts) {
+  for (const v of rotatable) {
     if (v.stalled) await rejectChannel(v.slug, v.channelName, v.tabId);
   }
 }
@@ -1489,6 +1670,9 @@ browser.runtime.onMessage.addListener((msg, sender) => {
     case "exportDebugLog":
       return exportDebugLogToFile();
 
+    case "reportBug":
+      return reportBugToGitHub();
+
     case "directoryPicked":
       return handleDirectoryPicked(msg.slug, msg.channel, sender.tab);
 
@@ -1498,6 +1682,9 @@ browser.runtime.onMessage.addListener((msg, sender) => {
 
     case "channelRedirected":
       return handleChannelLeft(msg.slug);
+
+    case "channelPlayingGame":
+      return handleChannelPlayingGame(msg, sender.tab);
 
     case "gqlDropSignal":
       return handleGqlDropSignal(msg, sender.tab);

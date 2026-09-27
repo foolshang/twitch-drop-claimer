@@ -7,7 +7,7 @@
 // value out loud when asking for a fresh test - lets whoever's testing
 // confirm from the background console alone that Firefox is actually running
 // this exact source tree, not a stale reload/cached build/old .xpi.
-const BUILD_MARKER = "2026-09-27-r3";
+const BUILD_MARKER = "2026-09-27-r5";
 
 const ALIASES = {
   // Path of Exile
@@ -70,13 +70,35 @@ function channelFromUrl(urlStr) {
   return null;
 }
 
-// "poe2, Diablo 4\n path of exile" -> [{input, slug}], de-duplicated by slug,
-// order preserved (priority = list order)
+// "poe2, Diablo 4\n path of exile\n @favoritestreamer" -> [{input, slug}, ...],
+// de-duplicated, order preserved (priority = list order, shared by games and
+// pinned channels alike - one combined tabQuota, not a separate pool per type).
+//
+// A line starting with "@" pins a specific channel instead of a game: the
+// user wants that exact channel watched (bypassing the directory's
+// lowest-viewer auto-pick), whatever game it happens to be playing.
+// `slug` starts out as a synthetic "channel:<name>" key (there's no real
+// game slug yet - the channel might not even be live) so every existing
+// per-slug storage map (watchTabs/watchMeta/campaignProgress/...) still has
+// a stable, unique key to index by. Once background.js observes what game
+// the pinned channel is actually streaming, it rewrites this entry's slug to
+// the real category slug (see handleChannelPlayingGame) and everything
+// downstream (inventory-progress matching, badges, isGameDone) treats it
+// exactly like an ordinary typed-game entry from that point on.
 function parseWatchList(raw) {
   const lines = (raw || "").split("\n").map((l) => l.trim()).filter(Boolean);
   const seen = new Set();
   const list = [];
   for (const input of lines) {
+    if (input.startsWith("@")) {
+      const channel = input.slice(1).trim();
+      if (!channel) continue;
+      const key = "channel:" + channel.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      list.push({ input, slug: key, channel, pinnedChannel: true });
+      continue;
+    }
     const slug = toSlug(input);
     if (!slug || seen.has(slug)) continue;
     seen.add(slug);
@@ -87,6 +109,10 @@ function parseWatchList(raw) {
 
 function directoryUrl(slug) {
   return `https://www.twitch.tv/directory/category/${slug}?filter=drops`;
+}
+
+function channelUrl(channel) {
+  return `https://www.twitch.tv/${encodeURIComponent(channel)}`;
 }
 
 function searchUrl(term) {

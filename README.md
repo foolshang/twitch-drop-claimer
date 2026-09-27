@@ -26,7 +26,20 @@ eligible game — up to a configurable quota (default 3) — each pointed at
 that game's live channel with the fewest viewers. Games beyond the quota
 queue up. A game's tab closes itself the moment that game is fully claimed,
 its campaign expires, or the game is invalid/removed, without touching the
-other tabs. Two priority modes decide which queued games get a tab first
+other tabs.
+
+A list line starting with `@` (e.g. `@somestreamer`) pins that exact
+channel instead of a game - its tab goes straight to that channel (never
+the directory's auto-pick), waits for it to go live rather than rotating to
+another channel if it's offline, and is never rotated/blocklisted for
+stalled drop progress the way an auto-picked channel would be. It shares
+the same priority-ordered list and tab quota as game entries. Once the
+channel is live, the background script binds it to whatever game it's
+actually playing (read from the channel page's own category link) and
+tracks/claims progress for it exactly like a typed game entry from then on;
+switching games later re-binds automatically.
+
+Two priority modes decide which queued games get a tab first
 when the list is longer than the quota: list order, or soonest-campaign-
 expiry-first (using Twitch's own campaign end date, known for every game
 that has an open campaign; falls closed to list order otherwise). Once
@@ -160,6 +173,10 @@ timers, opening and managing background tabs (watch tabs plus transient
 persisting settings/state, writing the local debug log file below, and
 running the content script plus reading tab URLs on Twitch only.
 
+There's also host access to the bug-report relay's address (see "Sending it
+to the developer" below) - used only for the explicit "Send bug report"
+button, never anything else.
+
 ## Debug log — what it stores, and where it goes
 
 A ring buffer (last 1000 lines) of this extension's own internal log lines:
@@ -170,14 +187,13 @@ remaining), and its own decisions (e.g. `channel X unusable (offline)`,
 password, session cookie, or any OAuth/auth token — nothing in the code
 that builds these lines reads that data in the first place.
 
-**It never leaves your computer.** There is no server this extension talks
-to for this (or anything else) - the only place this data goes is a plain
-text file on your own disk, `twitch-drop-claimer-debug.log`, written via
-Firefox's own downloads API to whatever folder Firefox is configured to
-save downloads to. Nothing is uploaded, and Claude/Anthropic/any other
-party never receives it automatically - if you want a developer to see it
-to help diagnose an issue, you choose to open/share that local file
-yourself.
+**The local export never leaves your computer.** The only place this data
+goes is a plain text file on your own disk, `twitch-drop-claimer-debug.log`,
+written via Firefox's own downloads API to whatever folder Firefox is
+configured to save downloads to. Nothing is uploaded automatically, and
+Claude/Anthropic/any other party never receives it - if you want a
+developer to see it to help diagnose an issue, you choose to open/share
+that local file yourself.
 
 It's written in two ways: a button in the popup ("Export debug log") writes
 it on demand, and it's also written automatically - throttled to at most
@@ -185,6 +201,17 @@ once every 5 minutes - right after auto-watch drops a channel (offline,
 switched game, or failed drop-progress verification), so a diagnosis has
 something to look at without needing the file exported at exactly the right
 moment.
+
+**Sending it to the developer.** A second button ("Send bug report") sends
+this same log text to a small relay the developer runs, which files it as a
+GitHub issue on this project and reports back the issue's link - one click,
+nothing saved locally, no GitHub account needed. This is the one case where
+this extension does talk to a server: only when you press this specific
+button, carrying only the log text above (same content, same guarantees -
+never your Twitch login/session/tokens) plus the extension version and UI
+language. The relay holds no data about you beyond that one request; it
+exists solely to create the GitHub issue without shipping a GitHub write
+token inside this extension's own public source.
 
 ## Testing
 

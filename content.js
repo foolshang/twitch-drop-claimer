@@ -8,7 +8,10 @@
  *    is the designated "watch tab" -> pick the live channel with the fewest
  *    viewers and navigate to it
  * 3. Channel page, when this tab is the watch tab -> set lowest quality +
- *    mute, watch for offline/raid and bounce back to the directory
+ *    mute, watch for offline/raid and bounce back to the directory (a
+ *    pinned "@channel" entry is the exception: it goes back to itself on a
+ *    raid, and never bounces at all for offline/game-changed - see the
+ *    pinned branch inside the channel-page monitor below)
  * 4. Inventory page (/drops/inventory) -> claim buttons (existing) + parse
  *    campaign progress and report it to background for the auto-skip logic
  *
@@ -177,6 +180,22 @@
     const m = a && (a.getAttribute("href") || "").match(/\/directory\/(?:category|game)\/([^/?#]+)/);
     if (!m) return null;
     try { return decodeURIComponent(m[1]).toLowerCase(); } catch { return m[1].toLowerCase(); }
+  }
+
+  // display name + slug of the category the viewed channel is currently
+  // streaming, for a pinned ("@channel") watch tab to report back to
+  // background.js. Deliberately toSlug(name) rather than the href slug
+  // above: parseInventoryCampaigns keys its own cards the same way (name
+  // learned from gameIdMap -> toSlug()+ALIASES), so this has to match that
+  // derivation exactly, not just be *a* real Twitch category slug, or a
+  // renamed game (e.g. Rainbow Six Siege) would bind to a slug the inventory
+  // page never uses and progress would never link up.
+  function currentStreamGame() {
+    const a = document.querySelector('[data-a-target="stream-game-link"]');
+    const name = a && (a.textContent || "").trim();
+    if (!name) return null;
+    const slug = toSlug(name);
+    return slug ? { name, slug } : null;
   }
 
   // "offline" | "game:<slug>" | null. Game slug comes from the stream info's
@@ -799,6 +818,7 @@
       let handled = false;
       let seenLive = false;
       let baselineGame = null;
+      let lastReportedGameSlug = null;
       const CHANNEL_PROBLEM_RECHECK_MS = 10_000;
 
       // fast first recovery attempt - don't make a stalled player wait a
@@ -819,14 +839,39 @@
         nudgeStalledPlayer();
 
         const expectedSlug = wt.activeGame && wt.activeGame.slug;
+        const pinned = !!(wt.activeGame && wt.activeGame.pinnedChannel);
         const currentChannel = channelFromUrl(location.href);
 
-        // raid/host: Twitch navigated this tab away from the channel we picked
+        // raid/host: Twitch navigated this tab away from the channel we picked.
+        // A pinned channel goes back to itself (that's the one the user
+        // explicitly asked for), never into the raid target or a directory.
         if (initialChannel && currentChannel && currentChannel !== initialChannel) {
           handled = true;
           log("redirected away from", initialChannel, "to", currentChannel);
           browser.runtime.sendMessage({ type: "channelRedirected", slug: expectedSlug }).catch(() => {});
-          if (expectedSlug) location.href = directoryUrl(expectedSlug);
+          location.href = pinned ? channelUrl(initialChannel) : (expectedSlug ? directoryUrl(expectedSlug) : location.href);
+          return;
+        }
+
+        if (looksLive()) {
+          seenLive = true;
+          if (!baselineGame) baselineGame = currentStreamGameSlug();
+        }
+
+        // pinned channel: never bounce away for being offline or for playing
+        // a different game than before - that's expected, not a problem.
+        // Just keep reporting whatever game it's actually playing so
+        // background.js can bind this entry's tracking to it.
+        if (pinned) {
+          if (looksLive()) {
+            const g = currentStreamGame();
+            if (g && g.slug !== lastReportedGameSlug) {
+              lastReportedGameSlug = g.slug;
+              browser.runtime.sendMessage({
+                type: "channelPlayingGame", channel: initialChannel, slug: g.slug, gameName: g.name,
+              }).catch(() => {});
+            }
+          }
           return;
         }
 
@@ -834,10 +879,6 @@
         // state (page mid-transition, category link not yet re-rendered) must
         // not bounce a good channel, so the same problem has to show up again
         // after CHANNEL_PROBLEM_RECHECK_MS before acting on it.
-        if (looksLive()) {
-          seenLive = true;
-          if (!baselineGame) baselineGame = currentStreamGameSlug();
-        }
         const first = channelProblem(baselineGame, seenLive);
         if (!first) return;
         await new Promise((r) => setTimeout(r, CHANNEL_PROBLEM_RECHECK_MS));

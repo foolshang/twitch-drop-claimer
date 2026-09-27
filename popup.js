@@ -86,6 +86,8 @@ const $gameStatusEmpty = document.getElementById("gameStatusEmpty");
 
 const $exportDebugLog = document.getElementById("exportDebugLog");
 const $exportDebugLogStatus = document.getElementById("exportDebugLogStatus");
+const $reportBug = document.getElementById("reportBug");
+const $reportBugStatus = document.getElementById("reportBugStatus");
 const $autoOff = document.getElementById("autooff");
 const $status = document.getElementById("status");
 const $uiLang = document.getElementById("uiLang");
@@ -130,7 +132,7 @@ async function renderInfo() {
 function renderGamesPreview() {
   const list = parseWatchList($gamesList.value);
   $gamesPreview.textContent = list.length
-    ? list.map((g, i) => `${i + 1}. ${g.input} → ${g.slug}`).join("   ")
+    ? list.map((g, i) => `${i + 1}. ${g.pinnedChannel ? `@${g.channel}` : `${g.input} → ${g.slug}`}`).join("   ")
     : "";
 }
 
@@ -150,9 +152,12 @@ function gameRowEl(game, index, isWatching, badge, detail, waitUntil) {
   const nameSpan = document.createElement("span");
   // show Twitch's canonical name when we've resolved one and it differs
   const canonical = game.displayName && game.displayName !== game.input ? game.displayName : null;
-  nameSpan.textContent = canonical
-    ? `${index + 1}. ${canonical}`
-    : `${index + 1}. ${game.input}`;
+  // a pinned channel has no canonical game name to swap in - show the
+  // channel plus whatever game it's currently been observed playing, if known
+  const label = canonical || (game.pinnedChannel && game.pinnedGameName
+    ? `${game.input} (${game.pinnedGameName})`
+    : game.input);
+  nameSpan.textContent = `${index + 1}. ${label}`;
   nameLine.appendChild(nameSpan);
   if (badge) nameLine.appendChild(badge);
   row.appendChild(nameLine);
@@ -438,7 +443,10 @@ async function renderGameStatus() {
     const campaign = game.campaign || null;
     const ocEntry = openCampaigns && openCampaigns.bySlug && openCampaigns.bySlug[game.slug];
     const hasOpenCampaign = !!(campaign && campaign.open) || !!(ocEntry && ocEntry.active);
-    const noOpenCampaign = ocFresh && !hasOpenCampaign;
+    // a pinned channel is trusted by virtue of being pinned - never flagged
+    // "no open drop" just because the /drops/campaigns snapshot doesn't (yet)
+    // know what game it's playing, see lacksOpenCampaign in background.js
+    const noOpenCampaign = !game.pinnedChannel && ocFresh && !hasOpenCampaign;
 
     let badge = null;
     let detail = t("detail_no_progress");
@@ -630,6 +638,25 @@ $exportDebugLog.addEventListener("click", async () => {
     $exportDebugLogStatus.textContent = t("export_debug_log_failed", { err: e });
   } finally {
     $exportDebugLog.disabled = false;
+  }
+});
+
+// sends the same log text as the export button above to a small relay
+// (see REPORT_BUG_URL in background.js) that creates a GitHub issue from
+// it - one click, no file to attach, no GitHub token anywhere in this
+// extension's own source.
+$reportBug.addEventListener("click", async () => {
+  $reportBug.disabled = true;
+  $reportBugStatus.textContent = t("report_bug_working");
+  try {
+    const res = await browser.runtime.sendMessage({ type: "reportBug" });
+    $reportBugStatus.textContent = res && res.ok
+      ? t("report_bug_done", { url: res.url || "?" })
+      : t("report_bug_failed", { err: (res && res.error) || "?" });
+  } catch (e) {
+    $reportBugStatus.textContent = t("report_bug_failed", { err: e });
+  } finally {
+    $reportBug.disabled = false;
   }
 });
 
