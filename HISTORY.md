@@ -1530,3 +1530,43 @@ via `npm run submit:listed` - lint clean (0/0/0), signed and auto-approved
 to `web-ext-artifacts/33d37586a96d443fa884-0.6.8.xpi`, recorded in
 `.amo-submitted-versions.json`. Firefox installs auto-update from the AMO
 listing.
+
+## 0.6.9 - leave a channel that went offline or switched game
+
+**Problem:** a watched streamer ending the stream or switching to another game
+did not make the extension change channel. content.js only recognised an
+offline page by Twitch's offline marker classes/text, and had no check for a
+category change at all, so both cases waited for `verifyDropStatus`'s
+17-minute progress comparison (which also fails closed when no
+`timeRemainingMin` can be read). Even after bouncing to the directory,
+`pickBestChannel()` could re-pick the same channel while Twitch's listing
+still showed it.
+
+**Fix:**
+- `channelProblem()` (content.js) returns `"offline"` or `"game:<slug>"`. The
+  game comes from `[data-a-target="stream-game-link"]` (href
+  `/directory/category/<slug>`, captured live) compared with the slug the tab
+  was picked for. A page that was live (viewer count seen) and lost the
+  viewer count without any offline marker also counts as offline; a player
+  content gate never does.
+- The same problem must be seen again 10s later before acting, so a page
+  mid-render does not bounce a good channel. Checked on the existing 60s tick.
+- background.js `handleChannelUnusable()` (new `channelGameChanged` message,
+  plus the existing `channelOffline`) blocks that channel for 20 min
+  (`UNUSABLE_CHANNEL_COOLDOWN_MS`) so it is not re-picked. Deliberately
+  shorter than `rejectChannel`'s 45 min and it leaves `watchMeta`/`dropSignals`
+  alone; raids/redirects stay log-only.
+
+**Verified live** (web-ext + RDP against a logged-in profile, watch tab on
+Halo Infinite): rewriting the stream game link to `just-chatting` on the
+channel page -> within ~1.5 min the tab returned to the directory, picked a
+different channel and the old one was in `blockedChannels` with a ~20 min
+expiry; removing the viewer-count element on the next channel -> same, moved
+to a third channel and blocked.
+
+**Tests:** `test/channel-live-detection.test.js` gains game-change (same,
+case-insensitive, different, link not rendered) and ended-stream-without-
+marker (was live / never live / content gate / explicit offline) cases. All
+test files pass.
+
+`BUILD_MARKER` -> `2026-09-27-r1`, `manifest.json` -> 0.6.9.
