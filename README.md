@@ -187,26 +187,20 @@ remaining), and its own decisions (e.g. `channel X unusable (offline)`,
 password, session cookie, or any OAuth/auth token — nothing in the code
 that builds these lines reads that data in the first place.
 
-**The local export never leaves your computer.** The only place this data
-goes is a plain text file on your own disk, `twitch-drop-claimer-debug.log`,
-written via Firefox's own downloads API to whatever folder Firefox is
-configured to save downloads to. Nothing is uploaded automatically, and
-Claude/Anthropic/any other party never receives it - if you want a
-developer to see it to help diagnose an issue, you choose to open/share
-that local file yourself.
+**The automatic local copy never leaves your computer.** It's written to
+`twitch-drop-claimer-debug.log`, via Firefox's own downloads API to
+whatever folder Firefox is configured to save downloads to, automatically
+and throttled to at most once every 5 minutes right after auto-watch drops
+a channel (offline, switched game, or failed drop-progress verification) -
+so a diagnosis has something to look at without needing anything exported
+at exactly the right moment. Nothing is uploaded, and Claude/Anthropic/any
+other party never receives it.
 
-It's written in two ways: a button in the popup ("Export debug log") writes
-it on demand, and it's also written automatically - throttled to at most
-once every 5 minutes - right after auto-watch drops a channel (offline,
-switched game, or failed drop-progress verification), so a diagnosis has
-something to look at without needing the file exported at exactly the right
-moment.
-
-**Sending it to the developer.** A second button ("Send bug report") sends
-this same log text to a small relay the developer runs, which files it as a
-GitHub issue on this project and reports back the issue's link - one click,
-nothing saved locally, no GitHub account needed. This is the one case where
-this extension does talk to a server: only when you press this specific
+**Sending it to the developer.** A button in the popup ("Send bug report")
+sends this same log text to a small relay the developer runs, which files
+it as a GitHub issue on this project and reports back the issue's link -
+one click, nothing saved locally, no GitHub account needed. This is the one
+case where this extension does talk to a server: only when you press this specific
 button, carrying only the log text above (same content, same guarantees -
 never your Twitch login/session/tokens) plus the extension version and UI
 language. The relay holds no data about you beyond that one request; it

@@ -1666,10 +1666,6 @@ browser.runtime.onMessage.addListener((msg, sender) => {
     case "searchCategoryResult":
       return handleSearchCategoryResult(msg);
 
-    // manual export button in popup.js - see exportDebugLogToFile() above
-    case "exportDebugLog":
-      return exportDebugLogToFile();
-
     case "reportBug":
       return reportBugToGitHub();
 

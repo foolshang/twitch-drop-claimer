@@ -84,8 +84,6 @@ const $priorityMode = document.getElementById("priorityMode");
 const $gameStatusList = document.getElementById("gameStatusList");
 const $gameStatusEmpty = document.getElementById("gameStatusEmpty");
 
-const $exportDebugLog = document.getElementById("exportDebugLog");
-const $exportDebugLogStatus = document.getElementById("exportDebugLogStatus");
 const $reportBug = document.getElementById("reportBug");
 const $reportBugStatus = document.getElementById("reportBugStatus");
 const $autoOff = document.getElementById("autooff");
@@ -620,31 +618,13 @@ $campaignsCheck.addEventListener("click", async () => {
   }
 });
 
-// writes background.js's in-memory log ring buffer to a plain-text file
-// (see exportDebugLogToFile() in background.js, which resolves and reports
-// back the real on-disk path - Firefox's configured download folder isn't
-// necessarily one literally named "Downloads") - lets a diagnosis read what
-// actually happened (e.g. a "no longer usable:" line) without needing
-// remote-debugging access to this real, logged-in profile.
-$exportDebugLog.addEventListener("click", async () => {
-  $exportDebugLog.disabled = true;
-  $exportDebugLogStatus.textContent = t("export_debug_log_working");
-  try {
-    const res = await browser.runtime.sendMessage({ type: "exportDebugLog" });
-    $exportDebugLogStatus.textContent = res && res.ok
-      ? t("export_debug_log_done", { path: res.path || "?" })
-      : t("export_debug_log_failed", { err: (res && res.error) || "?" });
-  } catch (e) {
-    $exportDebugLogStatus.textContent = t("export_debug_log_failed", { err: e });
-  } finally {
-    $exportDebugLog.disabled = false;
-  }
-});
-
-// sends the same log text as the export button above to a small relay
-// (see REPORT_BUG_URL in background.js) that creates a GitHub issue from
-// it - one click, no file to attach, no GitHub token anywhere in this
-// extension's own source.
+// sends background.js's in-memory log ring buffer to a small relay (see
+// REPORT_BUG_URL in background.js) that creates a GitHub issue from it -
+// one click, no file to attach, no GitHub token anywhere in this
+// extension's own source. The buffer is still also written to a local file
+// automatically after a channel is dropped (see maybeAutoExportDebugLog in
+// background.js) - this button is just the on-demand path, not the only
+// place the log data goes.
 $reportBug.addEventListener("click", async () => {
   $reportBug.disabled = true;
   $reportBugStatus.textContent = t("report_bug_working");

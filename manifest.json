@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Twitch Drop Auto-Claimer",
-  "version": "0.6.12",
+  "version": "0.6.13",
   "description": "Auto-claim Twitch Drops while you keep a stream/inventory tab open. Also reloads the inventory tab periodically.",
   "permissions": [
     "alarms",
