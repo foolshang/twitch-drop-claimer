@@ -1659,3 +1659,15 @@ submit:listed` - lint clean (0/0/0), signed and auto-approved to
 `.amo-submitted-versions.json`. Firefox installs auto-update from the AMO
 listing; existing users will see a permission-upgrade prompt for the new
 `downloads` permission.
+
+**2026-09-27 addendum:** at the user's request, disabled the 0.6.11 file on
+AMO (`PATCH /api/v5/addons/addon/{addon}/versions/{id}/` with
+`is_disabled: true`, version id `6518459`) so it's no longer offered for
+install/auto-update - confirmed via the addon detail endpoint that
+`current_version` reverted to `0.6.10` (id `6518047`) for everyone else,
+while the listing itself stays public (`status: public`). The signed 0.6.11
+xpi stays available locally for the user's own private testing at
+`web-ext-artifacts/33d37586a96d443fa884-0.6.11.xpi` (install manually via
+`about:addons` -> gear icon -> "Install Add-on From File..."). Re-enabling
+later (if the debug-log feature is confirmed working and meant for
+everyone) is the same PATCH with `is_disabled: false`.
