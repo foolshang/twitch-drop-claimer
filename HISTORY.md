@@ -1764,3 +1764,33 @@ submit:listed` - lint clean (0/0/0), signed and auto-approved to
 `.amo-submitted-versions.json`. Firefox installs auto-update from the AMO
 listing; existing users will see a permission-upgrade prompt for the new
 host permission to the bug-report relay's address.
+
+## 0.6.13 - remove the manual "Export debug log" button
+
+**Why:** at the user's request, right after 0.6.12 shipped "Send bug
+report" - having both a manual file-export button and a one-click
+send-to-GitHub button was redundant clutter; the one-click path covers what
+the file export was for.
+
+**What changed:** removed the popup button, its click handler, and the
+`"exportDebugLog"` message-handler case in background.js. The underlying
+`exportDebugLogToFile()` function and the automatic, throttled
+(`maybeAutoExportDebugLog()`, at most every 5 min, right after auto-watch
+drops a channel) write to a local file are untouched - that mechanism isn't
+tied to the button and is still useful on its own. Dropped the 5 now-unused
+i18n keys (`btn_export_debug_log`/`export_debug_log_{hint,working,done,
+failed}`) across all 9 languages, and split README's "Debug log" section so
+the "never leaves your computer" claim is scoped correctly to just the
+automatic local copy (it stopped being true for the whole section the
+moment 0.6.12 added a button that does talk to a server).
+
+**Tests:** all 8 test files pass unchanged; i18n key parity re-verified at
+81 keys/language (was 86). Lint clean (0/0/0).
+
+`BUILD_MARKER` -> `2026-09-27-r6`, `manifest.json` -> 0.6.13.
+
+Committed to `master` as `606c393`, pushed to GitHub (`dev` fast-forwarded
+to match). Submitted to the public AMO listed channel via `npm run
+submit:listed` - lint clean (0/0/0), signed and auto-approved to
+`web-ext-artifacts/33d37586a96d443fa884-0.6.13.xpi`, recorded in
+`.amo-submitted-versions.json`.
