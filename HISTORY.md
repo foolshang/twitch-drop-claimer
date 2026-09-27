@@ -1577,3 +1577,28 @@ match, local and remote). Submitted to the public AMO listed channel via
 `web-ext-artifacts/33d37586a96d443fa884-0.6.9.xpi`, recorded in
 `.amo-submitted-versions.json`. Firefox installs auto-update from the AMO
 listing.
+
+## 0.6.10 - game-change check no longer depends on the directory slug
+
+**Problem:** 0.6.9's game-change check compared the channel page's category
+slug with the slug the tab was picked for. Those can legitimately differ (a
+renamed/aliased game whose directory slug isn't the one Twitch puts on the
+channel page), which would bounce a perfectly good channel every time - the
+limitation flagged when 0.6.9 shipped.
+
+**Fix:** `channelProblem(baselineGame, seenLive)` now compares against the
+category the channel showed the first time it was seen live (`baselineGame`,
+set on the first 60s tick), so only a real change while watching counts.
+A channel already under the wrong category at pick time is still the drop-
+progress verification's job.
+
+**Verified live** (web-ext + RDP, Halo Infinite watch tab): rewriting the
+stream game link to a slug unlike the expected one before the first tick ->
+no bounce after 100s (the 0.6.9 logic would have bounced); changing it again
+afterwards -> tab returned to the directory, picked another channel, old one
+blocked ~20 min.
+
+**Tests:** game-change test now uses a baseline (same, case-insensitive,
+changed, link missing, no baseline yet). All test files pass.
+
+`BUILD_MARKER` -> `2026-09-27-r2`, `manifest.json` -> 0.6.10.

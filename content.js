@@ -181,19 +181,24 @@
 
   // "offline" | "game:<slug>" | null. Game slug comes from the stream info's
   // own category link (live DOM capture 2026-09-27:
-  // <a data-a-target="stream-game-link" href="/directory/category/just-chatting">),
-  // compared with the game the watch tab was picked for. A page that was
+  // <a data-a-target="stream-game-link" href="/directory/category/just-chatting">).
+  // Compared with baselineGame - the category this channel showed the first
+  // time it was seen live - NOT with the slug the tab was picked for: a
+  // renamed/aliased game's directory slug can differ from the slug Twitch puts
+  // on the channel page, which would bounce a perfectly good channel. (A
+  // channel that was already under the wrong category when picked is the
+  // drop-progress verification's job, see background.js.) A page that was
   // showing the live viewer count (seenLive) and then loses it also counts
   // as offline - Twitch doesn't always add an offline marker when a stream
   // just ends.
-  function channelProblem(expectedSlug, seenLive) {
+  function channelProblem(baselineGame, seenLive) {
     if (!looksLive()) {
       if (looksOffline()) return "offline";
       if (seenLive && !document.querySelector('[data-a-target="player-overlay-content-gate"]')) return "offline";
       return null;
     }
     const g = currentStreamGameSlug();
-    if (g && expectedSlug && g !== String(expectedSlug).toLowerCase()) return `game:${g}`;
+    if (g && baselineGame && g !== baselineGame) return `game:${g}`;
     return null;
   }
 
@@ -793,6 +798,7 @@
       let qualityApplied = false;
       let handled = false;
       let seenLive = false;
+      let baselineGame = null;
       const CHANNEL_PROBLEM_RECHECK_MS = 10_000;
 
       // fast first recovery attempt - don't make a stalled player wait a
@@ -828,11 +834,14 @@
         // state (page mid-transition, category link not yet re-rendered) must
         // not bounce a good channel, so the same problem has to show up again
         // after CHANNEL_PROBLEM_RECHECK_MS before acting on it.
-        if (looksLive()) seenLive = true;
-        const first = channelProblem(expectedSlug, seenLive);
+        if (looksLive()) {
+          seenLive = true;
+          if (!baselineGame) baselineGame = currentStreamGameSlug();
+        }
+        const first = channelProblem(baselineGame, seenLive);
         if (!first) return;
         await new Promise((r) => setTimeout(r, CHANNEL_PROBLEM_RECHECK_MS));
-        if (!enabled || channelProblem(expectedSlug, seenLive) !== first) return;
+        if (!enabled || channelProblem(baselineGame, seenLive) !== first) return;
 
         handled = true;
         log("channel", initialChannel, "no longer usable:", first, "- back to the directory");

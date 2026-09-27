@@ -267,17 +267,19 @@ async function testWrongSlugDetectedAsUnknownCategory() {
 }
 
 async function testGameChangeIsDetected() {
-  const problem = (html, expected, seen) =>
-    vm.runInContext("channelProblem", makeCtx(html))(expected, seen);
+  const problem = (html, baseline, seen) =>
+    vm.runInContext("channelProblem", makeCtx(html))(baseline, seen);
   assert.strictEqual(problem(liveWithGame("path-of-exile-2"), "path-of-exile-2", true), null,
-    "same game as picked -> no problem");
+    "same game as first seen -> no problem");
   assert.strictEqual(problem(liveWithGame("Path-of-Exile-2"), "path-of-exile-2", true), null,
     "slug comparison is case-insensitive");
   assert.strictEqual(problem(liveWithGame("just-chatting"), "path-of-exile-2", true), "game:just-chatting",
-    "streamer switched to another category -> game change");
+    "streamer switched to another category after first seen -> game change");
   assert.strictEqual(problem(LIVE_CHANNEL_MAIN, "path-of-exile-2", true), null,
-    "category link not rendered yet -> can't tell, no problem");
-  console.log("  OK  a stream switching to another game is detected (and a missing link is not)");
+    "category link not rendered -> can't tell, no problem");
+  assert.strictEqual(problem(liveWithGame("rainbow-six-siege"), null, true), null,
+    "no baseline yet -> nothing to compare with, and a renamed-game slug never trips it");
+  console.log("  OK  a stream switching to another game is detected (missing link / no baseline never is)");
 }
 
 async function testEndedStreamWithoutOfflineMarkerIsDetected() {
