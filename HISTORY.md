@@ -1875,3 +1875,9 @@ unchanged, background flash rules). `channel-live-detection.test.js` /
 (0/0/0); i18n key parity 76/language (was 81).
 
 `BUILD_MARKER` -> `2026-09-28-r7`, `manifest.json` -> 0.6.14.
+
+Committed to `master` as `5bed89f`, pushed to GitHub (`dev` fast-forwarded
+to match). Submitted to the public AMO listed channel via `npm run
+submit:listed` - lint clean (0/0/0), signed and auto-approved to
+`web-ext-artifacts/33d37586a96d443fa884-0.6.14.xpi`, recorded in
+`.amo-submitted-versions.json`. No new permissions, so no upgrade prompt.
