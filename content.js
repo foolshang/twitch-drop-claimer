@@ -10,7 +10,9 @@
  * 3. Channel page, when this tab is the watch tab -> set lowest quality +
  *    mute, watch for offline/raid and bounce back to the directory (a
  *    pinned "@channel" entry is the exception: it goes back to itself on a
- *    raid, and never bounces at all for offline/game-changed - see the
+ *    raid, never bounces for offline/game-changed, and while its channel is
+ *    offline it reloads the page every few minutes and tells background.js
+ *    the moment the channel is live so the player gets started - see the
  *    pinned branch inside the channel-page monitor below)
  * 4. Inventory page (/drops/inventory) -> claim buttons (existing) + parse
  *    campaign progress and report it to background for the auto-skip logic
@@ -219,6 +221,43 @@
     const g = currentStreamGameSlug();
     if (g && baselineGame && g !== baselineGame) return `game:${g}`;
     return null;
+  }
+
+  // Whether the left sidebar lists `channel` as live: true / false / null
+  // (not in the sidebar at all - the user doesn't follow it and it isn't in
+  // the recommended list - so no opinion). Live-verified 2026-09-28 in both
+  // sidebar modes: every entry is an anchor to "/<name>" inside `.side-nav`
+  // - `a.side-nav-card__link` when expanded, `a.side-nav-card` when
+  // collapsed to avatars (which also lists every followed channel, no "Show
+  // More" cut-off). An offline entry is marked `side-nav-card__link--offline`
+  // (expanded) or carries `.side-nav-card__avatar--offline` inside
+  // (collapsed); a live or recommended ("Live Channels") one has neither.
+  // Deliberately scoped to that ONE channel's own entries - the bare word
+  // "Live" / any "LIVE" badge on the page belongs to other channels (see
+  // HISTORY.md 2026-08-27).
+  function sidebarShowsLive(channel) {
+    if (!channel) return null;
+    const want = "/" + channel.toLowerCase();
+    const entries = [...document.querySelectorAll(".side-nav a.side-nav-card, .side-nav a.side-nav-card__link")]
+      .filter((a) => (a.getAttribute("href") || "").toLowerCase() === want);
+    if (entries.length === 0) return null;
+    const offline = (a) =>
+      a.classList.contains("side-nav-card__link--offline") || !!a.querySelector(".side-nav-card__avatar--offline");
+    return entries.some((a) => !offline(a));
+  }
+
+  // a sidebar that keeps saying "live" while the page still renders offline
+  // (stale sidebar, Twitch lag) must not become a reload loop: at most one
+  // sidebar-triggered reload per this long, remembered across the reload
+  const SIDEBAR_RELOAD_MIN_GAP_MS = 2 * 60 * 1000;
+  const SIDEBAR_RELOAD_KEY = "tdc_pinned_sidebar_reload_at";
+  function sidebarReloadAllowed() {
+    try {
+      return Date.now() - (Number(sessionStorage.getItem(SIDEBAR_RELOAD_KEY)) || 0) > SIDEBAR_RELOAD_MIN_GAP_MS;
+    } catch { return false; }
+  }
+  function noteSidebarReload() {
+    try { sessionStorage.setItem(SIDEBAR_RELOAD_KEY, String(Date.now())); } catch { /* best-effort */ }
   }
 
   function looksOffline() {
@@ -820,6 +859,13 @@
       let baselineGame = null;
       let lastReportedGameSlug = null;
       const CHANNEL_PROBLEM_RECHECK_MS = 10_000;
+      // pinned "@channel" only: an offline channel page is not guaranteed to
+      // turn itself into a live one (a hidden background tab in particular),
+      // so reload it every this-many 60s ticks while it shows offline - or
+      // sooner when the user's sidebar lists the channel as live
+      const PINNED_OFFLINE_RELOAD_TICKS = 3;
+      let pinnedOfflineTicks = 0;
+      let pinnedSawLive = false;
 
       // fast first recovery attempt - don't make a stalled player wait a
       // full 60s (channelWatchIntervalId below) for its first nudge
@@ -864,12 +910,40 @@
         // background.js can bind this entry's tracking to it.
         if (pinned) {
           if (looksLive()) {
+            pinnedOfflineTicks = 0;
+            if (!pinnedSawLive) {
+              // first live sighting on this page load (or first since it last
+              // went offline): a tab that was created/reloaded while the
+              // channel was offline never got its player started, so ask
+              // background.js to bring it to the foreground briefly, same as
+              // for a freshly-picked channel
+              pinnedSawLive = true;
+              log("pinned channel", initialChannel, "is live");
+              browser.runtime.sendMessage({ type: "pinnedChannelLive", channel: initialChannel }).catch(() => {});
+            }
             const g = currentStreamGame();
             if (g && g.slug !== lastReportedGameSlug) {
               lastReportedGameSlug = g.slug;
               browser.runtime.sendMessage({
                 type: "channelPlayingGame", channel: initialChannel, slug: g.slug, gameName: g.name,
               }).catch(() => {});
+            }
+          } else if (looksOffline()) {
+            // explicit offline markers only - a loading page or a content
+            // gate (subscriber-only / mature) is not "offline" and must not
+            // be reloaded in a loop
+            pinnedSawLive = false;
+            pinnedOfflineTicks++;
+            // early trigger: the user follows this channel and their sidebar
+            // already lists it as live while this page still says offline
+            const sidebarLive = sidebarShowsLive(initialChannel) === true && sidebarReloadAllowed();
+            if (sidebarLive || pinnedOfflineTicks >= PINNED_OFFLINE_RELOAD_TICKS) {
+              handled = true;
+              if (sidebarLive) noteSidebarReload();
+              log("pinned channel", initialChannel,
+                sidebarLive ? "is live in the sidebar but this page still shows offline - reloading now"
+                  : "still offline - reloading the page to catch it going live");
+              location.reload();
             }
           }
           return;

@@ -168,8 +168,8 @@ occlusion tracker included) ever sees a display-off event.
 
 `alarms`, `tabs`, `storage`, `downloads`, and host access to
 `*://*.twitch.tv/*` — used respectively for the periodic reload / auto-watch
-timers, opening and managing background tabs (watch tabs plus transient
-`/drops/campaigns` and `/search` tabs it opens and closes on its own),
+timers, opening and managing background tabs (watch tabs plus a transient
+`/search` tab it opens and closes on its own),
 persisting settings/state, writing the local debug log file below, and
 running the content script plus reading tab URLs on Twitch only.
 

@@ -2,7 +2,7 @@
  * Twitch Drop Auto-Claimer - background script
  * (loaded after shared.js - toSlug/channelFromUrl/directoryUrl come from there)
  *
- * Four independent jobs:
+ * Three independent jobs (plus a passive snapshot, see 4):
  *
  * 1. Inventory upkeep (unchanged from before): Twitch's inventory page
  *    doesn't always update progress live, so if a tab is open on
@@ -69,16 +69,17 @@
  *    only for the id->name / id->slug / open-campaign snapshot extractors
  *    (see inject.js), not for anything verifyDropStatus currently relies on.
  *
- * 4. Open-campaign snapshot: to tell whether a game the user added actually
- *    has a live drop campaign right now (and to resolve the typed name to
- *    Twitch's own game.displayName), refreshOpenCampaigns() opens
- *    /drops/campaigns in a transient background tab, captures the one
- *    ViewerDropsDashboard GQL response inject.js extracts from it, and
- *    closes the tab again. The result (`openCampaigns` in storage) drives
+ * 4. Open-campaign snapshot (PASSIVE ONLY): whenever the user themselves has
+ *    /drops/campaigns open, inject.js extracts the ViewerDropsDashboard GQL
+ *    response and it is stored as `openCampaigns`, which drives
  *    annotateWatchListFromCampaigns() and autoWatchTick's lacksOpenCampaign()
- *    gate. See the "open drop-campaign snapshot" section below.
+ *    gate (that gate fails open once the snapshot is older than
+ *    OPEN_CAMPAIGNS_MAX_AGE_MS). This file NEVER opens /drops/campaigns
+ *    itself any more - a former transient background tab for it (refreshed
+ *    every 45 min) got in the way of the user browsing other campaigns and
+ *    was removed in 0.6.14. See the "open drop-campaign snapshot" section.
  *
- * All four are fully gated on the `enabled` flag in browser.storage.local -
+ * The three tab-driving jobs are fully gated on the `enabled` flag in browser.storage.local -
  * once switched off, nothing here may open a tab, reload one, or fire a
  * request again. Auto-watch is additionally gated on `autoWatchEnabled`.
  *
@@ -130,11 +131,6 @@ const AUTO_OFF_PERIOD_MIN = 10;
 const AUTO_WATCH_ALARM = "auto-watch-tick";
 const AUTO_WATCH_PERIOD_MIN = 1;
 const INVENTORY_URL = "https://www.twitch.tv/drops/inventory";
-// The only page that fires ViewerDropsDashboard (confirmed live 2026-09-01 -
-// /drops/inventory does not). Opened in a transient background tab just long
-// enough to capture that one GQL response, then closed - see
-// refreshOpenCampaigns().
-const CAMPAIGNS_URL = "https://www.twitch.tv/drops/campaigns";
 // small always-on relay (Python stdlib HTTP server on a GCE VM, see
 // scripts/ - not checked into this repo) that turns a POST'd debug log into
 // a GitHub issue on foolshang/twitch-drop-claimer. Exists so "send bug
@@ -147,9 +143,6 @@ const REPORT_BUG_CLIENT_HEADER = "twitch-drop-claimer";
 // how stale the openCampaigns snapshot may be before autoWatchTick refuses
 // to act on "this game has no open campaign" (fail open on older data)
 const OPEN_CAMPAIGNS_MAX_AGE_MS = 6 * 60 * 60 * 1000;
-// autoWatchTick kicks off a background refresh once the snapshot is older
-// than this
-const OPEN_CAMPAIGNS_REFRESH_MS = 45 * 60 * 1000;
 const DEFAULT_TAB_QUOTA = 3;
 const EMPTY_COOLDOWN_MS = 5 * 60 * 1000; // how long a "nobody live" game sits out before retrying
 // how long a game sits out after its directory page looked "invalid"
@@ -251,18 +244,61 @@ async function exportDebugLogToFile() {
 // creates a GitHub issue and hands back its number/URL. Never sends
 // anything except this log text (channel/game names, timestamps, internal
 // decisions - never login/tokens, same content as the local export).
-async function reportBugToGitHub() {
-  const text = debugLogBuffer.length ? debugLogBuffer.join("\n") : "(no log lines yet)";
-  const cfg = await browser.storage.local.get("uiLang");
+//
+// The relay rejects a body over 60,000 bytes - and does so with a 413 it
+// sends before reading the body, so the connection is reset and fetch()
+// only surfaces an opaque "NetworkError" (a full 1000-line buffer easily
+// exceeds that). So the whole log is never sent as one request: it is cut
+// on line boundaries into parts whose `log` field stays under
+// REPORT_CHUNK_MAX_BYTES (measured as JSON-escaped UTF-8, i.e. what goes on
+// the wire), each sent as its own request/issue, tagged "part i/n" plus a
+// shared report id so the issues can be matched up.
+const REPORT_CHUNK_MAX_BYTES = 49_000; // + header/JSON wrapper stays under 50 KB
+
+const jsonEscapedBytes = (s) => new TextEncoder().encode(JSON.stringify(s)).length - 2;
+
+// slices one over-long line so every piece fits maxBytes even if every char
+// escapes to \uXXXX (6 bytes); never cuts a surrogate pair in half
+function sliceLongLine(line, maxBytes) {
+  if (jsonEscapedBytes(line) <= maxBytes) return [line];
+  const maxChars = Math.floor(maxBytes / 6);
+  const pieces = [];
+  for (let i = 0; i < line.length;) {
+    let end = Math.min(i + maxChars, line.length);
+    const c = line.charCodeAt(end - 1);
+    if (end < line.length && c >= 0xd800 && c <= 0xdbff) end--;
+    pieces.push(line.slice(i, end));
+    i = end;
+  }
+  return pieces;
+}
+
+function splitLogForReport(lines, maxBytes = REPORT_CHUNK_MAX_BYTES) {
+  const chunks = [];
+  let cur = [];
+  let size = 0;
+  for (const line of lines) {
+    for (const piece of sliceLongLine(line, maxBytes)) {
+      const cost = jsonEscapedBytes(piece) + 2; // the joining "\n" escapes to 2 bytes
+      if (cur.length && size + cost > maxBytes) {
+        chunks.push(cur.join("\n"));
+        cur = [];
+        size = 0;
+      }
+      cur.push(piece);
+      size += cost;
+    }
+  }
+  if (cur.length) chunks.push(cur.join("\n"));
+  return chunks;
+}
+
+async function postBugReportPart(text, meta) {
   try {
     const res = await fetch(REPORT_BUG_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Client": REPORT_BUG_CLIENT_HEADER },
-      body: JSON.stringify({
-        log: text,
-        version: browser.runtime.getManifest().version,
-        lang: cfg.uiLang || "?",
-      }),
+      body: JSON.stringify({ log: text, ...meta }),
     });
     const data = await res.json().catch(() => null);
     if (!res.ok || !data || !data.ok) {
@@ -272,6 +308,32 @@ async function reportBugToGitHub() {
   } catch (e) {
     return { ok: false, error: String(e) };
   }
+}
+
+async function reportBugToGitHub() {
+  const lines = debugLogBuffer.length ? debugLogBuffer : ["(no log lines yet)"];
+  const cfg = await browser.storage.local.get("uiLang");
+  const meta = { version: browser.runtime.getManifest().version, lang: cfg.uiLang || "?" };
+  const chunks = splitLogForReport(lines);
+  const reportId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+
+  const urls = [];
+  let firstIssue = null;
+  for (let i = 0; i < chunks.length; i++) {
+    const text = chunks.length > 1
+      ? `=== bug report ${reportId} - part ${i + 1}/${chunks.length} ===\n${chunks[i]}`
+      : chunks[i];
+    const r = await postBugReportPart(text, meta);
+    if (!r.ok) {
+      // stop at the first failure: later parts would only pile more
+      // half-reports onto the relay's hourly rate limit
+      const where = chunks.length > 1 ? `part ${i + 1}/${chunks.length} (${urls.length} sent): ` : "";
+      return { ok: false, error: where + r.error, sent: urls.length, parts: chunks.length };
+    }
+    if (firstIssue == null) firstIssue = r.issue;
+    urls.push(r.url);
+  }
+  return { ok: true, issue: firstIssue, url: urls[0], urls, parts: chunks.length };
 }
 
 // Auto-export is throttled (rather than firing on every single event) so a
@@ -410,57 +472,15 @@ async function handleDropClaimed() {
 // Lets the watch list tell, per game, whether Twitch has an OPEN drop
 // campaign for that game right now, and resolves the user's typed name to
 // Twitch's own game.displayName/slug. /drops/campaigns is the only page that
-// fires ViewerDropsDashboard (confirmed live 2026-09-01), so it's opened in
-// a transient background tab just long enough to capture that one response
-// (inject.js's extractor -> handleGqlDropSignal below), then closed again.
+// fires ViewerDropsDashboard (confirmed live 2026-09-01), and this file no
+// longer opens it - the snapshot is only ever (re)written when the user has
+// that page open themselves (inject.js's extractor -> handleGqlDropSignal
+// below).
 
-let campaignsRefreshInFlight = null;
-let campaignsSignalWaiters = [];
 // set true only while annotateWatchListFromCampaigns() writes watchList back,
 // so the storage.onChanged handler doesn't treat our own rewrite as a
 // user edit and loop
 let suppressWatchListReaction = false;
-
-function notifyCampaignsSignal() {
-  const waiters = campaignsSignalWaiters;
-  campaignsSignalWaiters = [];
-  for (const w of waiters) w();
-}
-
-// Opens CAMPAIGNS_URL long enough to capture one ViewerDropsDashboard
-// response (stored as `openCampaigns` by handleGqlDropSignal), then closes
-// the tab. Concurrent callers share one in-flight run. With `maxAgeMs`,
-// returns the existing snapshot untouched if it's younger than that.
-async function refreshOpenCampaigns({ maxAgeMs = 0 } = {}) {
-  if (maxAgeMs) {
-    const { openCampaigns } = await browser.storage.local.get("openCampaigns");
-    if (openCampaigns && openCampaigns.fetchedAt && Date.now() - openCampaigns.fetchedAt < maxAgeMs) {
-      return openCampaigns;
-    }
-  }
-  if (campaignsRefreshInFlight) return campaignsRefreshInFlight;
-
-  campaignsRefreshInFlight = (async () => {
-    let tab = null;
-    try {
-      const { id: watchWindowId } = await getOrCreateWatchWindow();
-      tab = await browser.tabs.create({ url: CAMPAIGNS_URL, active: false, pinned: true, ...(watchWindowId ? { windowId: watchWindowId } : {}) });
-      await new Promise((resolve) => {
-        const timer = setTimeout(resolve, 30_000);
-        campaignsSignalWaiters.push(() => { clearTimeout(timer); resolve(); });
-      });
-    } catch (e) {
-      log("refreshOpenCampaigns: could not open campaigns tab:", e);
-    } finally {
-      if (tab) { try { await browser.tabs.remove(tab.id); } catch { /* already gone */ } }
-      campaignsRefreshInFlight = null;
-    }
-    const { openCampaigns } = await browser.storage.local.get("openCampaigns");
-    return openCampaigns || null;
-  })();
-
-  return campaignsRefreshInFlight;
-}
 
 // One entry per real category slug, aggregating across a game's multiple
 // campaigns (a game can list an ACTIVE and an EXPIRED campaign at once).
@@ -691,16 +711,6 @@ async function autoWatchTick() {
   if (list.length === 0) {
     await teardownAllWatch("no games in list");
     return;
-  }
-
-  // keep the open-campaign snapshot fresh so "this game has no campaign" and
-  // the canonical-name resolution don't drift - fire and forget, the
-  // in-flight guard stops this from opening more than one tab at a time
-  const oc = cfg.openCampaigns;
-  if (!oc || !oc.fetchedAt || Date.now() - oc.fetchedAt > OPEN_CAMPAIGNS_REFRESH_MS) {
-    refreshOpenCampaigns({ maxAgeMs: OPEN_CAMPAIGNS_REFRESH_MS })
-      .then(annotateWatchListFromCampaigns)
-      .catch(() => {});
   }
 
   const invalidSlugs = cfg.invalidSlugs || [];
@@ -1354,7 +1364,12 @@ async function verifySweep() {
 // be looking. holdMs is a parameter (not just the constant) purely so tests
 // can exercise the revert without a real 8s wait.
 const PLAYBACK_FLASH_HOLD_MS = 8_000;
+// tabId -> when it was last flashed, so a pinned channel's "it's live now"
+// report right after the creation-time flash doesn't flash the tab twice
+const lastPlaybackFlashAt = new Map();
+const PINNED_LIVE_FLASH_MIN_GAP_MS = 2 * 60 * 1000;
 async function flashTabToStartPlayback(tabId, holdMs = PLAYBACK_FLASH_HOLD_MS) {
+  lastPlaybackFlashAt.set(tabId, Date.now());
   try {
     await browser.tabs.update(tabId, { active: true });
   } catch (e) {
@@ -1368,6 +1383,39 @@ async function flashTabToStartPlayback(tabId, holdMs = PLAYBACK_FLASH_HOLD_MS) {
       // tab already gone/rotated away - nothing to revert
     }
   }, holdMs);
+}
+
+// A pinned "@channel" tab is created straight on the channel page, so the
+// creation-time flash (see autoWatchTick) is wasted if the channel was
+// offline then - Twitch's player never starts in a tab that was never
+// active while the stream was live. content.js reports the moment it sees
+// the channel live (first sighting after a page load / after being offline);
+// flash the tab then, exactly as for a freshly-picked channel. Only for a
+// tab this file tracks as a pinned entry, only inside the dedicated watch
+// window, and not twice within PINNED_LIVE_FLASH_MIN_GAP_MS.
+async function handlePinnedChannelLive(msg, tab) {
+  if (!tab) return;
+  const cfg = await browser.storage.local.get(["watchTabs", "watchList", "enabled"]);
+  if (!cfg.enabled) return;
+  const watchTabs = cfg.watchTabs || {};
+  const slug = Object.keys(watchTabs).find((s) => watchTabs[s] === tab.id);
+  const game = slug && (cfg.watchList || []).find((g) => g.slug === slug);
+  if (!game || !game.pinnedChannel) return;
+
+  if (Date.now() - (lastPlaybackFlashAt.get(tab.id) || 0) < PINNED_LIVE_FLASH_MIN_GAP_MS) {
+    log("pinned channel", msg && msg.channel, "is live - tab was flashed moments ago, not again");
+    return;
+  }
+  const { id: watchWindowId } = await getOrCreateWatchWindow();
+  if (watchWindowId == null) return; // no isolated window - never flash in the user's own
+  try {
+    const liveTab = await browser.tabs.get(tab.id);
+    if (liveTab.windowId !== watchWindowId) return;
+  } catch {
+    return; // tab already gone
+  }
+  log("pinned channel", msg && msg.channel, "went live - flashing its tab to start playback");
+  await flashTabToStartPlayback(tab.id);
 }
 
 async function handleDirectoryPicked(slug, channel, tab) {
@@ -1462,7 +1510,7 @@ async function handleGqlDropSignal(msg, tab) {
   if (!tab) return;
 
   // openCampaigns is a full snapshot of every drop campaign Twitch currently
-  // lists (from the transient /drops/campaigns tab, see refreshOpenCampaigns)
+  // lists (captured while the user has /drops/campaigns open)
   // - account-wide, not tied to a watch tab, so handled before the slug-gate.
   // id -> real category slug, learned from SideNav (which carries id + slug
   // together). Global, not tab-scoped - handled before the slug gate.
@@ -1495,7 +1543,6 @@ async function handleGqlDropSignal(msg, tab) {
       const activeCount = Object.values(bySlug).filter((c) => c.active).length;
       log("[openCampaigns] snapshot:", Object.keys(bySlug).length, "games,", activeCount, "with an open campaign");
     });
-    notifyCampaignsSignal();
     // not inside the serialized block above - annotateWatchListFromCampaigns
     // runs its own serialized units (see its comment)
     await annotateWatchListFromCampaigns();
@@ -1584,9 +1631,6 @@ async function applyEnabledState(enabled) {
     browser.alarms.create(AUTO_WATCH_ALARM, { periodInMinutes: AUTO_WATCH_PERIOD_MIN });
     await serialized(openInventoryIfMissing);
     await serialized(autoWatchTick);
-    refreshOpenCampaigns({ maxAgeMs: OPEN_CAMPAIGNS_REFRESH_MS })
-      .then(annotateWatchListFromCampaigns)
-      .catch(() => {});
   } else {
     await browser.alarms.clear(RELOAD_ALARM);
     await browser.alarms.clear(AUTO_OFF_ALARM);
@@ -1616,11 +1660,6 @@ browser.alarms.onAlarm.addListener(async (alarm) => {
     } catch (e) {
       log("reload failed:", e);
     }
-    // same cadence as the inventory reload: keep the open-campaign snapshot
-    // from going stale (only actually opens a tab once it's old enough)
-    refreshOpenCampaigns({ maxAgeMs: OPEN_CAMPAIGNS_REFRESH_MS })
-      .then(annotateWatchListFromCampaigns)
-      .catch(() => {});
   } else if (alarm.name === AUTO_OFF_ALARM) {
     checkAutoOff();
   } else if (alarm.name === AUTO_WATCH_ALARM) {
@@ -1682,6 +1721,9 @@ browser.runtime.onMessage.addListener((msg, sender) => {
     case "channelPlayingGame":
       return handleChannelPlayingGame(msg, sender.tab);
 
+    case "pinnedChannelLive":
+      return handlePinnedChannelLive(msg, sender.tab);
+
     case "gqlDropSignal":
       return handleGqlDropSignal(msg, sender.tab);
 
@@ -1690,18 +1732,6 @@ browser.runtime.onMessage.addListener((msg, sender) => {
 
     case "dropClaimed":
       return handleDropClaimed();
-
-    case "refreshCampaigns":
-      // popup asked to re-check /drops/campaigns now
-      return refreshOpenCampaigns()
-        .then((oc) => annotateWatchListFromCampaigns().then(() => oc))
-        .then((oc) => ({
-          ok: !!(oc && oc.bySlug),
-          fetchedAt: oc && oc.fetchedAt,
-          total: oc && oc.bySlug ? Object.keys(oc.bySlug).length : 0,
-          active: oc && oc.bySlug ? Object.values(oc.bySlug).filter((c) => c.active).length : 0,
-        }))
-        .catch((e) => ({ ok: false, error: String(e) }));
 
     default:
       return undefined;
@@ -1749,13 +1779,12 @@ browser.storage.onChanged.addListener(async (changes, area) => {
     }
     await browser.storage.local.set(waitPruned ? { invalidSlugs, gameWaitUntil } : { invalidSlugs });
     await serialized(autoWatchTick);
-    // re-resolve names / open-campaign status for the new list. The snapshot
-    // is account-wide, so a recent one already covers a just-added game -
-    // only re-open the /drops/campaigns tab if it's more than a few minutes
-    // old. Not awaited, so the popup's save returns immediately.
-    refreshOpenCampaigns({ maxAgeMs: 5 * 60 * 1000 })
-      .then(annotateWatchListFromCampaigns)
-      .catch((e) => log("campaign refresh after watchList change failed:", e));
+    // re-resolve names / open-campaign status for the new list against
+    // whatever snapshot is already stored (account-wide, so it covers a
+    // just-added game too). Not awaited, so the popup's save returns
+    // immediately.
+    annotateWatchListFromCampaigns()
+      .catch((e) => log("campaign annotate after watchList change failed:", e));
   }
 
   if (changes.tabQuota || changes.priorityMode) {

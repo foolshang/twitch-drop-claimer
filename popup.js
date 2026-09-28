@@ -76,8 +76,6 @@ const $lastClaim = document.getElementById("lastClaim");
 
 const $gamesList = document.getElementById("gamesList");
 const $gamesPreview = document.getElementById("gamesPreview");
-const $campaignsCheck = document.getElementById("campaignsCheck");
-const $campaignsCheckStatus = document.getElementById("campaignsCheckStatus");
 const $autoWatch = document.getElementById("autowatch");
 const $tabQuota = document.getElementById("tabQuota");
 const $priorityMode = document.getElementById("priorityMode");
@@ -598,26 +596,6 @@ browser.storage.onChanged.addListener((changes, area) => {
   if (changes.watchList) reconcileGamesTextarea();
 });
 
-$campaignsCheck.addEventListener("click", async () => {
-  $campaignsCheck.disabled = true;
-  $campaignsCheckStatus.textContent = t("campaigns_checking");
-  try {
-    const res = await browser.runtime.sendMessage({ type: "refreshCampaigns" });
-    if (res && res.ok) {
-      $campaignsCheckStatus.textContent =
-        t("campaigns_checked", { active: res.active, total: res.total });
-      await renderGameStatus();
-      await reconcileGamesTextarea();
-    } else {
-      $campaignsCheckStatus.textContent = t("campaigns_failed");
-    }
-  } catch (e) {
-    $campaignsCheckStatus.textContent = t("campaigns_failed_err", { err: e });
-  } finally {
-    $campaignsCheck.disabled = false;
-  }
-});
-
 // sends background.js's in-memory log ring buffer to a small relay (see
 // REPORT_BUG_URL in background.js) that creates a GitHub issue from it -
 // one click, no file to attach, no GitHub token anywhere in this
@@ -631,7 +609,9 @@ $reportBug.addEventListener("click", async () => {
   try {
     const res = await browser.runtime.sendMessage({ type: "reportBug" });
     $reportBugStatus.textContent = res && res.ok
-      ? t("report_bug_done", { url: res.url || "?" })
+      // a big log goes out as several issues (one per part) - show the first
+      // one's URL plus how many more there are
+      ? t("report_bug_done", { url: (res.url || "?") + (res.parts > 1 ? ` (+${res.parts - 1})` : "") })
       : t("report_bug_failed", { err: (res && res.error) || "?" });
   } catch (e) {
     $reportBugStatus.textContent = t("report_bug_failed", { err: e });

@@ -1794,3 +1794,84 @@ to match). Submitted to the public AMO listed channel via `npm run
 submit:listed` - lint clean (0/0/0), signed and auto-approved to
 `web-ext-artifacts/33d37586a96d443fa884-0.6.13.xpi`, recorded in
 `.amo-submitted-versions.json`.
+
+## 0.6.14 - bug-report parts, no more campaigns tab, pinned channels catch going live
+
+**Problem 1 - "Send bug report" failed with `NetworkError when attempting to
+fetch resource`:** the button POSTed the whole 1000-line log buffer as one
+request. The relay (`report-service/main.py`) rejects a body over 60,000 bytes
+with a 413 it sends *before reading the body*, so the connection was reset
+and `fetch()` only surfaced an opaque NetworkError. Reproduced against the
+relay with a 70 KB body (413 headers, then `ConnectionAbortedError`; rejected
+before any issue is created). The relay's own "a 1000-line log is nowhere
+near this" comment was wrong for a long multi-tab run.
+
+**Fix 1:** `reportBugToGitHub()` now cuts the log on line boundaries into
+parts whose JSON-escaped `log` field stays under 49,000 bytes (whole request
+body under 50 KB), sends each as its own request/issue tagged
+`=== bug report <id> - part i/n ===` with a shared id, and stops at the first
+failure with `part i/n (k sent): <error>`. A small log is still one plain
+request. A single over-long line is sliced without splitting surrogate
+pairs. The popup shows the first issue URL plus `(+N)` for extra parts. No
+relay change or redeploy needed. Note the relay's 20 requests/hour global
+limit: a big report can now use several of them.
+
+**Problem 2 - a transient pinned `/drops/campaigns` tab got in the way of
+browsing other campaigns:** `refreshOpenCampaigns()` opened it on enable,
+every 45 min, on every watch-list save and from a popup button.
+
+**Fix 2:** the tab-opening code is gone (function, all five callers, the
+`refreshCampaigns` message, the popup "Check All Campaigns now" button/status
+and their i18n keys in all 9 languages, and the two `games_hint` sentences
+that promised a check after saving). The `openCampaigns` snapshot is now
+passive only: it is stored whenever the user has `/drops/campaigns` open
+themselves (inject.js extractor unchanged), still feeds
+`annotateWatchListFromCampaigns()` and the `lacksOpenCampaign()` gate, and
+that gate still fails open once the snapshot is older than 6 h.
+
+**Problem 3 - a pinned `@channel` that was offline and later went live was
+never watched:** the only "flash the tab so Twitch's player starts"
+(`flashTabToStartPlayback`) ran at tab creation, when an offline channel has
+no stream to start; the pinned branch of content.js's channel-page monitor
+just returned while offline, and nothing reloaded the page. Whether Twitch
+flips an offline page to live by itself in a hidden tab was not established,
+so the fix covers both cases.
+
+**Fix 3:** while a pinned channel's page shows explicit offline markers
+(`looksOffline()`), content.js reloads it every 3rd 60 s tick (never for a
+loading page or a subscriber-only content gate); the first time it sees the
+channel live it sends `pinnedChannelLive`, and background.js flashes that tab
+(pinned entries only, dedicated watch window only, not twice within 2 min).
+An early trigger reloads on the next tick when the left sidebar already lists
+the channel as live while the page says offline: scoped strictly to that one
+channel's own entry (the bare word "Live"/any LIVE badge is other channels' -
+the 2026-08-27 contamination), rate-limited to one such reload per 2 min via
+`sessionStorage` so a stale sidebar can't cause a reload loop. Sidebar DOM
+live-verified over RDP on 2026-09-28 in both modes: expanded
+(`a.side-nav-card__link`, offline = `side-nav-card__link--offline`, only 5
+followed shown until "Show More") and collapsed to avatars (`a.side-nav-card`,
+offline = `.side-nav-card__avatar--offline` inside, lists every followed
+channel); channels under "Live Channels" count as live too; a channel not in
+the sidebar gives no opinion and the 3-tick reload still applies.
+
+**Investigated and dropped:** a "Drops Enabled" tag preference (tagged
+channels first when picking, tag/game/live status logged when progress
+stalls). Live-verified the tag is readable (directory card
+`button.tw-tag[data-a-target]`, channel page `a.tw-tag`, also in a hidden
+tab), but it is a freeform tag the streamer types (spellings vary by
+language/typo, no tag id in the DOM), and campaign progress stays the ground
+truth - the user cut the whole feature before commit.
+
+**Tests:** new `test/bug-report-chunking.test.js` (5 cases: small log =
+one plain request, 1000 lines -> 5 lossless parts all under 50 KB, escape-
+heavy log, giant single line, stop at first failed part),
+`test/no-campaigns-tab.test.js` (every former trigger against a stale
+snapshot opens no campaigns tab; the passive path still stores a snapshot)
+and `test/pinned-live-wait.test.js` (11 cases: reload cadence, no reload for
+loading/content-gate pages, live reported once per session, sidebar early
+reload in expanded/collapsed/recommended forms, rate limit, non-pinned tabs
+unchanged, background flash rules). `channel-live-detection.test.js` /
+`inventory-parse.test.js` unchanged. All 11 test files pass; lint clean
+(0/0/0); i18n key parity 76/language (was 81).
+
+`BUILD_MARKER` -> `2026-09-28-r7`, `manifest.json` -> 0.6.14.
