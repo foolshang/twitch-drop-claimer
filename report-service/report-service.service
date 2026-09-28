@@ -14,6 +14,18 @@
 #   5. open the firewall: gcloud compute firewall-rules create
 #        allow-report-service --network=default --direction=INGRESS
 #        --action=ALLOW --rules=tcp:8090 --source-ranges=0.0.0.0/0
+#   6. HTTPS front (added 2026-09-28, because Firefox's HTTPS-Only Mode
+#      blocks the plain-http extension -> :8090 request): install Caddy from
+#      its official apt repo, put this in /etc/caddy/Caddyfile
+#        35-188-24-245.sslip.io {
+#            reverse_proxy 127.0.0.1:8090
+#        }
+#      and `systemctl restart caddy` (it gets/renews the Let's Encrypt cert
+#      itself), plus a second firewall rule:
+#        gcloud compute firewall-rules create allow-report-https
+#        --network=default --direction=INGRESS --action=ALLOW
+#        --rules=tcp:80,tcp:443 --source-ranges=0.0.0.0/0
+#      Undo: `systemctl disable --now caddy`, delete allow-report-https.
 
 [Unit]
 Description=twitch-drop-claimer bug-report -> GitHub issue relay

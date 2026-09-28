@@ -138,7 +138,12 @@ const INVENTORY_URL = "https://www.twitch.tv/drops/inventory";
 // inside this extension's own public, fully-inspectable source - the token
 // lives only in that relay's environment. X-Client is not a secret, just a
 // noise filter against generic internet scanners hitting the endpoint.
-const REPORT_BUG_URL = "http://35.188.24.245:8090/report";
+// HTTPS on purpose: a plain http:// IP:port endpoint is blocked outright by
+// Firefox's HTTPS-Only Mode (fetch -> "NetworkError", live-verified
+// 2026-09-28 - with it on, even a GET failed while curl worked). Caddy on
+// the VM terminates TLS for this sslip.io name (wildcard DNS that resolves
+// to the VM's static IP, so no domain purchase) and proxies to the relay.
+const REPORT_BUG_URL = "https://35-188-24-245.sslip.io/report";
 const REPORT_BUG_CLIENT_HEADER = "twitch-drop-claimer";
 // how stale the openCampaigns snapshot may be before autoWatchTick refuses
 // to act on "this game has no open campaign" (fail open on older data)
@@ -407,6 +412,102 @@ async function refreshBadge() {
 // browser.tabs.query() reflects a just-created/just-navigated tab by the
 // very next call is not guaranteed (produced a real duplicate inventory tab
 // in a live test, 2026-09-04).
+//
+// Window and tab ids only mean something inside ONE browser session (Firefox
+// numbers them from 1 again on every start), and Firefox's session restore
+// brings back last session's watch window - pinned watch tabs and all - so
+// three things are handled here (2026-09-28: a restart used to give the user
+// three windows, and a remembered id can even equal one of their own):
+//   - resetStateForNewBrowserSession(): a fresh session forgets every
+//     remembered tab/window id;
+//   - findWatchWindowCandidates()/adoption below: an existing window that
+//     looks like ours (all tabs pinned twitch.tv, one of them the inventory)
+//     is adopted instead of opening a second one, with its stale tabs closed;
+//   - sweepStaleWatchLeftovers(): any further such window (session restore
+//     can land after the first tick) and any pinned /drops/campaigns tab in
+//     the watch window (left behind by versions before 0.6.14) is closed.
+async function resetStateForNewBrowserSession() {
+  if (!browser.storage.session) return false; // no per-session storage -> nothing to compare against
+  const { tdcSessionStarted } = await browser.storage.session.get("tdcSessionStarted");
+  if (tdcSessionStarted) return false;
+  await browser.storage.session.set({ tdcSessionStarted: Date.now() });
+  await browser.storage.local.set({ watchTabs: {}, watchMeta: {}, dropSignals: {}, watchWindowId: null });
+  log("new browser session (or the extension was just loaded): forgot remembered watch tab/window ids");
+  return true;
+}
+
+const isTwitchUrl = (u) => /^https?:\/\/([^/]+\.)?twitch\.tv(\/|$)/.test(u || "");
+// Windows that look like a leftover/restored watch window of ours. Every tab
+// must be one of: a pinned twitch.tv tab, the drops inventory (pinned or not -
+// a freshly created watch window's initial tab is navigated to it unpinned),
+// or Firefox's own blank/home page (windows.create() leaves an about:home tab
+// behind - seen in the real session file). At least one tab must be the
+// inventory and - unless `loose` - at least one a pinned twitch.tv tab. Any
+// ordinary tab (a YouTube tab, the user's own unpinned Twitch tab, an
+// extension page) means it is the user's window, never ours. `loose` is only
+// for ADOPTING a window (a lone-inventory window from before an extension
+// reload is still ours to reuse); CLOSING one always uses the strict form,
+// since a user looking at their inventory in a window of its own must be safe.
+const isBlankTab = (u) => /^about:(blank|home|newtab)$/.test(u || "");
+const isInventoryTab = (t) => isTwitchUrl(t.url) && /\/drops\/inventory/.test(t.url || "");
+async function findWatchWindowCandidates({ loose = false } = {}) {
+  let wins;
+  try {
+    wins = await browser.windows.getAll({ populate: true, windowTypes: ["normal"] });
+  } catch { return []; }
+  return (wins || []).filter((w) => {
+    const tabs = w.tabs || [];
+    return tabs.length > 0 &&
+      tabs.every((t) => (t.pinned && isTwitchUrl(t.url)) || isInventoryTab(t) || isBlankTab(t.url)) &&
+      tabs.some(isInventoryTab) &&
+      (loose || tabs.some((t) => t.pinned && isTwitchUrl(t.url)));
+  });
+}
+
+async function adoptExistingWatchWindow() {
+  const strict = await findWatchWindowCandidates();
+  const strictIds = new Set(strict.map((w) => w.id));
+  const loose = (await findWatchWindowCandidates({ loose: true })).filter((w) => !strictIds.has(w.id));
+  const candidates = [...strict, ...loose]; // an unmistakable watch window is preferred
+  if (candidates.length === 0) return null;
+  const [keep, ...others] = candidates;
+  for (const w of others) {
+    if (!strictIds.has(w.id)) continue; // a loose-only match could be the user's - never closed
+    log("closing an extra leftover watch window", w.id);
+    try { await browser.windows.remove(w.id); } catch { /* already gone */ }
+  }
+  // keep one inventory tab (the one the extension refreshes); everything else
+  // in there is a stale watch/campaigns tab from before the restart
+  let keptInventory = false;
+  for (const t of keep.tabs) {
+    if (!keptInventory && /\/drops\/inventory/.test(t.url || "")) { keptInventory = true; continue; }
+    try { await browser.tabs.remove(t.id); } catch { /* already gone */ }
+  }
+  await browser.storage.local.set({ watchWindowId: keep.id });
+  log("adopted the existing watch window", keep.id, "instead of opening another");
+  return keep.id;
+}
+
+async function sweepStaleWatchLeftovers() {
+  const { watchWindowId } = await browser.storage.local.get("watchWindowId");
+  if (!watchWindowId) return;
+  let closedInventoryWindow = false;
+  for (const w of await findWatchWindowCandidates()) {
+    if (w.id === watchWindowId) continue;
+    log("closing a stale watch window", w.id, "(restored from an earlier session)");
+    try { await browser.windows.remove(w.id); closedInventoryWindow = true; } catch { /* already gone */ }
+  }
+  try {
+    for (const t of await browser.tabs.query({ windowId: watchWindowId, pinned: true })) {
+      if (/\/drops\/campaigns/.test(t.url || "")) {
+        log("closing a leftover pinned /drops/campaigns tab", t.id);
+        try { await browser.tabs.remove(t.id); } catch { /* already gone */ }
+      }
+    }
+  } catch { /* window gone - the next getOrCreateWatchWindow recreates it */ }
+  if (closedInventoryWindow) await openInventoryIfMissing();
+}
+
 let watchWindowCreateInFlight = null;
 async function getOrCreateWatchWindow() {
   const cfg = await browser.storage.local.get("watchWindowId");
@@ -421,6 +522,8 @@ async function getOrCreateWatchWindow() {
   if (watchWindowCreateInFlight) return watchWindowCreateInFlight;
   watchWindowCreateInFlight = (async () => {
     try {
+      const adopted = await adoptExistingWatchWindow();
+      if (adopted != null) return { id: adopted, freshlyCreated: false };
       const win = await browser.windows.create({ type: "normal" }); // blank - navigated below
       await browser.storage.local.set({ watchWindowId: win.id });
       const initialTab = win.tabs && win.tabs[0];
@@ -712,6 +815,8 @@ async function autoWatchTick() {
     await teardownAllWatch("no games in list");
     return;
   }
+
+  await sweepStaleWatchLeftovers();
 
   const invalidSlugs = cfg.invalidSlugs || [];
   const campaignProgress = cfg.campaignProgress || {};
@@ -1811,5 +1916,6 @@ browser.storage.onChanged.addListener(async (changes, area) => {
   if (enabled && !cfg.enabledSince) {
     await browser.storage.local.set({ enabledSince: Date.now() });
   }
+  await resetStateForNewBrowserSession();
   await applyEnabledState(enabled);
 })();

@@ -7,7 +7,7 @@
 // value out loud when asking for a fresh test - lets whoever's testing
 // confirm from the background console alone that Firefox is actually running
 // this exact source tree, not a stale reload/cached build/old .xpi.
-const BUILD_MARKER = "2026-09-28-r7";
+const BUILD_MARKER = "2026-09-29-r8";
 
 const ALIASES = {
   // Path of Exile

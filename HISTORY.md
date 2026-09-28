@@ -1881,3 +1881,72 @@ to match). Submitted to the public AMO listed channel via `npm run
 submit:listed` - lint clean (0/0/0), signed and auto-approved to
 `web-ext-artifacts/33d37586a96d443fa884-0.6.14.xpi`, recorded in
 `.amo-submitted-versions.json`. No new permissions, so no upgrade prompt.
+
+## 0.6.15 - HTTPS bug relay, one watch window per Firefox start
+
+**Problem 1 - "Send bug report" still failed with `NetworkError` on 0.6.14:**
+the message had no `part i/n` prefix, so it was a single small request - not
+the 60 KB body cap fixed in 0.6.14. Reproduced live: in a copy of the user's
+profile (`dom.security.https_only_mode = true`), a plain
+`GET http://35.188.24.245:8090/` from the extension's own popup page failed
+with `TypeError: NetworkError` while `curl` from the same machine returned
+200; relaunched with `--pref=dom.security.https_only_mode=false` the same GET
+gave 200 and a POST got the relay's own JSON answer. Firefox's HTTPS-Only Mode
+blocks the relay's plain `http://IP:port` outright, so every user with that
+mode on could never send a report (0.6.14's part splitting was a real but
+different bug).
+
+**Fix 1:** the relay is now reachable over HTTPS. On the VM (`poe-bot-vm`):
+Caddy from its official apt repo terminates TLS for
+`35-188-24-245.sslip.io` (public wildcard-DNS name that resolves to the VM's
+static IP - no domain purchase; Caddy gets and renews the Let's Encrypt cert
+itself) and reverse-proxies to the unchanged relay on `127.0.0.1:8090`; new
+firewall rule `allow-report-https` (tcp:80,443). The old `http://...:8090`
+endpoint is left open for 0.6.14-and-older clients. `REPORT_BUG_URL` and the
+manifest host permission now use `https://35-188-24-245.sslip.io`. Verified
+with HTTPS-Only Mode ON: GET 200, POST -> relay JSON, and one real report sent
+through the popup's own `reportBug` message (issue #2, checked and deleted).
+Steps recorded in `report-service/report-service.service` (undo:
+`systemctl disable --now caddy`, delete the firewall rule). The changed host
+permission means Firefox asks existing users to approve the update.
+
+**Problem 2 - three Firefox windows on every start, plus stale tabs:** window
+and tab ids are numbered from 1 again each session and Firefox restores last
+session's windows. The user's session file showed the old watch window
+restored next to a freshly created one (6 tabs: pinned inventory, two watch
+channels, two leftover pinned `/drops/campaigns` tabs from the removed
+transient tab, and an `about:home` tab left by `windows.create()`), and a
+remembered `watchWindowId`/`watchTabs` id can equal one of the USER's own
+windows/tabs after a restart.
+
+**Fix 2:** `resetStateForNewBrowserSession()` (marker in `storage.session`,
+verified present in Firefox 140+) forgets remembered tab/window ids in a new
+session; `getOrCreateWatchWindow()` first adopts an existing window that looks
+like ours (only pinned twitch.tv tabs / the inventory / blank tabs, with an
+inventory tab; a looser form - a lone inventory tab - is adopted but never
+closed) and closes its stale tabs; `sweepStaleWatchLeftovers()` at the start
+of every auto-watch tick closes further look-alike windows that session restore
+landed late and any pinned `/drops/campaigns` tab in the watch window, then
+reopens the inventory if it only lived in a closed window. Any ordinary tab
+(YouTube, the user's own unpinned Twitch tab, an extension page) marks a window
+as the user's - it is never adopted-over or closed. Live check in Firefox: a
+simulated restored watch window was closed by the sweep within the first tick
+while a window with an extension page + pinned inventory was left alone.
+An extension reload with a lone-inventory watch window opened no new window.
+Not established: whether `storage.session` survives an extension reload (the
+design is correct either way; if it is cleared, a reload just re-adopts the
+window and reopens the watch tabs once).
+
+**Not reproduced:** the user's `/drops/campaigns` page spinning forever when
+they open All Campaigns themselves. In a copy of their profile with 0.6.14
+loaded the page rendered normally (it showed "There are no Drops campaigns
+available currently" at the time). Suggested isolation: Troubleshoot Mode /
+a private window; inject.js only wraps `fetch`/XHR passively and cannot block a
+response.
+
+**Tests:** new `test/session-windows.test.js` (7 cases, fake windows/tabs
+registry including the id-collision case - fails against the 0.6.14 code at
+"adopted, not the user's window 2"). All 12 test files pass; lint clean
+(0/0/0).
+
+`BUILD_MARKER` -> `2026-09-29-r8`, `manifest.json` -> 0.6.15.

@@ -13,7 +13,10 @@ stdlib only - no pip install needed, matches poe-bot.service's simplicity
 Not part of the extension - excluded from AMO submissions by
 scripts/submit-amo.js's EXTENSION_FILES whitelist. Deployed on the same GCE
 VM (poe-bot-vm, project poe-discord-bot-501417) as the poe-discord-bot,
-behind the static IP baked into REPORT_BUG_URL in background.js.
+behind Caddy (TLS termination, see report-service.service), reached by the
+extension at the https://35-188-24-245.sslip.io name baked into REPORT_BUG_URL
+in background.js. Plain http on :8090 is still open for extension versions
+before 0.6.15, which used it (and which Firefox's HTTPS-Only Mode blocks).
 """
 
 import json
