@@ -1994,3 +1994,10 @@ into the vm context - overriding the host's `Date.now` has no effect on code
 running in a separate `vm.createContext`, discovered while writing this). All
 12 test files pass; lint clean (0/0/0). `HISTORY.md`'s 0.6.15 entry above is
 otherwise unchanged; this section documents the pre-commit correction.
+
+Committed to `master` as `c136598`, pushed to GitHub (`dev` fast-forwarded
+to match). Submitted to the public AMO listed channel via `npm run
+submit:listed` - lint clean (0/0/0), signed and auto-approved to
+`web-ext-artifacts/33d37586a96d443fa884-0.6.15.xpi`, recorded in
+`.amo-submitted-versions.json`. Existing users see an upgrade prompt for
+the new bug-relay host permission (now https://35-188-24-245.sslip.io).
