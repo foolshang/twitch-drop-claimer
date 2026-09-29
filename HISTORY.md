@@ -1950,3 +1950,47 @@ registry including the id-collision case - fails against the 0.6.14 code at
 (0/0/0).
 
 `BUILD_MARKER` -> `2026-09-29-r8`, `manifest.json` -> 0.6.15.
+
+## Follow-up to 0.6.15, before commit — pinned-channel reload moved to background.js
+
+**Problem:** the pinned-`@channel` offline-reload fix above (Fix 3, still
+uncommitted) put its `setInterval` + `location.reload()` in content.js - a
+tab Firefox discards for memory has no content script left running at all, so
+that timer could silently stop firing forever, reintroducing the exact bug it
+was meant to fix. This project already solved the equivalent problem for the
+inventory tab (`RELOAD_ALARM`, background.js-driven, unconditional
+`tabs.reload()` every 15 min) - the pinned-channel code didn't follow that
+same, already-established, more robust pattern.
+
+**Fix:** content.js's pinned branch now only reports what the DOM shows every
+60s tick (`pinnedChannelStatus`: `live` true/false/null, plus a `sidebarLive`
+hint while offline) and never reloads itself. background.js owns the decision
+and the actual `browser.tabs.reload()`:
+`handlePinnedChannelStatus()` reloads after 3 consecutive offline reports or
+immediately on a sidebar-live hint (rate-limited to one reload per 2 min per
+tab); `sweepStalePinnedHeartbeats()`, run every minute off the existing
+`AUTO_WATCH_ALARM`/`autoWatchTick()` cadence, force-reloads any pinned tab
+that has reported nothing at all for 5 minutes - the safety net for a tab
+whose content script died outright, which `tabs.reload()` recovers even
+though the tab was discarded. The playback-start "flash" (unchanged) still
+only ever fires inside the dedicated watch window - this only changes who
+decides to reload, not the tab-activation etiquette.
+
+**Verified live** (not just unit tests): pinned `@ds_lily` (offline at the
+time) against a copy of the user's profile; background.js's own log showed
+the exact designed sequence - three ~60s-apart "no fresh inventory reading
+yet" ticks, then `pinned channel ds_lily - still offline - reloading to catch
+it going live - reloading its tab`, called from background.js while the tab
+was never the active tab of any window. Tab remained tracked and normal after
+the reload.
+
+**Tests:** `test/pinned-live-wait.test.js` rewritten (14 cases): content.js
+side (status message shape per DOM state, non-pinned tabs send nothing,
+content.js's own `location.reload` spy never fires) and background.js side
+(flash-once-live, 3-tick reload, sidebar-hint immediate reload + rate limit,
+live resets the counter, `live:null` never acts, ignores untracked/off,
+heartbeat safety net recovers a "dead" tab via a fake-clock `Date.now` passed
+into the vm context - overriding the host's `Date.now` has no effect on code
+running in a separate `vm.createContext`, discovered while writing this). All
+12 test files pass; lint clean (0/0/0). `HISTORY.md`'s 0.6.15 entry above is
+otherwise unchanged; this section documents the pre-commit correction.

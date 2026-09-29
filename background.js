@@ -817,6 +817,7 @@ async function autoWatchTick() {
   }
 
   await sweepStaleWatchLeftovers();
+  await sweepStalePinnedHeartbeats();
 
   const invalidSlugs = cfg.invalidSlugs || [];
   const campaignProgress = cfg.campaignProgress || {};
@@ -1498,29 +1499,121 @@ async function flashTabToStartPlayback(tabId, holdMs = PLAYBACK_FLASH_HOLD_MS) {
 // flash the tab then, exactly as for a freshly-picked channel. Only for a
 // tab this file tracks as a pinned entry, only inside the dedicated watch
 // window, and not twice within PINNED_LIVE_FLASH_MIN_GAP_MS.
-async function handlePinnedChannelLive(msg, tab) {
-  if (!tab) return;
-  const cfg = await browser.storage.local.get(["watchTabs", "watchList", "enabled"]);
-  if (!cfg.enabled) return;
-  const watchTabs = cfg.watchTabs || {};
-  const slug = Object.keys(watchTabs).find((s) => watchTabs[s] === tab.id);
-  const game = slug && (cfg.watchList || []).find((g) => g.slug === slug);
-  if (!game || !game.pinnedChannel) return;
-
-  if (Date.now() - (lastPlaybackFlashAt.get(tab.id) || 0) < PINNED_LIVE_FLASH_MIN_GAP_MS) {
-    log("pinned channel", msg && msg.channel, "is live - tab was flashed moments ago, not again");
+async function flashPinnedTabOnceLive(tabId, channel) {
+  if (Date.now() - (lastPlaybackFlashAt.get(tabId) || 0) < PINNED_LIVE_FLASH_MIN_GAP_MS) {
+    log("pinned channel", channel, "is live - tab was flashed moments ago, not again");
     return;
   }
   const { id: watchWindowId } = await getOrCreateWatchWindow();
   if (watchWindowId == null) return; // no isolated window - never flash in the user's own
   try {
-    const liveTab = await browser.tabs.get(tab.id);
+    const liveTab = await browser.tabs.get(tabId);
     if (liveTab.windowId !== watchWindowId) return;
   } catch {
     return; // tab already gone
   }
-  log("pinned channel", msg && msg.channel, "went live - flashing its tab to start playback");
-  await flashTabToStartPlayback(tab.id);
+  log("pinned channel", channel, "went live - flashing its tab to start playback");
+  await flashTabToStartPlayback(tabId);
+}
+
+// ============================================================================
+// pinned-channel offline recovery
+// ============================================================================
+// content.js's pinned branch ONLY reports what the DOM currently shows
+// (msg.live: true/false/null) every 60s tick - it never reloads its own page
+// any more. Deliberately: a tab Firefox has discarded to free memory has no
+// content script left running at all, so reload logic living there could
+// silently stop firing forever - exactly the failure mode this replaces. Both
+// the decision and the actual browser.tabs.reload() live here instead, in the
+// persistent background page, which is unaffected by any one tab's content
+// script dying - and a reload works even on an already-discarded tab (it
+// fully reconstructs it, not a no-op against dead content).
+//
+// pinnedTabState: tabId -> { offlineTicks, lastHeartbeatAt }. In-memory only
+// (like lastPlaybackFlashAt above) - lost on an extension reload/restart,
+// which is fine: the next status report (or the safety-net sweep once one
+// arrives) rebuilds it, and one spurious extra reload right after a restart
+// is harmless.
+const pinnedTabState = new Map();
+// routine reload cadence while a pinned channel's page keeps showing offline
+const PINNED_OFFLINE_RELOAD_TICKS = 3;
+// a status report (including "still loading/gated", live===null) counts as
+// proof of life; this is the safety net for when NO report arrives at all -
+// generously longer than PINNED_OFFLINE_RELOAD_TICKS*60s so it only fires for
+// a genuinely stuck/discarded tab, not a slow-but-alive one
+const PINNED_HEARTBEAT_TIMEOUT_MS = 5 * 60 * 1000;
+const PINNED_RELOAD_MIN_GAP_MS = 2 * 60 * 1000;
+const lastPinnedReloadAt = new Map();
+
+async function getPinnedGameForTab(tabId) {
+  const cfg = await browser.storage.local.get(["watchTabs", "watchList", "enabled"]);
+  if (!cfg.enabled) return null; // disabling clears watchTabs anyway - this is belt-and-braces
+  const watchTabs = cfg.watchTabs || {};
+  const slug = Object.keys(watchTabs).find((s) => watchTabs[s] === tabId);
+  const game = slug && (cfg.watchList || []).find((g) => g.slug === slug);
+  return game && game.pinnedChannel ? game : null;
+}
+
+async function reloadPinnedTab(tabId, channel, reason) {
+  if (Date.now() - (lastPinnedReloadAt.get(tabId) || 0) < PINNED_RELOAD_MIN_GAP_MS) return;
+  lastPinnedReloadAt.set(tabId, Date.now());
+  pinnedTabState.set(tabId, { offlineTicks: 0, lastHeartbeatAt: Date.now() });
+  log("pinned channel", channel, "-", reason, "- reloading its tab");
+  try { await browser.tabs.reload(tabId); } catch (e) { log("reloadPinnedTab: tab already gone", tabId, e); }
+}
+
+async function handlePinnedChannelStatus(msg, tab) {
+  if (!tab) return;
+  const game = await getPinnedGameForTab(tab.id);
+  if (!game) return; // not (or no longer) a tracked pinned-channel tab
+
+  const state = pinnedTabState.get(tab.id) || { offlineTicks: 0, lastHeartbeatAt: 0 };
+  state.lastHeartbeatAt = Date.now();
+
+  if (msg.live === true) {
+    state.offlineTicks = 0;
+    pinnedTabState.set(tab.id, state);
+    await flashPinnedTabOnceLive(tab.id, msg.channel);
+    return;
+  }
+  if (msg.live === false) {
+    state.offlineTicks++;
+    pinnedTabState.set(tab.id, state);
+    if (msg.sidebarLive) {
+      await reloadPinnedTab(tab.id, msg.channel, "is live in the sidebar but this page still shows offline");
+    } else if (state.offlineTicks >= PINNED_OFFLINE_RELOAD_TICKS) {
+      await reloadPinnedTab(tab.id, msg.channel, "still offline - reloading to catch it going live");
+    }
+    return;
+  }
+  // live === null (loading / content-gated): heartbeat only, no action
+  pinnedTabState.set(tab.id, state);
+}
+
+// Safety net for a pinned tab that stops reporting ENTIRELY (Firefox
+// discarded it for memory, or its content script otherwise died) - no
+// message from it can ever arrive, so this has to be driven independently, on
+// the existing per-minute AUTO_WATCH_ALARM cadence rather than waiting on a
+// report that will never come. tabs.reload() also works on an already-
+// discarded tab (fully reconstructs it), which is the actual point.
+async function sweepStalePinnedHeartbeats() {
+  const cfg = await browser.storage.local.get(["watchTabs", "watchList"]);
+  const watchTabs = cfg.watchTabs || {};
+  const now = Date.now();
+  for (const game of cfg.watchList || []) {
+    if (!game.pinnedChannel) continue;
+    const tabId = watchTabs[game.slug];
+    if (tabId == null) continue;
+    const state = pinnedTabState.get(tabId);
+    // no state yet just means this tab hasn't had time to report in since it
+    // was opened/discovered - give it PINNED_HEARTBEAT_TIMEOUT_MS from now,
+    // don't reload a brand-new tab
+    if (!state) { pinnedTabState.set(tabId, { offlineTicks: 0, lastHeartbeatAt: now }); continue; }
+    if (now - state.lastHeartbeatAt > PINNED_HEARTBEAT_TIMEOUT_MS) {
+      const idleMin = Math.round((now - state.lastHeartbeatAt) / 60000);
+      await reloadPinnedTab(tabId, game.channel, `stopped reporting entirely (tab likely discarded) for ${idleMin} min`);
+    }
+  }
 }
 
 async function handleDirectoryPicked(slug, channel, tab) {
@@ -1826,8 +1919,8 @@ browser.runtime.onMessage.addListener((msg, sender) => {
     case "channelPlayingGame":
       return handleChannelPlayingGame(msg, sender.tab);
 
-    case "pinnedChannelLive":
-      return handlePinnedChannelLive(msg, sender.tab);
+    case "pinnedChannelStatus":
+      return handlePinnedChannelStatus(msg, sender.tab);
 
     case "gqlDropSignal":
       return handleGqlDropSignal(msg, sender.tab);

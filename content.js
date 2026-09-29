@@ -246,19 +246,6 @@
     return entries.some((a) => !offline(a));
   }
 
-  // a sidebar that keeps saying "live" while the page still renders offline
-  // (stale sidebar, Twitch lag) must not become a reload loop: at most one
-  // sidebar-triggered reload per this long, remembered across the reload
-  const SIDEBAR_RELOAD_MIN_GAP_MS = 2 * 60 * 1000;
-  const SIDEBAR_RELOAD_KEY = "tdc_pinned_sidebar_reload_at";
-  function sidebarReloadAllowed() {
-    try {
-      return Date.now() - (Number(sessionStorage.getItem(SIDEBAR_RELOAD_KEY)) || 0) > SIDEBAR_RELOAD_MIN_GAP_MS;
-    } catch { return false; }
-  }
-  function noteSidebarReload() {
-    try { sessionStorage.setItem(SIDEBAR_RELOAD_KEY, String(Date.now())); } catch { /* best-effort */ }
-  }
 
   function looksOffline() {
     // content gate (subscriber-only / mature / rerun) is NOT "offline"
@@ -859,12 +846,15 @@
       let baselineGame = null;
       let lastReportedGameSlug = null;
       const CHANNEL_PROBLEM_RECHECK_MS = 10_000;
-      // pinned "@channel" only: an offline channel page is not guaranteed to
-      // turn itself into a live one (a hidden background tab in particular),
-      // so reload it every this-many 60s ticks while it shows offline - or
-      // sooner when the user's sidebar lists the channel as live
-      const PINNED_OFFLINE_RELOAD_TICKS = 3;
-      let pinnedOfflineTicks = 0;
+      // pinned "@channel" only: reporting only, NEVER reloads itself here.
+      // An offline channel page is not guaranteed to turn itself into a live
+      // one on its own (a hidden background tab in particular), so it needs
+      // reloading sometimes - but a tab Firefox has discarded for memory has
+      // no content script left to run a timer/reload at all, so the DECISION
+      // and the actual browser.tabs.reload() both live in background.js
+      // (handlePinnedChannelStatus / its own heartbeat safety-net sweep),
+      // which persists independently of any one tab's content script. This
+      // tick only ever sends what the DOM currently shows.
       let pinnedSawLive = false;
 
       // fast first recovery attempt - don't make a stalled player wait a
@@ -910,7 +900,6 @@
         // background.js can bind this entry's tracking to it.
         if (pinned) {
           if (looksLive()) {
-            pinnedOfflineTicks = 0;
             if (!pinnedSawLive) {
               // first live sighting on this page load (or first since it last
               // went offline): a tab that was created/reloaded while the
@@ -919,8 +908,8 @@
               // for a freshly-picked channel
               pinnedSawLive = true;
               log("pinned channel", initialChannel, "is live");
-              browser.runtime.sendMessage({ type: "pinnedChannelLive", channel: initialChannel }).catch(() => {});
             }
+            browser.runtime.sendMessage({ type: "pinnedChannelStatus", channel: initialChannel, live: true }).catch(() => {});
             const g = currentStreamGame();
             if (g && g.slug !== lastReportedGameSlug) {
               lastReportedGameSlug = g.slug;
@@ -933,18 +922,18 @@
             // gate (subscriber-only / mature) is not "offline" and must not
             // be reloaded in a loop
             pinnedSawLive = false;
-            pinnedOfflineTicks++;
-            // early trigger: the user follows this channel and their sidebar
-            // already lists it as live while this page still says offline
-            const sidebarLive = sidebarShowsLive(initialChannel) === true && sidebarReloadAllowed();
-            if (sidebarLive || pinnedOfflineTicks >= PINNED_OFFLINE_RELOAD_TICKS) {
-              handled = true;
-              if (sidebarLive) noteSidebarReload();
-              log("pinned channel", initialChannel,
-                sidebarLive ? "is live in the sidebar but this page still shows offline - reloading now"
-                  : "still offline - reloading the page to catch it going live");
-              location.reload();
-            }
+            // the user follows this channel and their sidebar already lists
+            // it as live while this page still says offline - background.js
+            // decides how urgently to act on that (rate-limited there)
+            const sidebarLive = sidebarShowsLive(initialChannel) === true;
+            browser.runtime.sendMessage({
+              type: "pinnedChannelStatus", channel: initialChannel, live: false, sidebarLive,
+            }).catch(() => {});
+          } else {
+            // loading / content-gated: not live, not offline - still a
+            // heartbeat (background.js's dead-tab safety net must not
+            // mistake "still loading" for "the tab died")
+            browser.runtime.sendMessage({ type: "pinnedChannelStatus", channel: initialChannel, live: null }).catch(() => {});
           }
           return;
         }

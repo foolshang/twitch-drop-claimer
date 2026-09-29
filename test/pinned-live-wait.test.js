@@ -1,18 +1,20 @@
 /**
  * pinned-live-wait.test.js
  *
- * A pinned "@channel" entry whose channel is offline used to just sit there:
- * content.js's pinned branch only reported the game once the page happened to
- * show live, nothing reloaded an offline page, and the one playback "flash"
- * (flashTabToStartPlayback) happened at tab creation, when there was no
- * stream to start. So a channel that went live later never got watched.
- *
- * Now, while the page shows explicit offline markers, content.js reloads it
- * every PINNED_OFFLINE_RELOAD_TICKS (3) 60s ticks; the first time it sees the
- * channel live it sends "pinnedChannelLive"; background.js then flashes that
- * tab (watch window only, not twice within 2 min). If the user follows the
- * channel and their sidebar entry already shows it live while the page still
- * says offline, the reload happens on the next tick instead (rate-limited).
+ * A pinned "@channel" entry whose channel is offline used to just sit there
+ * (a former transient-flash-at-creation, no reload trigger). A first fix put
+ * a reload timer directly in content.js (setInterval + location.reload()) -
+ * but a tab Firefox discards to free memory has NO content script left
+ * running at all, so that timer could silently stop firing forever and the
+ * channel would never be watched again, exactly the original bug. That fix
+ * was replaced: content.js now ONLY reports what the DOM shows every 60s tick
+ * (`pinnedChannelStatus`: live true/false/null, plus a sidebar-live hint when
+ * offline) and NEVER calls location.reload() itself; the decision AND the
+ * actual browser.tabs.reload() live in background.js instead, which persists
+ * independently of any one tab's content script - handlePinnedChannelStatus()
+ * reacts to each report, and sweepStalePinnedHeartbeats() (run every minute
+ * off the existing AUTO_WATCH_ALARM cadence) force-reloads a tab that stops
+ * reporting ENTIRELY, recovering even a fully discarded tab.
  */
 
 const vm = require("vm");
@@ -24,7 +26,7 @@ const { JSDOM } = require("jsdom");
 const ROOT = path.join(__dirname, "..");
 const read = (f) => fs.readFileSync(path.join(ROOT, f), "utf8");
 
-// markup from the live captures used by channel-live-detection.test.js
+// markup from the live captures used elsewhere in this test suite
 const LIVE = `
   <div class="channel-root channel-root--live"><div class="channel-root__info">
     <span data-a-target="animated-channel-viewers-count">7</span>
@@ -36,27 +38,13 @@ const OFFLINE = `
 const LOADING = `<div class="channel-root"></div>`;
 const CONTENT_GATE = `<div class="channel-root"><div data-a-target="player-overlay-content-gate">Subscribers only</div></div>`;
 
-function readContentJs() {
-  return read("content.js");
-}
-
-// followed-channel sidebar entries, markup captured live 2026-09-28: an
-// offline one carries side-nav-card__link--offline (text "Offline")
 const sidebarEntry = (name, live) =>
   `<div class="side-nav-card"><a data-a-id="followed-channel-0" data-test-selector="followed-channel" ` +
   `class="ScCoreLink side-nav-card__link tw-link${live ? "" : " side-nav-card__link--empty-category side-nav-card__link--offline"}" ` +
   `href="/${name}"><span>${name}</span><span>${live ? "Live 56 viewers" : "Offline"}</span></a></div>`;
 
-// same channel in the sidebar's collapsed (avatar-only) mode: the anchor itself
-// is `.side-nav-card`, an offline one has `.side-nav-card__avatar--offline`
-const collapsedEntry = (name, live) =>
-  `<a class="ScCoreLink side-nav-card tw-link" href="/${name}"><div class="side-nav-card__avatar${live ? "" : " side-nav-card__avatar--offline"}"><img></div></a>`;
-
-// "Live Channels" (recommended) entry: only ever lists live channels
-const recommendedEntry = (name) =>
-  `<div class="side-nav-card"><a data-test-selector="recommended-channel" class="ScCoreLink side-nav-card__link tw-link" href="/${name}"><span>${name}</span><span>Live 11.9K viewers</span></a></div>`;
-
-async function makeContent(initialHtml, { pinned = true, sidebar = "", session = {} } = {}) {
+// ---- content.js side -----------------------------------------------------
+async function makeContent(initialHtml, { pinned = true, sidebar = "" } = {}) {
   const dom = new JSDOM(`<!doctype html><html><body><nav class="side-nav">${sidebar}</nav>${initialHtml}</body></html>`);
   const { window } = dom;
   Object.defineProperty(window.HTMLElement.prototype, "innerText", {
@@ -65,24 +53,19 @@ async function makeContent(initialHtml, { pinned = true, sidebar = "", session =
   });
   const intervals = [];
   const sent = [];
-  let reloads = 0;
+  let reloadCalls = 0;
   const sandbox = {
     console: { log: () => {}, error: () => {}, warn: () => {} },
     document: window.document,
     location: {
       pathname: "/somestreamer", href: "https://www.twitch.tv/somestreamer", search: "",
-      reload: () => { reloads++; },
+      reload: () => { reloadCalls++; }, // must NEVER be called any more - asserted below
     },
     MutationObserver: window.MutationObserver,
     MouseEvent: window.MouseEvent, URL: globalThis.URL,
-    sessionStorage: {
-      getItem: (k) => (k in session ? session[k] : null),
-      setItem: (k, v) => { session[k] = String(v); },
-    },
     setInterval: (fn, ms) => { intervals.push({ fn, ms }); return intervals.length; },
     clearInterval: () => {},
-    // only the non-pinned path's 10s problem re-check is awaited; run it now
-    setTimeout: (fn, ms) => { if (ms === 10_000) setImmediate(fn); return 0; },
+    setTimeout: (fn, ms) => { if (ms === 10_000) setImmediate(fn); return 0; }, // let the non-pinned 10s re-check fire
     clearTimeout: () => {},
     browser: {
       storage: {
@@ -106,142 +89,68 @@ async function makeContent(initialHtml, { pinned = true, sidebar = "", session =
   };
   const ctx = vm.createContext(sandbox);
   vm.runInContext(read("shared.js"), ctx);
-  vm.runInContext(readContentJs(), ctx);
+  vm.runInContext(read("content.js"), ctx);
   await new Promise((r) => setImmediate(r)); // let storage.get().then(start) run
   const tick = intervals.find((i) => i.ms === 60_000);
   assert.ok(tick, "channel-page 60s monitor must be registered");
   return {
     tick: () => tick.fn(),
     setPage: (html) => { window.document.body.innerHTML = `<nav class="side-nav">${sidebar}</nav>${html}`; },
-    sent, get reloads() { return reloads; },
+    sent, get reloadCalls() { return reloadCalls; },
   };
 }
 
-const liveMsgs = (c) => c.sent.filter((m) => m.type === "pinnedChannelLive");
+const statusMsgs = (c) => c.sent.filter((m) => m.type === "pinnedChannelStatus");
 
-async function testOfflineChannelIsReloadedEveryThirdTick() {
-  const c = await makeContent(OFFLINE);
+async function testLiveSendsStatusTrueEveryTick() {
+  const c = await makeContent(LIVE);
   await c.tick(); await c.tick();
-  assert.strictEqual(c.reloads, 0, "no reload before 3 offline ticks");
-  await c.tick();
-  assert.strictEqual(c.reloads, 1, "third offline tick reloads the page");
-  assert.strictEqual(liveMsgs(c).length, 0);
-  console.log("  OK  pinned + offline markers: page reloaded on the 3rd 60s tick, not before");
+  assert.deepStrictEqual(statusMsgs(c).map((m) => m.live), [true, true]);
+  assert.strictEqual(statusMsgs(c)[0].channel, "somestreamer");
+  assert.strictEqual(c.reloadCalls, 0, "content.js never calls location.reload() itself any more");
+  console.log("  OK  pinned + live: reports {live:true} every tick, never reloads itself");
 }
 
-async function testLoadingPageAndContentGateAreNeverReloaded() {
-  for (const [label, html] of [["loading page", LOADING], ["content gate", CONTENT_GATE]]) {
+async function testOfflineSendsStatusFalseWithSidebarHint() {
+  const c = await makeContent(OFFLINE, { sidebar: sidebarEntry("somestreamer", false) });
+  await c.tick(); await c.tick(); await c.tick(); await c.tick();
+  const msgs = statusMsgs(c);
+  assert.strictEqual(msgs.length, 4);
+  for (const m of msgs) { assert.strictEqual(m.live, false); assert.strictEqual(m.sidebarLive, false); }
+  assert.strictEqual(c.reloadCalls, 0, "even after many offline ticks, content.js still never reloads itself - that decision is background.js's now");
+  console.log("  OK  pinned + offline: reports {live:false, sidebarLive:false} every tick indefinitely, no local reload");
+}
+
+async function testSidebarLiveIsReportedAsAHint() {
+  const c = await makeContent(OFFLINE, { sidebar: sidebarEntry("SomeStreamer", true) }); // case-insensitive href match
+  await c.tick();
+  const m = statusMsgs(c)[0];
+  assert.strictEqual(m.type, "pinnedChannelStatus");
+  assert.strictEqual(m.channel, "somestreamer");
+  assert.strictEqual(m.live, false);
+  assert.strictEqual(m.sidebarLive, true);
+  console.log("  OK  sidebar lists the channel live while the page says offline -> reported as a hint (case-insensitive), content.js still does not act on it");
+}
+
+async function testLoadingAndContentGateReportLiveNull() {
+  for (const html of [LOADING, CONTENT_GATE]) {
     const c = await makeContent(html);
-    for (let i = 0; i < 8; i++) await c.tick();
-    assert.strictEqual(c.reloads, 0, `${label} has no explicit offline marker - must not be reloaded`);
-  }
-  console.log("  OK  a loading page / subscriber-only gate is not treated as offline (no reload loop)");
-}
-
-async function testLiveIsReportedOnceThenAgainAfterOffline() {
-  const c = await makeContent(OFFLINE);
-  await c.tick(); await c.tick();
-  c.setPage(LIVE); // Twitch flipped the page (or a reload landed live)
-  await c.tick();
-  assert.strictEqual(liveMsgs(c).length, 1, "first live sighting reported");
-  assert.strictEqual(liveMsgs(c)[0].channel, "somestreamer");
-  assert.strictEqual(c.reloads, 0, "offline counter was reset by the live sighting, no stray reload");
-  await c.tick(); await c.tick();
-  assert.strictEqual(liveMsgs(c).length, 1, "not re-reported while it stays live");
-  assert.ok(c.sent.some((m) => m.type === "channelPlayingGame" && m.slug === "warframe"), "game binding report still sent");
-
-  // stream ends, and the page flips back to live before the 3rd offline tick:
-  // the "seen live" flag was cleared, so the next live sighting is reported
-  c.setPage(OFFLINE);
-  await c.tick();
-  c.setPage(LIVE);
-  await c.tick();
-  assert.strictEqual(liveMsgs(c).length, 2, "reported again for the next live session");
-  assert.strictEqual(c.reloads, 0);
-
-  // after an actual reload the old instance is gone and a fresh content
-  // script starts from scratch - it reports its own first live sighting
-  const fresh = await makeContent(OFFLINE);
-  await fresh.tick();
-  fresh.setPage(LIVE);
-  await fresh.tick();
-  assert.strictEqual(liveMsgs(fresh).length, 1, "a fresh page load reports its first live sighting");
-  console.log("  OK  live reported once per session (again after an offline gap); offline counter resets on live");
-}
-
-async function testSidebarLiveTriggersImmediateReload() {
-  // the user follows somestreamer; sidebar says live, the page still says offline
-  const c = await makeContent(OFFLINE, { sidebar: sidebarEntry("SomeStreamer", true) }); // href case differs on purpose
-  await c.tick();
-  assert.strictEqual(c.reloads, 1, "reload on the very first tick, not the third");
-  console.log("  OK  sidebar lists the pinned channel live while the page says offline -> reload now (case-insensitive href)");
-}
-
-async function testSidebarOfflineOrAbsentOrOthersLiveDoesNotTrigger() {
-  const cases = [
-    ["sidebar says offline", sidebarEntry("somestreamer", false)],
-    ["channel not followed / absent", ""],
-    ["only OTHER channels are live", sidebarEntry("someoneelse", true) + sidebarEntry("anotherperson", true)],
-  ];
-  for (const [label, sidebar] of cases) {
-    const c = await makeContent(OFFLINE, { sidebar });
     await c.tick(); await c.tick();
-    assert.strictEqual(c.reloads, 0, `${label}: no early reload`);
-    await c.tick();
-    assert.strictEqual(c.reloads, 1, `${label}: still reloads on the 3rd tick`);
+    assert.deepStrictEqual(statusMsgs(c).map((m) => m.live), [null, null]);
+    assert.strictEqual(c.reloadCalls, 0);
   }
-  console.log("  OK  offline sidebar entry / not followed / other channels' Live badges never trigger the early reload");
+  console.log("  OK  a loading page / subscriber-only gate reports {live:null} (still a heartbeat, not offline)");
 }
 
-async function testCollapsedAndRecommendedSidebarModes() {
-  const live = await makeContent(OFFLINE, { sidebar: collapsedEntry("somestreamer", true) });
-  await live.tick();
-  assert.strictEqual(live.reloads, 1, "collapsed sidebar, avatar not marked offline -> live -> early reload");
-
-  const off = await makeContent(OFFLINE, { sidebar: collapsedEntry("somestreamer", false) });
-  await off.tick(); await off.tick();
-  assert.strictEqual(off.reloads, 0, "collapsed sidebar, avatar marked offline -> no early reload");
-
-  const rec = await makeContent(OFFLINE, { sidebar: recommendedEntry("somestreamer") });
-  await rec.tick();
-  assert.strictEqual(rec.reloads, 1, "the channel listed under Live Channels is live too");
-
-  const twice = await makeContent(OFFLINE, { sidebar: sidebarEntry("somestreamer", false) + recommendedEntry("somestreamer") });
-  await twice.tick();
-  assert.strictEqual(twice.reloads, 1, "any live entry for the channel wins over an offline duplicate");
-  console.log("  OK  collapsed (avatar-only) sidebar and the Live Channels list work like the expanded Followed list");
-}
-
-async function testSidebarReloadIsRateLimited() {
-  const session = {};
-  const first = await makeContent(OFFLINE, { sidebar: sidebarEntry("somestreamer", true), session });
-  await first.tick();
-  assert.strictEqual(first.reloads, 1);
-  assert.ok(session.tdc_pinned_sidebar_reload_at, "reload time remembered across the reload");
-
-  // the reloaded page STILL says offline while the sidebar still says live
-  const again = await makeContent(OFFLINE, { sidebar: sidebarEntry("somestreamer", true), session });
-  await again.tick(); await again.tick();
-  assert.strictEqual(again.reloads, 0, "no second sidebar-triggered reload within 2 min (no reload loop)");
-  await again.tick();
-  assert.strictEqual(again.reloads, 1, "the normal 3-tick reload still applies");
-
-  session.tdc_pinned_sidebar_reload_at = String(Date.now() - 3 * 60 * 1000);
-  const later = await makeContent(OFFLINE, { sidebar: sidebarEntry("somestreamer", true), session });
-  await later.tick();
-  assert.strictEqual(later.reloads, 1, "allowed again once 2 min have passed");
-  console.log("  OK  sidebar-triggered reloads are limited to one per 2 min, remembered across reloads");
-}
-
-async function testNonPinnedTabIsUnchanged() {
+async function testNonPinnedTabNeverSendsStatus() {
   const c = await makeContent(OFFLINE, { pinned: false });
-  for (let i = 0; i < 6; i++) await c.tick();
-  assert.strictEqual(c.reloads, 0, "an ordinary game tab never reloads-and-waits");
-  assert.strictEqual(liveMsgs(c).length, 0);
-  console.log("  OK  non-pinned watch tabs keep their old behaviour (no reload, no live report)");
+  for (let i = 0; i < 5; i++) await c.tick();
+  assert.strictEqual(statusMsgs(c).length, 0, "an ordinary (non-pinned) game tab never sends pinnedChannelStatus");
+  assert.strictEqual(c.reloadCalls, 0);
+  console.log("  OK  non-pinned watch tabs never send pinnedChannelStatus (old rotate-away behaviour unaffected)");
 }
 
-// ---- background.js -----------------------------------------------------
+// ---- background.js side --------------------------------------------------
 function makeBg({ enabled = true, watchList, tabWindow = 77 } = {}) {
   const storageData = {
     enabled, watchWindowId: 77,
@@ -252,10 +161,21 @@ function makeBg({ enabled = true, watchList, tabWindow = 77 } = {}) {
     ],
   };
   const activeCalls = [];
+  const reloadCalls = [];
+  // vm.createContext gives background.js its OWN Date built-in, separate
+  // from this file's - overriding the host Date.now has no effect on code
+  // running inside the sandbox, so a controllable Date is passed in instead
+  // (only `now()` is faked; everything else - `new Date()`, `Date.parse` -
+  // still behaves normally) to fast-forward time without a real wait.
+  let clockOffsetMs = 0;
+  const RealDate = Date;
+  class FakeDate extends RealDate {
+    static now() { return RealDate.now() + clockOffsetMs; }
+  }
   const sandbox = {
     console: { log: () => {}, error: () => {}, warn: () => {} },
     setTimeout, clearTimeout, setInterval, clearInterval,
-    TextEncoder, URL: globalThis.URL, Blob: globalThis.Blob,
+    TextEncoder, URL: globalThis.URL, Blob: globalThis.Blob, Date: FakeDate,
     browser: {
       storage: {
         local: {
@@ -275,9 +195,9 @@ function makeBg({ enabled = true, watchList, tabWindow = 77 } = {}) {
       tabs: {
         get: (id) => Promise.resolve({ id, windowId: tabWindow }),
         update: (id, opts) => { if ("active" in opts) activeCalls.push({ id, active: opts.active }); return Promise.resolve(); },
+        reload: (id) => { reloadCalls.push(id); return Promise.resolve(); },
         create: () => Promise.resolve({ id: 1 }),
         query: () => Promise.resolve([]),
-        reload: () => {},
       },
       alarms: { create: () => {}, clear: () => Promise.resolve(true), onAlarm: { addListener: () => {} } },
       browserAction: { setBadgeText: () => {}, setBadgeBackgroundColor: () => {}, setTitle: () => {} },
@@ -288,69 +208,128 @@ function makeBg({ enabled = true, watchList, tabWindow = 77 } = {}) {
   vm.runInContext(read("shared.js"), ctx);
   vm.runInContext(read("i18n.js"), ctx);
   vm.runInContext(read("background.js"), ctx);
-  return { ctx, activeCalls, handle: vm.runInContext("handlePinnedChannelLive", ctx) };
+  return {
+    ctx, activeCalls, reloadCalls,
+    status: vm.runInContext("handlePinnedChannelStatus", ctx),
+    sweep: vm.runInContext("sweepStalePinnedHeartbeats", ctx),
+    advanceClock: (ms) => { clockOffsetMs += ms; },
+  };
 }
 
 const trueCalls = (b) => b.activeCalls.filter((c) => c.active === true);
 
-async function testBackgroundFlashesPinnedTabOnce() {
+async function testLiveFlashesTheTabOncePerTwoMinutes() {
   const b = makeBg();
-  await b.handle({ channel: "somestreamer" }, { id: 5 });
-  assert.deepStrictEqual(trueCalls(b), [{ id: 5, active: true }], "pinned tab in the watch window is flashed");
-  await b.handle({ channel: "somestreamer" }, { id: 5 });
-  assert.strictEqual(trueCalls(b).length, 1, "a second report within 2 min does not flash again");
-  console.log("  OK  background flashes a pinned tab when it reports live, once per 2 min");
+  await b.status({ channel: "somestreamer", live: true }, { id: 5 });
+  assert.deepStrictEqual(trueCalls(b), [{ id: 5, active: true }]);
+  await b.status({ channel: "somestreamer", live: true }, { id: 5 });
+  assert.strictEqual(trueCalls(b).length, 1, "a second live report within 2 min does not flash again");
+  console.log("  OK  live report flashes the tab to start playback, once per 2 min");
 }
 
-async function testBackgroundIgnoresEverythingElse() {
+async function testThreeOfflineTicksTriggerOneReload() {
+  const b = makeBg();
+  await b.status({ channel: "somestreamer", live: false, sidebarLive: false }, { id: 5 });
+  await b.status({ channel: "somestreamer", live: false, sidebarLive: false }, { id: 5 });
+  assert.deepStrictEqual(b.reloadCalls, [], "no reload before the 3rd offline report");
+  await b.status({ channel: "somestreamer", live: false, sidebarLive: false }, { id: 5 });
+  assert.deepStrictEqual(b.reloadCalls, [5], "3rd offline report reloads the tab");
+  console.log("  OK  background.js reloads the pinned tab on the 3rd offline status report");
+}
+
+async function testSidebarHintReloadsImmediatelyAndIsRateLimited() {
+  const b = makeBg();
+  await b.status({ channel: "somestreamer", live: false, sidebarLive: true }, { id: 5 });
+  assert.deepStrictEqual(b.reloadCalls, [5], "sidebar-live hint reloads on the very first offline report");
+  await b.status({ channel: "somestreamer", live: false, sidebarLive: true }, { id: 5 });
+  assert.deepStrictEqual(b.reloadCalls, [5], "a second sidebar-triggered reload within 2 min is suppressed (rate limit)");
+  console.log("  OK  a sidebar-live hint reloads immediately, rate-limited to one per 2 min");
+}
+
+async function testLiveResetsTheOfflineCounter() {
+  const b = makeBg();
+  await b.status({ channel: "somestreamer", live: false }, { id: 5 });
+  await b.status({ channel: "somestreamer", live: false }, { id: 5 });
+  await b.status({ channel: "somestreamer", live: true }, { id: 5 }); // stream came back before tick 3
+  await b.status({ channel: "somestreamer", live: false }, { id: 5 });
+  await b.status({ channel: "somestreamer", live: false }, { id: 5 });
+  assert.deepStrictEqual(b.reloadCalls, [], "counter was reset by the live report - only 2 offline reports since");
+  console.log("  OK  a live report in between resets the offline-tick counter (no premature reload)");
+}
+
+async function testLoadingNullNeitherFlashesNorReloads() {
+  const b = makeBg();
+  for (let i = 0; i < 5; i++) await b.status({ channel: "somestreamer", live: null }, { id: 5 });
+  assert.deepStrictEqual(trueCalls(b), []);
+  assert.deepStrictEqual(b.reloadCalls, []);
+  console.log("  OK  {live:null} (loading/gated) neither flashes nor reloads, however many times reported");
+}
+
+async function testStatusIgnoresEverythingElse() {
   const ordinary = makeBg();
-  await ordinary.handle({ channel: "x" }, { id: 6 }); // tab 6 = ordinary game entry
-  assert.strictEqual(trueCalls(ordinary).length, 0, "an ordinary game tab is never flashed by this message");
+  await ordinary.status({ channel: "x", live: false }, { id: 6 }); // tab 6 is the ordinary game entry
+  await ordinary.status({ channel: "x", live: false }, { id: 6 });
+  await ordinary.status({ channel: "x", live: false }, { id: 6 });
+  assert.deepStrictEqual(ordinary.reloadCalls, [], "an ordinary game tab is never reloaded by pinnedChannelStatus");
 
   const unknown = makeBg();
-  await unknown.handle({ channel: "x" }, { id: 999 });
-  assert.strictEqual(trueCalls(unknown).length, 0, "an untracked tab (the user's own) is never touched");
-
-  const elsewhere = makeBg({ tabWindow: 12 });
-  await elsewhere.handle({ channel: "somestreamer" }, { id: 5 });
-  assert.strictEqual(trueCalls(elsewhere).length, 0, "a tab outside the dedicated watch window is never flashed");
+  await unknown.status({ channel: "x", live: false }, { id: 999 });
+  assert.deepStrictEqual(unknown.reloadCalls, [], "an untracked tab (the user's own) is never touched");
 
   const off = makeBg({ enabled: false });
-  await off.handle({ channel: "somestreamer" }, { id: 5 });
-  assert.strictEqual(trueCalls(off).length, 0, "nothing happens while the extension is switched off");
+  await off.status({ channel: "somestreamer", live: true }, { id: 5 });
+  assert.deepStrictEqual(off.activeCalls, [], "nothing happens while the extension is switched off");
 
   const noTab = makeBg();
-  await noTab.handle({ channel: "somestreamer" }, undefined);
-  assert.strictEqual(trueCalls(noTab).length, 0);
-  console.log("  OK  background ignores ordinary tabs, untracked tabs, other windows, and OFF state");
+  await noTab.status({ channel: "somestreamer", live: true }, undefined);
+  assert.deepStrictEqual(noTab.activeCalls, []);
+  console.log("  OK  background ignores ordinary tabs, untracked tabs, and OFF state");
 }
 
-async function testBoundPinnedEntryStillCounts() {
-  // after handleChannelPlayingGame the entry's slug is the real game slug but stays pinnedChannel
-  const b = makeBg({
-    watchList: [{ input: "@somestreamer", slug: "warframe", channel: "somestreamer", pinnedChannel: true }],
-  });
-  b.ctx; // storage watchTabs still maps tab 5 under the old key - rekey like the real binder does
-  await vm.runInContext(`browser.storage.local.set({ watchTabs: { warframe: 5 } })`, b.ctx);
-  await b.handle({ channel: "somestreamer" }, { id: 5 });
-  assert.strictEqual(trueCalls(b).length, 1, "a pinned entry already bound to a real game slug is still flashed");
-  console.log("  OK  a pinned entry bound to a real game slug is still recognised");
+async function testHeartbeatSafetyNetRecoversADeadTab() {
+  const b = makeBg();
+  await b.status({ channel: "somestreamer", live: false }, { id: 5 }); // one report, then the tab "dies" (discarded)
+  await b.sweep();
+  assert.deepStrictEqual(b.reloadCalls, [], "not yet stale");
+
+  b.advanceClock(6 * 60 * 1000); // 6 min of total silence
+  await b.sweep();
+  assert.deepStrictEqual(b.reloadCalls, [5], "no report at all for 6 min -> the safety net reloads the tab itself");
+  console.log("  OK  sweepStalePinnedHeartbeats reloads a pinned tab that stopped reporting entirely (simulated tab discard)");
+}
+
+async function testHeartbeatSafetyNetGivesFreshTabsAGracePeriod() {
+  const b = makeBg(); // no status report has ever arrived for this tab yet
+  await b.sweep();
+  assert.deepStrictEqual(b.reloadCalls, [], "a freshly opened tab is not reloaded before it has had a chance to report in");
+  console.log("  OK  a tab with no report yet gets a grace period, not an immediate reload");
+}
+
+async function testHeartbeatSafetyNetLeavesRecentlyReportingTabsAlone() {
+  const b = makeBg();
+  await b.status({ channel: "somestreamer", live: true }, { id: 5 });
+  await b.sweep();
+  assert.deepStrictEqual(b.reloadCalls, [], "a tab that just reported in is left alone");
+  console.log("  OK  a tab that recently reported in is never touched by the safety net");
 }
 
 (async () => {
   console.log("Running pinned-channel live-wait tests (no real browser, no network)...\n");
   try {
-    await testOfflineChannelIsReloadedEveryThirdTick();
-    await testLoadingPageAndContentGateAreNeverReloaded();
-    await testLiveIsReportedOnceThenAgainAfterOffline();
-    await testSidebarLiveTriggersImmediateReload();
-    await testSidebarOfflineOrAbsentOrOthersLiveDoesNotTrigger();
-    await testCollapsedAndRecommendedSidebarModes();
-    await testSidebarReloadIsRateLimited();
-    await testNonPinnedTabIsUnchanged();
-    await testBackgroundFlashesPinnedTabOnce();
-    await testBackgroundIgnoresEverythingElse();
-    await testBoundPinnedEntryStillCounts();
+    await testLiveSendsStatusTrueEveryTick();
+    await testOfflineSendsStatusFalseWithSidebarHint();
+    await testSidebarLiveIsReportedAsAHint();
+    await testLoadingAndContentGateReportLiveNull();
+    await testNonPinnedTabNeverSendsStatus();
+    await testLiveFlashesTheTabOncePerTwoMinutes();
+    await testThreeOfflineTicksTriggerOneReload();
+    await testSidebarHintReloadsImmediatelyAndIsRateLimited();
+    await testLiveResetsTheOfflineCounter();
+    await testLoadingNullNeitherFlashesNorReloads();
+    await testStatusIgnoresEverythingElse();
+    await testHeartbeatSafetyNetRecoversADeadTab();
+    await testHeartbeatSafetyNetGivesFreshTabsAGracePeriod();
+    await testHeartbeatSafetyNetLeavesRecentlyReportingTabsAlone();
     console.log("\nALL PASSED");
     process.exit(0);
   } catch (e) {
