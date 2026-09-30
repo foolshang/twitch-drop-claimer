@@ -2250,3 +2250,11 @@ with a copy of a real user's cookies/profile; if live testing is needed, use a
 separate Twitch test account only.
 
 `BUILD_MARKER` -> `2026-09-30-r4`, `manifest.json` -> 0.6.16.
+
+Signed to the UNLISTED channel on 2026-09-30 (`npm run submit`, no
+`--listed`) for a few days of testing in the user's real Firefox:
+`web-ext-artifacts/33d37586a96d443fa884-0.6.16.xpi`, built from `76f224e`
+(`BUILD_MARKER` `2026-09-30-r4`); the version is in the local, git-ignored
+`.amo-submitted-versions.json`. Not submitted to the listed channel. AMO does
+not allow reusing a version number, so if the test goes well the same code
+ships to listed as 0.6.17 (manifest + `BUILD_MARKER` bump only).
