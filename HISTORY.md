@@ -1944,6 +1944,11 @@ available currently" at the time). Suggested isolation: Troubleshoot Mode /
 a private window; inject.js only wraps `fetch`/XHR passively and cannot block a
 response.
 
+**Correction (found in 0.6.16):** that empty page was not a rendering bug of
+this extension. See "0.6.16" below: the page's Drops-only GQL operations
+(`ViewerDropsDashboard` etc.) were answered with `failed integrity check`, and
+the same empty list reproduces with the extension removed.
+
 **Tests:** new `test/session-windows.test.js` (7 cases, fake windows/tabs
 registry including the id-collision case - fails against the 0.6.14 code at
 "adopted, not the user's window 2"). All 12 test files pass; lint clean
@@ -2001,3 +2006,165 @@ submit:listed` - lint clean (0/0/0), signed and auto-approved to
 `web-ext-artifacts/33d37586a96d443fa884-0.6.15.xpi`, recorded in
 `.amo-submitted-versions.json`. Existing users see an upgrade prompt for
 the new bug-relay host permission (now https://35-188-24-245.sslip.io).
+
+## 0.6.16 - claim scan limited to inventory/channel pages, exact "รับ", adoption race
+
+**Reported:** with 0.6.15 installed, `/drops/campaigns` showed "There are no
+Drops campaigns available currently" under Open Drop Campaigns and only
+CONTROL under Open Reward Campaigns, while another browser (no extension) at
+the same time listed Pokémon, Special Events, The Blood of Dawnwalker, etc.
+
+**Root cause of the empty list: not this extension.** In a copy of the user's
+profile, normal Firefox launch (no web-ext, no RDP), with only this extension
+removed, the page shows exactly the same empty list. Through web-ext + RDP the
+page's GQL traffic (all HTTP 200) shows why: `ViewerDropsDashboard` (the
+campaign list), `DropsInventoryRewardGroupStatus` (the drops inside a
+campaign) and `DropsPage_ClaimDropRewards` (the claim mutation) all come back
+with `errors: [{message: "failed integrity check"}]` and null data, while
+ordinary operations sent with the same `Client-Integrity` token succeed and
+`gql.twitch.tv/integrity` itself answers 200 - Twitch applies a stricter
+integrity bar to Drops-only operations. It is identical with a do-nothing
+extension, with a probe extension that only observes, and with 0.6.15, so
+`inject.js` wrapping `fetch`/XHR is not the cause (the page's own `fetch` is
+already non-native without any extension of ours). The 0.6.15 "Not reproduced"
+note above was this same failure. Not established: WHY Twitch rates the
+profile's session this way (the user is testing a cookie reset/re-login
+separately); web-ext/RDP launches are themselves rated the same way, so they
+cannot show a working list on demand (one early run did).
+
+**Consequence:** in such a session the claim mutation fails too - the
+inventory's four "Claim Now" buttons stayed unclaimed and the extension
+re-clicked them every cooldown, dozens of rejected `DropsPage_ClaimDropRewards`
+calls in a few minutes (and each click also made background.js reload the
+inventory tab). Auto-claim itself works (it clicks); Twitch refuses the claim.
+See Problem 3.
+
+**Problem 1 (real, found while ruling out suspects):** content.js scanned for
+claim buttons on every twitch.tv page, and its generic fallback matched by
+`startsWith`, so the bare Thai "รับ" matched "รับชม…" and "claim" matched
+"claimed…". Live on `/drops/campaigns` with 0.6.15, four decoy buttons ("Claim
+Now", "รับ", aria "รับชมสตรีม", aria "Claimed") were ALL clicked, three rounds in
+30 s; with 0.6.16 none were. No such button exists on the real page today
+(none of its 17 buttons matched), so this did not cause the report, but it is
+one Thai label away from doing so.
+
+**Fix 1:** `clickClaims()` returns unless the current path is the inventory or a
+channel page (`isClaimScanPage()`, checked on every call because Twitch
+navigates without reloading the content script). "รับ", "claim" and the other
+short labels match the whole string; only an aria-label that carries the
+reward name after the verb ("Claim Drop: <name>", "รับรางวัล <name>") matches by
+prefix, never the already-claimed forms ("claimed…", "รับรางวัลแล้ว").
+
+**Problem 2 (real):** at Firefox start a tab the user just opened with a URL is
+`about:blank` until its navigation commits. `findWatchWindowCandidates()`
+treated blank tabs as ignorable, so the user's window (pinned twitch tabs +
+inventory + that tab) looked like our restored watch window and
+`adoptExistingWatchWindow()` closed every tab but the inventory. Observed live
+with the signed 0.6.15 in a normal Firefox launch on a copy of the profile:
+the `/drops/campaigns` tab given on the command line came up as
+`/drops/inventory`.
+`sweepStaleWatchLeftovers()` shared the flaw (it closes whole windows).
+
+**Fix 2:** a tab whose `status` is `loading` is never blank; and a window that
+only qualifies thanks to a blank tab is looked at again after
+`ADOPT_SETTLE_MS` (1.5 s) and adopted/closed only if it still qualifies, using
+the second look's tab list (`findSettledWatchWindowCandidates()`, used by both
+adoption and the sweep). Windows without a blank tab are handled immediately as
+before.
+
+**Problem 3 - a rejected claim was retried every few seconds for ever:**
+content.js clicked a claim button and never looked whether the claim went
+through, so a button that stays (Twitch rejecting the claim, see above) was
+clicked again at every 5 s scan - by every open tab that shows it; every click
+also wrote `lastClaim` and made background.js reload the inventory tab.
+
+**Fix 3:** the claim state lives in background.js, per reward and shared by
+every tab (first built per tab in `sessionStorage`, replaced before release:
+a per-tab count restarts whenever the inventory tab is closed/reopened - it is
+reloaded every 15 min - and several tabs each ran their own schedule).
+- Before clicking, content.js asks background.js (`claimAsk`); background says
+  no while the reward is backing off, once it is given up for the browser
+  session, and while another tab holds it (`inflightAt`, held from the yes
+  until the verdict or `CLAIM_INFLIGHT_TTL_MS` = 60 s, so a tab that dies
+  costs no failure) - of several tabs looking at the same button one clicks
+  per round. The decision and the bookkeeping have no `await` between them,
+  so two tabs asking in the same instant cannot both get a yes.
+- `CLAIM_VERIFY_MS` (12 s) after a click the tab judges it (`verifyClaim()`):
+  no claim button for that reward left (checked by reward key, not by element -
+  React may replace the node) = claimed, and only now is it recorded as the last
+  claim and the inventory refresh requested; still there = rejected. The tab
+  sends `claimResult {key, ok}` and background.js counts: waits 1 -> 5 -> 15 min
+  (`CLAIM_BACKOFF_MS`) and gives up on the reward after `CLAIM_MAX_FAILURES` = 4
+  failures in a row (no 60 min step). A success forgets the reward. A tab that
+  switches off or navigates away before its verdict sends `claimRelease`.
+- The state is kept in memory and mirrored into `storage.session` (without the
+  in-flight hold), so it survives closing/reopening the inventory tab and a
+  background-page reload inside one browser session; a new browser session
+  (`resetStateForNewBrowserSession`) clears both and `claimHealth`.
+- Reward key = the alt text of the reward image in the button's own card, else
+  the button's label (all anonymous buttons then back off together). No answer
+  from background = no click.
+- background.js logs one line per verdict into the debug log (`claim rejected,
+  likely integrity - backing off N min for "<reward>" (failure k/4)`, `... not
+  retrying "<reward>" this session`, `claim went through: "<reward>"`) - the
+  lines a bug report shows, unlike content.js's console - and keeps
+  `claimHealth.streak` (rejected claims in a row across rewards, reset by any
+  success) for the popup: at `CLAIM_WARN_STREAK` (3) it shows `claim_fail_warning`
+  (all 9 languages) telling the user to claim by hand on the inventory page or
+  check their session. Scans that find only buttons that are backing off are
+  throttled like clicks.
+Not verified: what Twitch's real claim button DOM looks like (the reward-key
+lookup is best effort).
+
+**Testing note - do not use web-ext/RDP to decide this:** Drops-only GQL
+operations failed the integrity check in EVERY web-ext/RDP test environment
+used for this entry (do-nothing extension, observe-only probe, 0.6.15, 0.6.16;
+one early run listed campaigns, all later ones did not, including pristine
+profile copies), so what happens in a user's normal Firefox cannot be read off
+those launches - they are rated differently, and driving a real logged-in
+session that way may itself count against the account. From here on: unit tests
+with a fake DOM/clock only, no live runs with the user's cookies. The live
+observations below were made before that rule and are kept as recorded.
+
+**Verified live** (copy of the user's profile, web-ext + RDP, extension
+0.6.16 confirmed running: `BUILD_MARKER = 2026-09-30-r1`, manifest 0.6.16 -
+this is the state before Fix 3, which has unit tests only):
+decoy buttons on `/drops/campaigns` not clicked in 30 s (0.6.15: clicked, see
+above); the start-URL tab survived and the watch window opened normally; on
+the inventory page the real "Claim Now" buttons are still clicked (the
+mutation is then rejected by Twitch, see above). Not verified live: the
+adoption race with 0.6.16 (needs the installed, signed extension in a normal
+launch - the temporary web-ext install starts differently and the tab
+survived there with 0.6.15 too, so only the unit tests exercise the fix);
+that `/drops/campaigns` lists the same campaigns as a browser without the
+extension, and `openCampaigns` (both need a session Twitch's integrity check
+accepts - not available in any test launch).
+
+**Tests:** new `test/claim-scan-scope.test.js` (4 cases: no scan on
+campaigns/directory/home/settings/VOD, still claims on inventory and channel
+pages, single-page navigation honoured at click time, 15-label matching table)
+- fails against 0.6.15 at "campaigns page must never be scanned".
+`test/session-windows.test.js` gains 3 race cases (still-loading user tab,
+blank tab that navigates during the settle wait, sweep leaving a window whose
+blank tab navigates) - each fails alone against 0.6.15's background.js; its
+`bgSrc()` shortens the settle delay for speed. New
+`test/claim-backoff.test.js` (10 cases: fake tabs, each with its own fake DOM and
+the real content.js, talking to ONE real background.js on a fake clock): an
+unclaimable button is clicked at 0, 75, 390, 1305 s (1 -> 5 -> 15 min, then
+given up) and never again in 4 hours - against 0.6.15 the same fixture is
+clicked every 5 s (2881 clicks); three tabs seeing the same button at the same
+instant produce exactly one click per round (4 rounds, the same schedule);
+closing and reopening the inventory tab keeps the count (clicks at 0, 75, 391,
+1306 s - 4 attempts in all, not 4 more); a claim that goes through is recorded
+only after the verdict and leaves no state; rewards back off independently; a
+tab that dies before its verdict frees the reward after 60 s at no cost;
+switching a tab off releases it; state survives a background reload
+(`storage.session`) and a new browser session clears it and the popup
+warning; streak / given-up list / log lines / reset on success; schedule
+helpers and popup wiring. Mutation-checked: dropping the in-flight hold,
+ignoring stored state, or not clearing `storage.session` on a new session each
+fail a test. `claim-scan-scope.test.js` answers `claimAsk` with yes (it tests
+which buttons/pages, not backoff). All 14 test files pass; `web-ext lint`
+clean (0/0/0); i18n key parity holds (77/language).
+
+`BUILD_MARKER` -> `2026-09-30-r3`, `manifest.json` -> 0.6.16.

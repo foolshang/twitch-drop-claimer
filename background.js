@@ -431,7 +431,9 @@ async function resetStateForNewBrowserSession() {
   const { tdcSessionStarted } = await browser.storage.session.get("tdcSessionStarted");
   if (tdcSessionStarted) return false;
   await browser.storage.session.set({ tdcSessionStarted: Date.now() });
-  await browser.storage.local.set({ watchTabs: {}, watchMeta: {}, dropSignals: {}, watchWindowId: null });
+  await browser.storage.local.set({ watchTabs: {}, watchMeta: {}, dropSignals: {}, watchWindowId: null, claimHealth: null });
+  claimBackoff = new Map(); // and every reward's claim backoff (see getClaimBackoff)
+  try { await browser.storage.session.set({ claimBackoff: {} }); } catch { /* best effort */ }
   log("new browser session (or the extension was just loaded): forgot remembered watch tab/window ids");
   return true;
 }
@@ -448,7 +450,15 @@ const isTwitchUrl = (u) => /^https?:\/\/([^/]+\.)?twitch\.tv(\/|$)/.test(u || ""
 // for ADOPTING a window (a lone-inventory window from before an extension
 // reload is still ours to reuse); CLOSING one always uses the strict form,
 // since a user looking at their inventory in a window of its own must be safe.
-const isBlankTab = (u) => /^about:(blank|home|newtab)$/.test(u || "");
+// A tab that is still loading is never "blank": a tab the user just opened with
+// a URL (Firefox started with one, a link opened in a new tab) reports
+// about:blank until its navigation commits, and treating it as blank made the
+// user's window look like ours - adoption then closed their campaigns tab.
+const isBlankTab = (t) => /^about:(blank|home|newtab)$/.test(t.url || "") && t.status !== "loading";
+// How long a window that only qualifies thanks to a blank tab must keep
+// qualifying before we adopt or close it (a navigation that has not reported
+// "loading" yet has committed by then).
+const ADOPT_SETTLE_MS = 1_500;
 const isInventoryTab = (t) => isTwitchUrl(t.url) && /\/drops\/inventory/.test(t.url || "");
 async function findWatchWindowCandidates({ loose = false } = {}) {
   let wins;
@@ -458,16 +468,29 @@ async function findWatchWindowCandidates({ loose = false } = {}) {
   return (wins || []).filter((w) => {
     const tabs = w.tabs || [];
     return tabs.length > 0 &&
-      tabs.every((t) => (t.pinned && isTwitchUrl(t.url)) || isInventoryTab(t) || isBlankTab(t.url)) &&
+      tabs.every((t) => (t.pinned && isTwitchUrl(t.url)) || isInventoryTab(t) || isBlankTab(t)) &&
       tabs.some(isInventoryTab) &&
       (loose || tabs.some((t) => t.pinned && isTwitchUrl(t.url)));
   });
 }
 
+// findWatchWindowCandidates() for the callers that ADOPT or CLOSE what it
+// returns. A window that qualifies only because a tab is momentarily blank
+// (the user's new tab before its navigation commits) is looked at again after
+// ADOPT_SETTLE_MS and kept only if it still qualifies; the tab lists of the
+// second look are returned, so nothing that navigated in between is touched.
+async function findSettledWatchWindowCandidates(opts) {
+  const first = await findWatchWindowCandidates(opts);
+  if (!first.some((w) => w.tabs.some(isBlankTab))) return first;
+  await new Promise((resolve) => setTimeout(resolve, ADOPT_SETTLE_MS));
+  const firstIds = new Set(first.map((w) => w.id));
+  return (await findWatchWindowCandidates(opts)).filter((w) => firstIds.has(w.id));
+}
+
 async function adoptExistingWatchWindow() {
-  const strict = await findWatchWindowCandidates();
+  const strict = await findSettledWatchWindowCandidates();
   const strictIds = new Set(strict.map((w) => w.id));
-  const loose = (await findWatchWindowCandidates({ loose: true })).filter((w) => !strictIds.has(w.id));
+  const loose = (await findSettledWatchWindowCandidates({ loose: true })).filter((w) => !strictIds.has(w.id));
   const candidates = [...strict, ...loose]; // an unmistakable watch window is preferred
   if (candidates.length === 0) return null;
   const [keep, ...others] = candidates;
@@ -492,7 +515,7 @@ async function sweepStaleWatchLeftovers() {
   const { watchWindowId } = await browser.storage.local.get("watchWindowId");
   if (!watchWindowId) return;
   let closedInventoryWindow = false;
-  for (const w of await findWatchWindowCandidates()) {
+  for (const w of await findSettledWatchWindowCandidates()) {
     if (w.id === watchWindowId) continue;
     log("closing a stale watch window", w.id, "(restored from an earlier session)");
     try { await browser.windows.remove(w.id); closedInventoryWindow = true; } catch { /* already gone */ }
@@ -556,6 +579,95 @@ async function openInventoryIfMissing() {
       log("opened inventory tab");
     }
   }
+}
+
+// ---- claim backoff, one state for every tab --------------------------------
+// content.js (any tab) asks `claimAsk` before it clicks a claim button and
+// reports the verdict 12 s later (`claimResult`, see verifyClaim there);
+// background.js owns the per-reward state (shared.js: CLAIM_*):
+//   { f: failures in a row, next: earliest next click, stop: given up }
+// plus, in memory only, `inflightAt`: a tab holds the reward's claim from the
+// moment `claimAsk` said yes until its verdict, so of several tabs looking at
+// the same button only one clicks per round (a tab that dies before reporting
+// stops holding it after CLAIM_INFLIGHT_TTL_MS, no failure counted). The state
+// outlives any tab (closing/reopening the inventory does not reset it) and is
+// mirrored into storage.session; a new browser session forgets it (see
+// resetStateForNewBrowserSession). The decision + bookkeeping in each handler
+// has no await between reading and writing the map, so two tabs asking in the
+// same instant cannot both be told yes.
+const CLAIM_INFLIGHT_TTL_MS = 60_000;
+let claimBackoff = null; // Map: reward key -> { f, next, stop, inflightAt? }
+
+async function getClaimBackoff() {
+  if (claimBackoff) return claimBackoff;
+  let stored = {};
+  try {
+    if (browser.storage.session) stored = (await browser.storage.session.get("claimBackoff")).claimBackoff || {};
+  } catch { /* no per-session storage: memory only */ }
+  if (!claimBackoff) claimBackoff = new Map(Object.entries(stored)); // a concurrent caller / reset may have set it meanwhile
+  return claimBackoff;
+}
+
+function saveClaimBackoff() {
+  if (!browser.storage.session || !claimBackoff) return;
+  const out = {};
+  for (const [key, st] of claimBackoff) out[key] = { f: st.f, next: st.next, stop: st.stop };
+  browser.storage.session.set({ claimBackoff: out }).catch(() => {});
+}
+
+async function handleClaimAsk(msg) {
+  const map = await getClaimBackoff();
+  const key = String(msg.key || "");
+  const now = Date.now();
+  const st = map.get(key);
+  if (!claimBackoffAllows(st, now)) return { allowed: false, reason: st.stop ? "stopped" : "backoff" };
+  if (st && st.inflightAt && now - st.inflightAt < CLAIM_INFLIGHT_TTL_MS) return { allowed: false, reason: "in-flight" };
+  map.set(key, { f: 0, next: 0, stop: false, ...(st || {}), inflightAt: now });
+  return { allowed: true };
+}
+
+// the tab that was told yes will not click after all (switched off, navigated away)
+async function handleClaimRelease(msg) {
+  const map = await getClaimBackoff();
+  const st = map.get(String(msg.key || ""));
+  if (!st) return;
+  delete st.inflightAt;
+  if (!st.f && !st.stop) map.delete(String(msg.key || ""));
+}
+
+// Verdict on a claim. Also keeps storage.local `claimHealth` for the popup:
+// `streak` is the number of rejected claims in a row with no success in
+// between (across rewards), `stopped` the rewards given up on this session.
+// The lines logged here are the ones a bug report shows (content.js's own
+// console lines never reach the report).
+async function handleClaimResult(msg) {
+  const map = await getClaimBackoff();
+  const key = String(msg.key || "?");
+  const now = Date.now();
+  const { claimHealth } = await browser.storage.local.get("claimHealth");
+  const h = claimHealth && typeof claimHealth === "object" ? claimHealth : {};
+  const stopped = new Set(Array.isArray(h.stopped) ? h.stopped : []);
+  let streak;
+  if (msg.ok) {
+    streak = 0;
+    stopped.delete(key);
+    map.delete(key);
+    log(`claim went through: "${key}"`);
+  } else {
+    streak = (h.streak || 0) + 1;
+    const next = claimBackoffAfterFailure(map.get(key), now); // no inflightAt: the round is over
+    map.set(key, next);
+    if (next.stop) {
+      stopped.add(key);
+      log(`claim rejected ${next.f} times in a row, likely integrity - not retrying "${key}" this session`);
+    } else {
+      log(`claim rejected, likely integrity - backing off ${Math.round((next.next - now) / 60_000)} min for "${key}" (failure ${next.f}/${CLAIM_MAX_FAILURES})`);
+    }
+  }
+  saveClaimBackoff();
+  await browser.storage.local.set({
+    claimHealth: { streak, stopped: [...stopped], lastFailureAt: msg.ok ? (h.lastFailureAt || null) : now },
+  });
 }
 
 let dropClaimedDebounce = null;
@@ -1930,6 +2042,15 @@ browser.runtime.onMessage.addListener((msg, sender) => {
 
     case "dropClaimed":
       return handleDropClaimed();
+
+    case "claimAsk":
+      return handleClaimAsk(msg);
+
+    case "claimRelease":
+      return handleClaimRelease(msg);
+
+    case "claimResult":
+      return handleClaimResult(msg);
 
     default:
       return undefined;

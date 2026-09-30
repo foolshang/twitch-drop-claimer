@@ -12,7 +12,12 @@
  *   - a restored window that looks like ours is adopted, not duplicated, and
  *     its stale tabs are closed;
  *   - later-restored look-alike windows and leftover pinned campaigns tabs
- *     are swept, the user's own windows never are.
+ *     are swept, the user's own windows never are;
+ *   - a tab the user just opened (still about:blank while its navigation
+ *     commits) never makes their window look like ours: verified live
+ *     2026-09-30 - the /drops/campaigns tab opened at Firefox start was
+ *     replaced by the inventory because adoption saw a "blank" tab and closed
+ *     everything else in the window.
  */
 
 const vm = require("vm");
@@ -22,6 +27,10 @@ const assert = require("assert");
 
 const ROOT = path.join(__dirname, "..");
 const read = (f) => fs.readFileSync(path.join(ROOT, f), "utf8");
+// background.js with the adoption settle delay shortened so the race tests
+// stay fast (a no-op replace against a background.js that predates the constant)
+const SETTLE_MS = 60;
+const bgSrc = () => read("background.js").replace(/ADOPT_SETTLE_MS = [\d_]+/, `ADOPT_SETTLE_MS = ${SETTLE_MS}`);
 
 const INV = "https://www.twitch.tv/drops/inventory";
 const CAMP = "https://www.twitch.tv/drops/campaigns";
@@ -116,7 +125,7 @@ function makeWorld({ session = "none", local = {}, windows, tabs }) {
   const flush = (ms = 80) => new Promise((r) => setTimeout(r, ms));
   return {
     ctx, storageLocal, storageSession, winMap, tabMap, created, removed, flush,
-    boot: async () => { vm.runInContext(read("background.js"), ctx); await flush(150); },
+    boot: async () => { vm.runInContext(bgSrc(), ctx); await flush(150); },
     tick: async () => { await vm.runInContext("serialized(autoWatchTick)", ctx); await flush(); },
     tabsIn: (winId) => [...tabMap.values()].filter((t) => t.windowId === winId),
   };
@@ -193,7 +202,7 @@ async function testLateRestoredLookalikeWindowIsSwept() {
     ],
   });
   await vm.runInContext("void 0", w.ctx);
-  vm.runInContext(read("background.js"), w.ctx); // boot (session marker present -> no reset)
+  vm.runInContext(bgSrc(), w.ctx); // boot (session marker present -> no reset)
   await w.flush(150);
   await w.tick();
 
@@ -215,7 +224,7 @@ async function testSweepReopensInventoryIfItWasOnlyInTheStaleWindow() {
       { id: 4, windowId: 11, url: "https://www.twitch.tv/old", pinned: true },
     ],
   });
-  vm.runInContext(read("background.js"), w.ctx);
+  vm.runInContext(bgSrc(), w.ctx);
   await w.flush(150);
   await w.tick();
   assert.ok(!w.winMap.has(11), "stale window closed");
@@ -258,7 +267,7 @@ async function testSignatureBoundaries() {
   for (const [label, expected, tabs] of cases) {
     // enabled:false so loading background.js does no scheduling of its own while we look
     const w = makeWorld({ session: { tdcSessionStarted: 1 }, local: { enabled: false }, windows: [5], tabs });
-    vm.runInContext(read("background.js"), w.ctx);
+    vm.runInContext(bgSrc(), w.ctx);
     await w.flush(30);
     const found = await vm.runInContext("findWatchWindowCandidates", w.ctx)();
     assert.strictEqual(found.length === 1, expected, label);
@@ -289,7 +298,7 @@ async function testLoneInventoryWindowIsAdoptedButNeverClosed() {
       { id: 2, windowId: 20, url: INV, pinned: false }, // the user reading their inventory in a window of its own
     ],
   });
-  vm.runInContext(read("background.js"), sweep.ctx);
+  vm.runInContext(bgSrc(), sweep.ctx);
   await sweep.flush(150);
   await sweep.tick();
   assert.ok(sweep.winMap.has(20), "a user's lone-inventory window is never closed");
@@ -312,6 +321,71 @@ async function testNoSessionStorageKeepsOldBehaviour() {
   console.log("  OK  a Firefox without storage.session behaves exactly as before");
 }
 
+
+// Firefox reports a tab opened with a URL as about:blank until the navigation
+// commits. Model the commit as a delayed url/status change on the fake tab.
+const navigateLater = (w, id, url, ms) => setTimeout(() => {
+  const t = w.tabMap.get(id);
+  if (t) { t.url = url; t.status = "complete"; }
+}, ms);
+const raceWindow = (blankTab) => ({
+  session: {}, // fresh browser session -> adoption runs at boot
+  local: { watchWindowId: null },
+  windows: [1],
+  tabs: [
+    { id: 1, windowId: 1, url: INV, pinned: true, status: "complete" },
+    { id: 2, windowId: 1, url: "https://www.twitch.tv/somechannel", pinned: true, status: "complete" },
+    { id: 3, windowId: 1, ...blankTab }, // the user's own tab, opened at browser start
+  ],
+});
+
+async function testUsersLoadingTabIsNotClosedByAdoption() {
+  const w = makeWorld(raceWindow({ url: "about:blank", pinned: false, status: "loading" }));
+  navigateLater(w, 3, CAMP, 20);
+  await w.boot();
+  await w.flush(SETTLE_MS * 3);
+  assert.ok(w.tabMap.has(3), "the user's still-loading tab is not closed");
+  assert.strictEqual(w.tabMap.get(3).url, CAMP, "and it ends up on the page they asked for");
+  assert.notStrictEqual(w.storageLocal.watchWindowId, 1, "their window is not adopted as the watch window");
+  assert.ok(w.tabMap.has(1) && w.tabMap.has(2), "no tab of theirs is touched");
+  console.log("  OK  race: a still-loading user tab keeps its window from being adopted (campaigns tab survives)");
+}
+
+async function testBlankTabThatNavigatesDuringSettleIsNotClosed() {
+  // worst case: the tab still reports status "complete" on the first look
+  const w = makeWorld(raceWindow({ url: "about:blank", pinned: false, status: "complete" }));
+  navigateLater(w, 3, CAMP, 15);
+  await w.boot();
+  await w.flush(SETTLE_MS * 3);
+  assert.ok(w.tabMap.has(3), "a blank tab that navigated during the settle wait is not closed");
+  assert.strictEqual(w.tabMap.get(3).url, CAMP);
+  assert.notStrictEqual(w.storageLocal.watchWindowId, 1, "the window is not adopted once it stopped looking like ours");
+  console.log("  OK  race: a blank tab that commits its navigation during the settle wait is re-checked and left alone");
+}
+
+async function testSweepDoesNotCloseWindowWithNavigatingTab() {
+  const w = makeWorld({
+    session: { tdcSessionStarted: 1 },
+    local: { watchWindowId: 10 },
+    windows: [10, 11],
+    tabs: [
+      { id: 1, windowId: 10, url: INV, pinned: true, status: "complete" },
+      { id: 2, windowId: 10, url: "https://www.twitch.tv/somechannel", pinned: true, status: "complete" },
+      { id: 3, windowId: 11, url: INV, pinned: true, status: "complete" },
+      { id: 4, windowId: 11, url: "https://www.twitch.tv/old", pinned: true, status: "complete" },
+      { id: 5, windowId: 11, url: "about:blank", pinned: false, status: "complete" }, // user's new tab, about to navigate
+    ],
+  });
+  navigateLater(w, 5, CAMP, 15);
+  vm.runInContext(bgSrc(), w.ctx);
+  await w.flush(150);
+  await w.tick();
+  await w.flush(SETTLE_MS * 3);
+  assert.ok(w.winMap.has(11), "a window whose blank tab just navigated is never closed as a stale watch window");
+  assert.ok(w.tabMap.has(5) && w.tabMap.get(5).url === CAMP, "and the user's campaigns tab is intact");
+  console.log("  OK  race: the stale-window sweep re-checks and leaves a window alone once its blank tab navigates");
+}
+
 (async () => {
   console.log("Running session/window tests (no real browser, no network)...\n");
   try {
@@ -322,6 +396,9 @@ async function testNoSessionStorageKeepsOldBehaviour() {
     await testSignatureBoundaries();
     await testLoneInventoryWindowIsAdoptedButNeverClosed();
     await testNoSessionStorageKeepsOldBehaviour();
+    await testUsersLoadingTabIsNotClosedByAdoption();
+    await testBlankTabThatNavigatesDuringSettleIsNotClosed();
+    await testSweepDoesNotCloseWindowWithNavigatingTab();
     console.log("\nALL PASSED");
     process.exit(0);
   } catch (e) {

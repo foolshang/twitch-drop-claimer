@@ -216,6 +216,18 @@
     margin-bottom: 12px;
   }
 
+  .claim-warning {
+    background: rgba(240, 147, 43, .1);
+    border: 1px solid var(--warn);
+    color: var(--warn);
+    border-radius: 6px;
+    padding: 8px 10px;
+    margin-bottom: 12px;
+    font-size: 11.5px;
+    font-weight: 600;
+    line-height: 1.45;
+  }
+
   .sleep-warning {
     background: rgba(240, 147, 43, .1);
     border: 1px solid var(--warn);
@@ -466,6 +478,7 @@
   <div class="hint" id="watchingChannelHint" data-i18n="multi_tab_hint" hidden></div>
   <div class="off-note" id="offNote" hidden></div>
   <div class="all-done-banner" id="allDoneBanner" data-i18n="all_done_banner" hidden></div>
+  <div class="claim-warning" id="claimWarning" hidden></div>
 
   <details class="sleep-warning" id="sleepWarning" hidden>
     <summary data-i18n="sleep_summary"></summary>

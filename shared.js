@@ -7,7 +7,7 @@
 // value out loud when asking for a fresh test - lets whoever's testing
 // confirm from the background console alone that Firefox is actually running
 // this exact source tree, not a stale reload/cached build/old .xpi.
-const BUILD_MARKER = "2026-09-29-r8";
+const BUILD_MARKER = "2026-09-30-r3";
 
 const ALIASES = {
   // Path of Exile
@@ -155,4 +155,34 @@ function matchOpenCampaign(input, campaigns) {
     return short.length >= 4 && long.includes(short);
   });
   return contained.length === 1 ? contained[0] : null;
+}
+
+// ---- claim backoff --------------------------------------------------------
+// A clicked claim button that is still there CLAIM_VERIFY_MS later means Twitch
+// rejected the claim (seen live: every DropsPage_ClaimDropRewards answered
+// "failed integrity check" and the button stayed, so it used to be re-clicked
+// every few seconds for ever). The state is kept by background.js, per reward
+// and shared by every tab (content.js asks before it clicks): a failure in a
+// row waits CLAIM_BACKOFF_MS[failures - 1] before the next click, and
+// CLAIM_MAX_FAILURES in a row stops that reward for the rest of the browser
+// session (so 1 -> 5 -> 15 min, then stop). A success forgets the reward.
+// State is a plain JSON object { f, next, stop } (f = failures in a row, next =
+// earliest next click, stop = given up), so it can live in storage.session.
+const CLAIM_VERIFY_MS = 12_000;
+const CLAIM_BACKOFF_MS = [60_000, 300_000, 900_000];
+const CLAIM_MAX_FAILURES = 4;
+// consecutive rejected claims (across all rewards, no success in between)
+// before the popup tells the user to claim by hand / check their session
+const CLAIM_WARN_STREAK = 3;
+
+function claimBackoffAllows(state, now) {
+  if (!state) return true;
+  if (state.stop) return false;
+  return now >= (state.next || 0);
+}
+
+function claimBackoffAfterFailure(state, now) {
+  const f = ((state && state.f) || 0) + 1;
+  if (f >= CLAIM_MAX_FAILURES) return { f, next: 0, stop: true };
+  return { f, next: now + CLAIM_BACKOFF_MS[Math.min(f - 1, CLAIM_BACKOFF_MS.length - 1)], stop: false };
 }

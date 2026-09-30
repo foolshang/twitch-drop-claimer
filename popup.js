@@ -69,6 +69,7 @@ const $powerStatusText = document.getElementById("powerStatusText");
 const $infoPanel = document.getElementById("infoPanel");
 const $offNote = document.getElementById("offNote");
 const $allDoneBanner = document.getElementById("allDoneBanner");
+const $claimWarning = document.getElementById("claimWarning");
 const $sleepWarning = document.getElementById("sleepWarning");
 const $watchingChannel = document.getElementById("watchingChannel");
 const $watchingChannelHint = document.getElementById("watchingChannelHint");
@@ -397,7 +398,7 @@ async function renderGameStatus() {
   const cfg = await browser.storage.local.get([
     "watchList", "autoWatchEnabled", "watchPhase", "watchTabs",
     "invalidSlugs", "campaignProgress", "priorityMode", "emptyUntil",
-    "openCampaigns", "gameWaitUntil",
+    "openCampaigns", "gameWaitUntil", "claimHealth",
   ]);
   const watchList = cfg.watchList || [];
   const openCampaigns = cfg.openCampaigns || null;
@@ -411,6 +412,12 @@ async function renderGameStatus() {
   const priorityMode = cfg.priorityMode || "list-order";
 
   $allDoneBanner.hidden = cfg.watchPhase !== "all-done";
+  // every recent claim was rejected by Twitch (content.js's verifyClaim): tell
+  // the user to claim by hand / check the session instead of leaving them to
+  // wonder why nothing is ever claimed
+  const claimStreak = (cfg.claimHealth && cfg.claimHealth.streak) || 0;
+  $claimWarning.hidden = claimStreak < CLAIM_WARN_STREAK;
+  if (!$claimWarning.hidden) $claimWarning.textContent = t("claim_fail_warning", { n: claimStreak });
   // Firefox has no way for an extension to keep the machine awake (no
   // browser.power API, and Screen Wake Lock API rejects on a background tab
   // - verified live, not assumed) - the only real mitigation is the OS
@@ -589,7 +596,7 @@ browser.storage.onChanged.addListener((changes, area) => {
     changes.watchList || changes.watchTabs || changes.autoWatchEnabled ||
     changes.watchPhase || changes.invalidSlugs || changes.campaignProgress ||
     changes.priorityMode || changes.emptyUntil ||
-    changes.openCampaigns || changes.gameWaitUntil
+    changes.openCampaigns || changes.gameWaitUntil || changes.claimHealth
   ) {
     renderGameStatus();
   }

@@ -3,7 +3,8 @@
  * (loaded after shared.js - toSlug/ALIASES/channelFromUrl/directoryUrl come from there)
  *
  * Runs in several contexts:
- * 1. Any twitch.tv page  -> claim drop buttons wherever they appear
+ * 1. Inventory and channel pages -> claim drop buttons wherever they appear
+ *    (never scanned elsewhere, e.g. /drops/campaigns - see isClaimScanPage)
  * 2. Directory page (/directory/category/<slug>?filter=drops), when this tab
  *    is the designated "watch tab" -> pick the live channel with the fewest
  *    viewers and navigate to it
@@ -52,16 +53,24 @@
     'div[class*="callout"] button[class*="primary"]',
   ];
 
-  // button text/aria-label considered a claim button (supports multiple UI languages)
+  // button text/aria-label considered a claim button (supports multiple UI languages).
+  // Whole-string matches only: the bare Thai "รับ" ("receive") is also the start
+  // of unrelated labels such as "รับชม…" ("watch"), and "claim" is the start of
+  // "claimed…", so neither may be matched by prefix.
   const CLAIM_TEXTS = [
     "claim", "claim now", "claim drop", "claim your reward", "claim reward",
     "รับรางวัล", "รับ",
   ];
+  // aria-labels that carry the reward name after the verb ("Claim Drop: <name>")
+  // may match by prefix, but only when the verb is a whole word and not the
+  // already-claimed form.
+  const CLAIM_ARIA_PREFIXES = [/^claim(?![a-z])/, /^รับรางวัล(?!แล้ว)/];
 
   function textMatches(el) {
     const t = (el.textContent || "").trim().toLowerCase();
     const aria = (el.getAttribute("aria-label") || "").trim().toLowerCase();
-    return CLAIM_TEXTS.some((c) => t === c || aria === c || aria.startsWith(c));
+    return CLAIM_TEXTS.some((c) => t === c || aria === c) ||
+      CLAIM_ARIA_PREFIXES.some((re) => re.test(aria));
   }
 
   function findClaimButtons() {
@@ -93,26 +102,102 @@
     }
   }
 
-  function clickClaims(reason) {
+  // ---- claim verification + backoff (CLAIM_* in shared.js; state in background.js) --
+  // Clicking is not claiming: seen live, Twitch answered every claim with
+  // "failed integrity check" and the button just stayed, so it used to be
+  // clicked again every few seconds for ever (and each click also told
+  // background.js to reload the inventory tab). Now:
+  //   - before clicking, background.js is asked whether this reward may be
+  //     claimed right now (`claimAsk`): not while it is backing off, not once
+  //     given up for the browser session, and not while another tab holds it -
+  //     of several tabs looking at the same button only one clicks per round;
+  //   - CLAIM_VERIFY_MS after the click the verdict is judged - no claim button
+  //     for that reward left = claimed - and sent back (`claimResult`);
+  //     background.js keeps the failure count and the next-allowed time, so it
+  //     survives closing/reopening this tab (1 -> 5 -> 15 min, then it gives up).
+  const awaitingClaimVerify = new Set(); // reward keys clicked by THIS tab, verdict pending
+  const claimVerifyTimeoutIds = new Set();
+  let claimScanBusy = false; // a scan is waiting for background.js's answers
+
+  function sendClaimMessage(msg) {
+    try { return browser.runtime.sendMessage(msg); } catch (e) { return Promise.reject(e); }
+  }
+  // no answer (background gone) = no click: never claim without the shared state
+  const askClaimGate = (key) => sendClaimMessage({ type: "claimAsk", key })
+    .then((r) => !!(r && r.allowed))
+    .catch(() => false);
+  const releaseClaim = (key) => { sendClaimMessage({ type: "claimRelease", key }).catch(() => {}); };
+
+  // Which reward a claim button belongs to: the alt text of the reward image in
+  // the nearest ancestor that holds this one claim button (best effort - the
+  // markup was never directly inspectable). Falls back to the button's own
+  // label, which is shared by every anonymous button: conservative, they back
+  // off together.
+  function claimKey(btn) {
+    let el = btn;
+    for (let i = 0; el && i < 6; i++, el = el.parentElement) {
+      if (el.querySelectorAll &&
+          [...el.querySelectorAll('button, [role="button"]')].filter(textMatches).length > 1) break; // several rewards in here
+      const img = el.querySelector && el.querySelector("img[alt]");
+      const alt = img && (img.getAttribute("alt") || "").trim();
+      if (alt) return alt;
+    }
+    const label = (btn.getAttribute("aria-label") || btn.textContent || "").trim();
+    return `claim:${label}`;
+  }
+
+  function verifyClaim(key, text) {
+    awaitingClaimVerify.delete(key);
+    if (!enabled || !isClaimScanPage()) { releaseClaim(key); return; } // switched off / navigated away: no verdict
+    const stillThere = findClaimButtons().some((b) => claimKey(b) === key);
+    if (stillThere) log(`claim of "${key}" was rejected (the button is still there) - background.js decides when to retry`);
+    else recordClaim(text);
+    sendClaimMessage({ type: "claimResult", key, ok: !stillThere }).catch(() => {});
+  }
+
+  async function clickClaims(reason) {
     if (!enabled) return; // in case a queued callback fires after the switch was already turned off
+    // Twitch is a single-page app, so the path can change without a reload -
+    // checked on every call, not once at start(). Claim buttons only exist on
+    // the inventory and on channel pages; everywhere else (notably
+    // /drops/campaigns, full of accordion buttons) nothing may be clicked.
+    if (!isClaimScanPage()) return;
 
     const now = Date.now();
     if (now - lastClickAt < CLICK_COOLDOWN_MS) return;
+    if (claimScanBusy) return;
 
     const buttons = findClaimButtons();
     if (buttons.length === 0) return;
 
-    for (const btn of buttons) {
-      try {
-        const text = (btn.textContent || "").trim();
-        btn.click();
-        log(`claimed via ${reason}:`, text);
-        recordClaim(text);
-      } catch (e) {
-        log("click failed:", e);
-      }
-    }
+    // also throttles scans that find only buttons that are backing off
     lastClickAt = now;
+    claimScanBusy = true;
+    try {
+      for (const btn of buttons) {
+        const key = claimKey(btn);
+        if (awaitingClaimVerify.has(key)) continue; // clicked moments ago, verdict pending
+        if (!(await askClaimGate(key))) continue; // backing off / given up / another tab has it
+        // told yes; the page or the switch may have changed while waiting
+        if (!enabled || !isClaimScanPage() || btn.isConnected === false) { releaseClaim(key); continue; }
+        try {
+          const text = (btn.textContent || "").trim();
+          btn.click();
+          log(`claimed via ${reason}:`, text);
+          awaitingClaimVerify.add(key);
+          const id = setTimeout(() => {
+            claimVerifyTimeoutIds.delete(id);
+            verifyClaim(key, text);
+          }, CLAIM_VERIFY_MS);
+          claimVerifyTimeoutIds.add(id);
+        } catch (e) {
+          log("click failed:", e);
+          releaseClaim(key);
+        }
+      }
+    } finally {
+      claimScanBusy = false;
+    }
   }
 
   // =========================================================================
@@ -129,6 +214,11 @@
 
   function isInventoryPage() {
     return location.pathname.startsWith("/drops/inventory");
+  }
+
+  // the only pages where claim buttons are scanned for and clicked
+  function isClaimScanPage() {
+    return isInventoryPage() || isChannelPage();
   }
 
   // A slug that doesn't map to any real Twitch category doesn't always
@@ -983,6 +1073,11 @@
       inventoryWaitTimeoutId = inventoryFirstScanTimeoutId =
       initialScanTimeoutId = channelWatchIntervalId = directoryIntervalId =
       searchResolveTimeoutId = playerNudgeTimeoutId = null;
+
+    claimVerifyTimeoutIds.forEach((id) => clearTimeout(id));
+    claimVerifyTimeoutIds.clear();
+    awaitingClaimVerify.forEach((key) => releaseClaim(key)); // pending verdicts are cancelled: let another tab have the reward
+    awaitingClaimVerify.clear();
 
     log("stopped");
   }
