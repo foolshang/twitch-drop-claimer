@@ -118,6 +118,10 @@
   const awaitingClaimVerify = new Set(); // reward keys clicked by THIS tab, verdict pending
   const claimVerifyTimeoutIds = new Set();
   let claimScanBusy = false; // a scan is waiting for background.js's answers
+  const awaitingClaimBtn = new Map(); // reward key -> the button clicked (to find its game)
+  const unmatchedClicks = []; // { key, at }: our clicks whose claim request inject.js has not reported yet
+  const claimKeyBySeq = new Map(); // inject.js's claim request number -> reward key
+  const notLinkedKeys = new Set(); // rewards whose claim was refused: the game account is not connected
 
   function sendClaimMessage(msg) {
     try { return browser.runtime.sendMessage(msg); } catch (e) { return Promise.reject(e); }
@@ -146,8 +150,59 @@
     return `claim:${label}`;
   }
 
+  // ---- a claim refused because the game account is not connected -----------
+  // inject.js (page world) reports every claim request (`claimRequest`, numbered)
+  // and, for a refusal that says the account is not connected, `claimNotLinked`
+  // with the same number. Each request belongs to the oldest click of ours that
+  // has no request yet, which tells which reward was refused. That is not an
+  // integrity problem and not a failed attempt: background.js stops that one
+  // reward for the session and the popup says to connect the account.
+  const CLAIM_REQUEST_MATCH_MS = 10_000;
+
+  function gameIdOfCard(btn) {
+    let el = btn;
+    for (let i = 0; el && i < 10; i++, el = el.parentElement) {
+      const img = el.querySelector && el.querySelector('img[src*="_IGDB-"]');
+      const m = img && String(img.src || (img.getAttribute && img.getAttribute("src")) || "").match(/\/(\d+)_IGDB-/);
+      if (m) return m[1];
+    }
+    return null;
+  }
+
+  async function onClaimNotLinked(key) {
+    if (notLinkedKeys.has(key)) return;
+    notLinkedKeys.add(key);
+    log(`claim of "${key}" refused: the game account is not connected`);
+    let game = null;
+    try {
+      const id = gameIdOfCard(awaitingClaimBtn.get(key));
+      if (id) game = ((await browser.storage.local.get("gameIdMap")).gameIdMap || {})[id] || null;
+    } catch { /* the game name is only a nicety */ }
+    sendClaimMessage({ type: "claimNotLinked", key, game }).catch(() => {});
+  }
+
+  function onPageSignal(event) {
+    if (event.source !== window || event.origin !== window.location.origin) return;
+    const msg = event.data;
+    if (!msg || msg.type !== "__DROP_CLAIMER_GQL__" || !msg.payload || !msg.payload.signal) return;
+    const signal = msg.payload.signal;
+    if (!enabled) return;
+    if (signal.kind === "claimRequest") {
+      const now = Date.now();
+      while (unmatchedClicks.length && now - unmatchedClicks[0].at > CLAIM_REQUEST_MATCH_MS) unmatchedClicks.shift();
+      const click = unmatchedClicks.shift();
+      if (click) claimKeyBySeq.set(signal.seq, click.key);
+    } else if (signal.kind === "claimNotLinked") {
+      const key = claimKeyBySeq.get(signal.seq);
+      if (key && awaitingClaimVerify.has(key)) onClaimNotLinked(key);
+    }
+  }
+  if (typeof window !== "undefined" && window.addEventListener) window.addEventListener("message", onPageSignal);
+
   function verifyClaim(key, text) {
     awaitingClaimVerify.delete(key);
+    awaitingClaimBtn.delete(key);
+    if (notLinkedKeys.has(key)) return; // already dealt with: not a failed attempt
     if (!enabled || !isClaimScanPage()) { releaseClaim(key); return; } // switched off / navigated away: no verdict
     const stillThere = findClaimButtons().some((b) => claimKey(b) === key);
     if (stillThere) log(`claim of "${key}" was rejected (the button is still there) - background.js decides when to retry`);
@@ -185,6 +240,8 @@
           btn.click();
           log(`claimed via ${reason}:`, text);
           awaitingClaimVerify.add(key);
+          awaitingClaimBtn.set(key, btn);
+          unmatchedClicks.push({ key, at: Date.now() });
           const id = setTimeout(() => {
             claimVerifyTimeoutIds.delete(id);
             verifyClaim(key, text);
@@ -1078,6 +1135,8 @@
     claimVerifyTimeoutIds.clear();
     awaitingClaimVerify.forEach((key) => releaseClaim(key)); // pending verdicts are cancelled: let another tab have the reward
     awaitingClaimVerify.clear();
+    awaitingClaimBtn.clear();
+    unmatchedClicks.length = 0;
 
     log("stopped");
   }

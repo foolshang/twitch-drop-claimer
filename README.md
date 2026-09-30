@@ -164,6 +164,18 @@ occlusion tracker included) ever sees a display-off event.
    Add-on…" and select `manifest.json`, or run it through `web-ext`:
    `npx web-ext run`
 
+## Development rule: no live tests with real cookies
+
+**Never run live tests with a copy of a real user's cookies or profile** - not
+through `web-ext run`, not over the Firefox remote-debugging protocol, not with
+a copied `cookies.sqlite`. Automated/debugged Firefox sessions may carry
+signals Twitch can use to flag a session (suspected, not proven), and a flagged
+session loses Drops for the account (seen 2026-09-30: `failed integrity check`
+on every Drops-only operation until the twitch.tv cookies were cleared and the
+user logged in again). If live testing is needed, use a **separate Twitch test account** in a
+fresh profile - never someone's real one. Everything the extension does can be
+checked with the fake-DOM / fake-clock tests below.
+
 ## Permissions
 
 `alarms`, `tabs`, `storage`, `downloads`, and host access to

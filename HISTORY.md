@@ -2007,7 +2007,7 @@ submit:listed` - lint clean (0/0/0), signed and auto-approved to
 `.amo-submitted-versions.json`. Existing users see an upgrade prompt for
 the new bug-relay host permission (now https://35-188-24-245.sslip.io).
 
-## 0.6.16 - claim scan limited to inventory/channel pages, exact "รับ", adoption race
+## 0.6.16 - claim scan limited to inventory/channel pages, shared claim backoff, integrity + account-link detection, adoption race
 
 **Reported:** with 0.6.15 installed, `/drops/campaigns` showed "There are no
 Drops campaigns available currently" under Open Drop Campaigns and only
@@ -2027,10 +2027,16 @@ integrity bar to Drops-only operations. It is identical with a do-nothing
 extension, with a probe extension that only observes, and with 0.6.15, so
 `inject.js` wrapping `fetch`/XHR is not the cause (the page's own `fetch` is
 already non-native without any extension of ours). The 0.6.15 "Not reproduced"
-note above was this same failure. Not established: WHY Twitch rates the
-profile's session this way (the user is testing a cookie reset/re-login
-separately); web-ext/RDP launches are themselves rated the same way, so they
-cannot show a working list on demand (one early run did).
+note above was this same failure. **Confirmed by the user in their real
+Firefox on 2026-09-30:** clearing the twitch.tv cookies and logging in again
+brought the `/drops/campaigns` list back - Twitch had flagged the old
+session/device (a Drops-only integrity failure); it was not this extension's
+code and not any other extension. Not proven, only suspected, why that session
+was flagged: (a) 0.6.15 re-clicking rejected claims every few seconds (see
+Problem 3), (b) the web-ext/RDP live tests run since 2026-09-10 with a copy of
+the user's real cookies/profile (see "Testing note" and the README rule).
+web-ext/RDP launches are themselves rated the same way, so they cannot show a
+working list on demand (one early run did).
 
 **Consequence:** in such a session the claim mutation fails too - the
 inventory's four "Claim Now" buttons stayed unclaimed and the extension
@@ -2116,6 +2122,56 @@ reloaded every 15 min - and several tabs each ran their own schedule).
 Not verified: what Twitch's real claim button DOM looks like (the reward-key
 lookup is best effort).
 
+**Problem 4 - the user was never told that Twitch was refusing Drops:** the
+extension kept clicking (and, with Fix 3, backing off) while the popup said
+nothing, and the campaign list quietly stayed empty.
+
+**Fix 4 (integrity detection, passive - inject.js only reads what Twitch
+answers):** `INTEGRITY_EXTRACTORS` watch `ViewerDropsDashboard`, `Inventory`,
+`DropsInventoryRewardGroupStatus` and `DropsPage_ClaimDropRewards` for an
+`errors[]` message containing "failed integrity" and send `integrityFailed`.
+`dropsOpOk` is sent when `ViewerDropsDashboard`, `DropsInventoryRewardGroupStatus`
+or the claim answer normally - deliberately NOT `Inventory`, which kept working
+in a flagged session (seen live), so it proves nothing. background.js, on
+`integrityFailed`: `claimAsk` answers no for every reward in every tab at once
+(no waiting for a backoff), one log line (`Twitch refused <op> with "failed
+integrity check" - this session looks flagged for Drops. Auto-claim is stopped
+in every tab; clear twitch.tv cookies and log in again`; repeats, which come
+several times per page load, are not logged again), and the flag goes into
+`storage.session` (`integrityFlag`). It clears on `dropsOpOk` (the per-reward
+backoff state, the streak and the account-link list are reset with it: those
+refusals were the session's fault) and on a new browser session. Not counted as
+claim failures. The popup shows `integrity_warning` (all 9 languages: Twitch is
+rejecting Drops for this session - clear twitch.tv cookies and log in again),
+follows `storage.session` live, and hides the vaguer claim-streak warning while
+it shows.
+
+**Problem 5 - a claim refused because the game account is not connected looked
+like any other failed claim:** it would have backed off 1 -> 5 -> 15 min and
+fed the "Twitch keeps rejecting claims" warning although nothing is wrong with
+the session.
+
+**Fix 5:** inject.js reports `claimNotLinked` when a claim response says the
+account is not connected (an error message such as "Connect your Twitch and
+game accounts", an error code about an unconnected/unlinked account, or
+`claimDropRewards.isUserAccountConnected === false`; an integrity refusal is
+never classified this way). inject.js also numbers claim requests
+(`claimRequest`, `seq`, in request order, as they go out); content.js pairs
+each request with the oldest click of its own that has no request yet, so it
+knows WHICH reward was refused, and tells background.js (`claimNotLinked`): only
+that reward stops for the browser session (`{stop: true, notLinked: true}`), all
+other rewards keep claiming, and it never touches `claimHealth` or the integrity
+flag. The popup shows one line per refused reward - `claim_not_linked_warning`
+with the game name when the reward's card carries the boxart id that
+`gameIdMap` resolves, else the reward name - and a button opening
+`https://www.twitch.tv/drops/campaigns`. When `ViewerDropsDashboard` later
+reports `accountConnected` for that game the reward is released again.
+**Not verified:** the real shape of Twitch's "account not connected" claim
+response was never captured (the three detectors above are guesses from the
+wording the user gave and from `isUserAccountConnected` on the campaign data),
+so on a real refusal it may not fire - it then falls back to the ordinary
+failed-claim backoff, which is safe.
+
 **Testing note - do not use web-ext/RDP to decide this:** Drops-only GQL
 operations failed the integrity check in EVERY web-ext/RDP test environment
 used for this entry (do-nothing extension, observe-only probe, 0.6.15, 0.6.16;
@@ -2167,4 +2223,30 @@ fail a test. `claim-scan-scope.test.js` answers `claimAsk` with yes (it tests
 which buttons/pages, not backoff). All 14 test files pass; `web-ext lint`
 clean (0/0/0); i18n key parity holds (77/language).
 
-`BUILD_MARKER` -> `2026-09-30-r3`, `manifest.json` -> 0.6.16.
+New `test/integrity-signals.test.js` (11 cases; shared fixtures in
+`test/claim-harness.js`, which `claim-backoff.test.js` now uses too): fake GQL
+responses through the real inject.js - integrity errors of the 4 operations
+give `integrityFailed`, other errors/operations and normal responses do not
+(`dropsOpOk` only where it is proof, never for `Inventory`), old extractors
+intact, claim requests numbered in request order, an unconnected game account
+is its own signal and never an integrity failure; the real background.js with
+three real content.js tabs - after `integrityFailed` not one click in any tab
+for 90 s, any reward refused, one log line, `storage.session` flag, streak
+untouched; a normal response changes nothing; the flag clears only on a proof
+operation and resets the old refusals; a new browser session clears it, a
+background reload keeps it; tabs resume at the next scan; an account-link error
+stops only that reward (with its game), a manual claim request is not paired
+with a click, the other reward keeps being claimed, neither the streak nor the
+integrity flag move; connecting the account (campaign data) releases it;
+popup wiring and 9-language strings. They fail against the previous commit
+(`ViewerDropsDashboard: one integrityFailed signal`) and each of five mutants
+(claimAsk ignoring the flag, account-link counted in the streak, an integrity
+refusal reported as not-linked, `Inventory` as proof, no request/click pairing)
+fails a test. All 15 test files pass; `web-ext lint` clean (0/0/0); i18n key
+parity holds (80/language).
+
+`README.md` (Install (development)) now carries the permanent rule: never run live tests
+with a copy of a real user's cookies/profile; if live testing is needed, use a
+separate Twitch test account only.
+
+`BUILD_MARKER` -> `2026-09-30-r4`, `manifest.json` -> 0.6.16.

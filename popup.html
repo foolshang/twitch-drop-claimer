@@ -228,6 +228,17 @@
     line-height: 1.45;
   }
 
+  .claim-warning a, .claim-warning button.link {
+    color: var(--warn);
+    background: none;
+    border: none;
+    padding: 0;
+    margin-left: 4px;
+    font: inherit;
+    text-decoration: underline;
+    cursor: pointer;
+  }
+
   .sleep-warning {
     background: rgba(240, 147, 43, .1);
     border: 1px solid var(--warn);
@@ -478,7 +489,9 @@
   <div class="hint" id="watchingChannelHint" data-i18n="multi_tab_hint" hidden></div>
   <div class="off-note" id="offNote" hidden></div>
   <div class="all-done-banner" id="allDoneBanner" data-i18n="all_done_banner" hidden></div>
+  <div class="claim-warning" id="integrityWarning" hidden></div>
   <div class="claim-warning" id="claimWarning" hidden></div>
+  <div id="notLinkedWarnings"></div>
 
   <details class="sleep-warning" id="sleepWarning" hidden>
     <summary data-i18n="sleep_summary"></summary>

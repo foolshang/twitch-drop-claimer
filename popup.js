@@ -70,6 +70,8 @@ const $infoPanel = document.getElementById("infoPanel");
 const $offNote = document.getElementById("offNote");
 const $allDoneBanner = document.getElementById("allDoneBanner");
 const $claimWarning = document.getElementById("claimWarning");
+const $integrityWarning = document.getElementById("integrityWarning");
+const $notLinkedWarnings = document.getElementById("notLinkedWarnings");
 const $sleepWarning = document.getElementById("sleepWarning");
 const $watchingChannel = document.getElementById("watchingChannel");
 const $watchingChannelHint = document.getElementById("watchingChannelHint");
@@ -398,7 +400,7 @@ async function renderGameStatus() {
   const cfg = await browser.storage.local.get([
     "watchList", "autoWatchEnabled", "watchPhase", "watchTabs",
     "invalidSlugs", "campaignProgress", "priorityMode", "emptyUntil",
-    "openCampaigns", "gameWaitUntil", "claimHealth",
+    "openCampaigns", "gameWaitUntil", "claimHealth", "claimNotLinked",
   ]);
   const watchList = cfg.watchList || [];
   const openCampaigns = cfg.openCampaigns || null;
@@ -415,9 +417,29 @@ async function renderGameStatus() {
   // every recent claim was rejected by Twitch (content.js's verifyClaim): tell
   // the user to claim by hand / check the session instead of leaving them to
   // wonder why nothing is ever claimed
+  // Twitch refusing Drops for the whole session (background.js's integrityFlag,
+  // kept in storage.session): says so plainly and hides the vaguer streak warning
+  let integrityFlag = null;
+  try { integrityFlag = (await browser.storage.session.get("integrityFlag")).integrityFlag || null; } catch { /* no session storage */ }
+  $integrityWarning.hidden = !integrityFlag;
+  if (integrityFlag) $integrityWarning.textContent = t("integrity_warning");
   const claimStreak = (cfg.claimHealth && cfg.claimHealth.streak) || 0;
-  $claimWarning.hidden = claimStreak < CLAIM_WARN_STREAK;
+  $claimWarning.hidden = !!integrityFlag || claimStreak < CLAIM_WARN_STREAK;
   if (!$claimWarning.hidden) $claimWarning.textContent = t("claim_fail_warning", { n: claimStreak });
+  // a claim refused because the game account is not connected: one line per game/reward
+  $notLinkedWarnings.replaceChildren();
+  for (const e of Array.isArray(cfg.claimNotLinked) ? cfg.claimNotLinked : []) {
+    const box = document.createElement("div");
+    box.className = "claim-warning";
+    box.append(t("claim_not_linked_warning", { game: e.game || e.key }));
+    const link = document.createElement("button");
+    link.type = "button";
+    link.className = "link";
+    link.textContent = t("claim_open_campaigns");
+    link.addEventListener("click", () => browser.tabs.create({ url: "https://www.twitch.tv/drops/campaigns" }));
+    box.append(link);
+    $notLinkedWarnings.append(box);
+  }
   // Firefox has no way for an extension to keep the machine awake (no
   // browser.power API, and Screen Wake Lock API rejects on a background tab
   // - verified live, not assumed) - the only real mitigation is the OS
@@ -583,6 +605,10 @@ async function reconcileGamesTextarea() {
 
 // the popup can stay open while things change in the background -> keep it live
 browser.storage.onChanged.addListener((changes, area) => {
+  if (area === "session") {
+    if (changes.integrityFlag) renderGameStatus();
+    return;
+  }
   if (area !== "local") return;
   if (changes.uiLang && changes.uiLang.newValue && changes.uiLang.newValue !== LANG) {
     LANG = i18nResolveLang(changes.uiLang.newValue, navigator.language);
@@ -596,7 +622,7 @@ browser.storage.onChanged.addListener((changes, area) => {
     changes.watchList || changes.watchTabs || changes.autoWatchEnabled ||
     changes.watchPhase || changes.invalidSlugs || changes.campaignProgress ||
     changes.priorityMode || changes.emptyUntil ||
-    changes.openCampaigns || changes.gameWaitUntil || changes.claimHealth
+    changes.openCampaigns || changes.gameWaitUntil || changes.claimHealth || changes.claimNotLinked
   ) {
     renderGameStatus();
   }

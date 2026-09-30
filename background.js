@@ -431,9 +431,10 @@ async function resetStateForNewBrowserSession() {
   const { tdcSessionStarted } = await browser.storage.session.get("tdcSessionStarted");
   if (tdcSessionStarted) return false;
   await browser.storage.session.set({ tdcSessionStarted: Date.now() });
-  await browser.storage.local.set({ watchTabs: {}, watchMeta: {}, dropSignals: {}, watchWindowId: null, claimHealth: null });
+  await browser.storage.local.set({ watchTabs: {}, watchMeta: {}, dropSignals: {}, watchWindowId: null, claimHealth: null, claimNotLinked: null });
   claimBackoff = new Map(); // and every reward's claim backoff (see getClaimBackoff)
-  try { await browser.storage.session.set({ claimBackoff: {} }); } catch { /* best effort */ }
+  integrityFlag = null; // and Twitch's verdict on the session (see getIntegrityFlag)
+  try { await browser.storage.session.set({ claimBackoff: {}, integrityFlag: null }); } catch { /* best effort */ }
   log("new browser session (or the extension was just loaded): forgot remembered watch tab/window ids");
   return true;
 }
@@ -615,7 +616,57 @@ function saveClaimBackoff() {
   browser.storage.session.set({ claimBackoff: out }).catch(() => {});
 }
 
+// ---- Twitch refusing Drops for this session (integrity) ---------------------
+// inject.js reports `integrityFailed` when ViewerDropsDashboard / Inventory /
+// DropsInventoryRewardGroupStatus / DropsPage_ClaimDropRewards come back with
+// "failed integrity ..." (Twitch has flagged the session/device: seen live,
+// fixed by clearing twitch.tv cookies and logging in again). From that moment
+// no tab claims anything - claimAsk says no at once, no waiting for the
+// per-reward backoff - and the flag (storage.session `integrityFlag`) makes
+// the popup say what to do. It clears when an operation that fails in a
+// flagged session works again (`dropsOpOk`; Inventory is no proof, it works
+// even when flagged) and on a new browser session. Not counted as claim
+// failures, so nothing in the backoff state changes while it is set.
+let integrityFlag; // undefined = not loaded yet, null = clear, else { since, op, lastAt }
+
+async function getIntegrityFlag() {
+  if (integrityFlag !== undefined) return integrityFlag;
+  let stored = null;
+  try {
+    if (browser.storage.session) stored = (await browser.storage.session.get("integrityFlag")).integrityFlag || null;
+  } catch { /* no per-session storage: memory only */ }
+  if (integrityFlag === undefined) integrityFlag = stored; // a concurrent caller / reset may have set it meanwhile
+  return integrityFlag;
+}
+
+function saveIntegrityFlag() {
+  if (!browser.storage.session) return;
+  browser.storage.session.set({ integrityFlag: integrityFlag ? { since: integrityFlag.since, op: integrityFlag.op } : null }).catch(() => {});
+}
+
+async function handleIntegritySignal(signal) {
+  const flag = await getIntegrityFlag();
+  const now = Date.now();
+  if (signal.kind === "integrityFailed") {
+    if (flag) { flag.lastAt = now; return; } // already known: no log/storage spam (it fires on every page load, several times)
+    integrityFlag = { since: now, op: signal.operationName || "?", lastAt: now };
+    saveIntegrityFlag();
+    log(`Twitch refused ${integrityFlag.op} with "failed integrity check" - this session looks flagged for Drops. Auto-claim is stopped in every tab; clear twitch.tv cookies and log in again`);
+    return;
+  }
+  // dropsOpOk
+  if (!flag) return;
+  integrityFlag = null;
+  saveIntegrityFlag();
+  // the refusals were the session's fault, not the rewards': start them all afresh
+  (await getClaimBackoff()).clear();
+  saveClaimBackoff();
+  await browser.storage.local.set({ claimHealth: null, claimNotLinked: null });
+  log(`Drops operations work again (${signal.operationName || "?"}) - integrity flag cleared, auto-claim resumes`);
+}
+
 async function handleClaimAsk(msg) {
+  if (await getIntegrityFlag()) return { allowed: false, reason: "integrity" };
   const map = await getClaimBackoff();
   const key = String(msg.key || "");
   const now = Date.now();
@@ -633,6 +684,42 @@ async function handleClaimRelease(msg) {
   if (!st) return;
   delete st.inflightAt;
   if (!st.f && !st.stop) map.delete(String(msg.key || ""));
+}
+
+// A claim was refused because the game account is not connected (content.js
+// saw `claimNotLinked` for a reward it just clicked). Not an integrity problem
+// and not a failed attempt: that reward stops for the session, everything else
+// keeps claiming, and the popup (storage.local `claimNotLinked`) tells the user
+// to connect the account on the campaigns page. Never touches `claimHealth`.
+async function handleClaimNotLinked(msg) {
+  const map = await getClaimBackoff();
+  const key = String(msg.key || "");
+  if (!key) return;
+  map.set(key, { f: 0, next: 0, stop: true, notLinked: true });
+  saveClaimBackoff();
+  const { claimNotLinked } = await browser.storage.local.get("claimNotLinked");
+  const list = Array.isArray(claimNotLinked) ? claimNotLinked.filter((e) => e && e.key !== key) : [];
+  list.push({ key, game: msg.game ? String(msg.game) : null });
+  await browser.storage.local.set({ claimNotLinked: list });
+  log(`claim needs a linked game account - not retrying "${key}"${msg.game ? ` (${msg.game})` : ""} this session; connect it on the campaigns page`);
+}
+
+// ViewerDropsDashboard says which games have a connected account: those
+// rewards can be claimed again
+async function clearNotLinkedForConnectedGames(games) {
+  const { claimNotLinked } = await browser.storage.local.get("claimNotLinked");
+  if (!Array.isArray(claimNotLinked) || claimNotLinked.length === 0) return;
+  const connected = new Set((games || []).filter((g) => g && g.accountConnected).map((g) => String(g.name)));
+  const gone = claimNotLinked.filter((e) => e && e.game && connected.has(e.game));
+  if (gone.length === 0) return;
+  const map = await getClaimBackoff();
+  for (const e of gone) {
+    const st = map.get(e.key);
+    if (st && st.notLinked) map.delete(e.key);
+    log(`game account of ${e.game} is connected now - claiming "${e.key}" resumes`);
+  }
+  saveClaimBackoff();
+  await browser.storage.local.set({ claimNotLinked: claimNotLinked.filter((e) => !gone.includes(e)) });
 }
 
 // Verdict on a claim. Also keeps storage.local `claimHealth` for the popup:
@@ -1819,6 +1906,12 @@ async function handleChannelUnusable(msg) {
 async function handleGqlDropSignal(msg, tab) {
   if (!tab) return;
 
+  // Twitch refusing Drops for this session / clearing up again - account-wide,
+  // handled before anything slug-related. (`claimRequest` / `claimNotLinked`
+  // are for content.js, which knows which reward it clicked: nothing to do here.)
+  if (msg.signal.kind === "integrityFailed" || msg.signal.kind === "dropsOpOk") return handleIntegritySignal(msg.signal);
+  if (msg.signal.kind === "claimNotLinked" || msg.signal.kind === "claimRequest") return;
+
   // openCampaigns is a full snapshot of every drop campaign Twitch currently
   // lists (captured while the user has /drops/campaigns open)
   // - account-wide, not tied to a watch tab, so handled before the slug-gate.
@@ -1853,6 +1946,7 @@ async function handleGqlDropSignal(msg, tab) {
       const activeCount = Object.values(bySlug).filter((c) => c.active).length;
       log("[openCampaigns] snapshot:", Object.keys(bySlug).length, "games,", activeCount, "with an open campaign");
     });
+    await clearNotLinkedForConnectedGames(msg.signal.games);
     // not inside the serialized block above - annotateWatchListFromCampaigns
     // runs its own serialized units (see its comment)
     await annotateWatchListFromCampaigns();
@@ -2048,6 +2142,9 @@ browser.runtime.onMessage.addListener((msg, sender) => {
 
     case "claimRelease":
       return handleClaimRelease(msg);
+
+    case "claimNotLinked":
+      return handleClaimNotLinked(msg);
 
     case "claimResult":
       return handleClaimResult(msg);

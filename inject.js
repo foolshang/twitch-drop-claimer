@@ -66,6 +66,14 @@
  * DropsInventoryRewardGroupStatus, also real and fires there repeatedly,
  * has no game field at all (just per-reward-group claim status) - not
  * useful for the id->name mapping, so no extractor for it.
+ *
+ * Besides those, INTEGRITY_EXTRACTORS (below) watch four Drops operations for
+ * Twitch refusing them: seen live (2026-09-30) a session/device Twitch had
+ * flagged got `errors: [{message: "failed integrity check"}]` + null data for
+ * ViewerDropsDashboard, DropsInventoryRewardGroupStatus and
+ * DropsPage_ClaimDropRewards (the campaign list, the drops inside a campaign,
+ * the claim itself) while every ordinary operation - Inventory included -
+ * kept working. Clearing twitch.tv cookies and logging in again fixed it.
  */
 (() => {
   const GQL_URL = "https://gql.twitch.tv/gql";
@@ -182,6 +190,68 @@
     },
   };
 
+  // ---- integrity / account-link detection ----------------------------------
+  // Passive as everything here: read the response of Drops operations and say
+  // what Twitch answered. Signals (see background.js handleGqlDropSignal):
+  //   integrityFailed  the operation was refused with "failed integrity ..."
+  //   dropsOpOk        the operation worked - only sent for operations that
+  //                    fail in a flagged session, so it proves the flag is gone
+  //                    (Inventory answers fine even when flagged: no proof)
+  //   claimNotLinked   a claim was refused because the game account is not
+  //                    connected (NOT an integrity problem); `seq` numbers this
+  //                    tab's claim requests so content.js can tell which
+  //                    reward it belongs to
+  const errorMessages = (body) => (Array.isArray(body && body.errors) ? body.errors : [])
+    .map((e) => String((e && e.message) || ""));
+  const isIntegrityError = (body) => errorMessages(body).some((m) => /failed integrity/i.test(m));
+  const hasData = (body) => !!(body && body.data && typeof body.data === "object" &&
+    Object.values(body.data).some((v) => v != null));
+  const integrityOrOk = (proof) => (body) => {
+    if (isIntegrityError(body)) return { kind: "integrityFailed" };
+    if (proof && !(body && body.errors && body.errors.length) && hasData(body)) return { kind: "dropsOpOk" };
+    return null;
+  };
+
+  // The exact shape of Twitch's "connect your account" refusal was never
+  // captured, so this is deliberately loose: an error whose message or
+  // extension code is about an unconnected/unlinked account, or the claim
+  // payload itself saying the user account is not connected.
+  const NOT_LINKED_MESSAGE = /(not|isn't|aren't)\s+(yet\s+)?(connected|linked)|connect your (twitch|game|account)|link (your|the) (game )?account|account\s+(is\s+)?not\s+(connected|linked)/i;
+  const NOT_LINKED_CODE = /(NOT|UN)[_ ]?(CONNECTED|LINKED)|ACCOUNT[_ ]?(NOT[_ ]?)?(CONNECT|LINK)|NEEDS?[_ ]?(ACCOUNT[_ ]?)?(CONNECT|LINK)/i;
+  function claimNotLinked(body) {
+    if (isIntegrityError(body)) return false;
+    const errs = Array.isArray(body && body.errors) ? body.errors : [];
+    if (errs.some((e) => NOT_LINKED_MESSAGE.test(String((e && e.message) || "")) ||
+        NOT_LINKED_CODE.test(String((e && e.extensions && e.extensions.code) || "")))) return true;
+    const claim = body && body.data && body.data.claimDropRewards;
+    return !!(claim && claim.isUserAccountConnected === false);
+  }
+
+  const INTEGRITY_EXTRACTORS = {
+    ViewerDropsDashboard: integrityOrOk(true),
+    DropsInventoryRewardGroupStatus: integrityOrOk(true),
+    Inventory: integrityOrOk(false),
+    DropsPage_ClaimDropRewards(body) {
+      if (claimNotLinked(body)) return { kind: "claimNotLinked" };
+      return integrityOrOk(true)(body);
+    },
+  };
+
+  // claim requests made by this page so far, numbered in request order and
+  // announced as `claimRequest` when they go out; the response's `seq` is the
+  // request's (content.js pairs them with its own clicks)
+  let claimSeq = 0;
+  function reserveClaimSeqs(requestEntries) {
+    const seqs = [];
+    (requestEntries || []).forEach((r, i) => {
+      if (r && r.operationName === "DropsPage_ClaimDropRewards") {
+        seqs[i] = claimSeq++;
+        post({ operationName: r.operationName, signal: { kind: "claimRequest", operationName: r.operationName, seq: seqs[i] }, at: Date.now() });
+      }
+    });
+    return seqs;
+  }
+
   function parseJsonArray(text) {
     if (!text) return null;
     try {
@@ -192,14 +262,23 @@
     }
   }
 
-  function handleExchange(requestEntries, responseText) {
+  function handleExchange(requestEntries, responseText, claimSeqs) {
     const responseEntries = parseJsonArray(responseText);
     if (!responseEntries) return;
 
     responseEntries.forEach((resEntry, i) => {
       const reqEntry = requestEntries && requestEntries[i];
       const name = reqEntry && reqEntry.operationName;
-      const extractor = name && EXTRACTORS[name];
+      if (!name) return;
+      const integrity = INTEGRITY_EXTRACTORS[name];
+      if (integrity) {
+        const signal = integrity(resEntry);
+        if (signal) {
+          if (claimSeqs && claimSeqs[i] != null) signal.seq = claimSeqs[i];
+          post({ operationName: name, signal: { ...signal, operationName: name }, at: Date.now() });
+        }
+      }
+      const extractor = EXTRACTORS[name];
       if (!extractor) return;
       const signal = extractor(resEntry);
       if (signal) post({ operationName: name, signal, at: Date.now() });
@@ -215,8 +294,9 @@
       if (url && url.startsWith(GQL_URL)) {
         const body = init && typeof init.body === "string" ? init.body : null;
         const requestEntries = parseJsonArray(body);
+        const claimSeqs = reserveClaimSeqs(requestEntries);
         promise
-          .then((res) => res.clone().text().then((text) => handleExchange(requestEntries, text)))
+          .then((res) => res.clone().text().then((text) => handleExchange(requestEntries, text, claimSeqs)))
           .catch(() => {});
       }
     } catch { /* never break the page's real request */ }
@@ -233,8 +313,9 @@
   XMLHttpRequest.prototype.send = function (body) {
     if (this.__dropClaimerIsGql) {
       const requestEntries = parseJsonArray(typeof body === "string" ? body : null);
+      const claimSeqs = reserveClaimSeqs(requestEntries);
       this.addEventListener("load", () => {
-        try { handleExchange(requestEntries, this.responseText); } catch { /* ignore */ }
+        try { handleExchange(requestEntries, this.responseText, claimSeqs); } catch { /* ignore */ }
       });
     }
     return nativeSend.call(this, body);
