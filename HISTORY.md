@@ -2358,3 +2358,12 @@ against 0.6.16 (run one by one). All 16 test files pass; `web-ext lint` clean
 (0/0/0); i18n key parity holds (82/language).
 
 `BUILD_MARKER` -> `2026-10-02-r1`, `manifest.json` -> 0.6.17.
+
+Signed to the UNLISTED channel on 2026-10-02 (`npm run submit`, no
+`--listed`) for a few days of testing in the user's real Firefox (replacing
+0.6.16 as the build under test):
+`web-ext-artifacts/33d37586a96d443fa884-0.6.17.xpi`, built from `96d1df0`
+(`BUILD_MARKER` `2026-10-02-r1`); the version is in the local, git-ignored
+`.amo-submitted-versions.json`. Not submitted to the listed channel. AMO does
+not allow reusing a version number, so if the test goes well the same code
+ships to listed as 0.6.18 (manifest + `BUILD_MARKER` bump only).
