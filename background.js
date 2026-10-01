@@ -1067,11 +1067,20 @@ async function autoWatchTick() {
     if (!(await tabExists(watchTabs[slug]))) delete watchTabs[slug];
   }
 
+  // A pinned channel that is matched to a campaign but streams another game earns
+  // nothing right now: its tab stays (that is how it notices the channel coming
+  // back, like an offline one waiting to go live) but it is not "watching", so it
+  // does not hold a quota slot - the next queued entry may use it. When the
+  // channel is back on the campaign's game it counts again; the tabs open at that
+  // moment are not closed to make room, so the total may briefly exceed the quota.
+  const parked = new Set(eligible.filter((g) => entryPlaysWrongGame(g, campaignProgress[g.slug])).map((g) => g.slug));
+
   // fill remaining quota with the next-priority eligible games not already watched
   const ordered = orderByPriority(eligible, priorityMode, campaignProgress, emptyUntil);
-  let openCount = Object.keys(watchTabs).length;
+  let openCount = Object.keys(watchTabs).filter((k) => !parked.has(k)).length;
   for (const game of ordered) {
-    if (openCount >= quota) break;
+    const isParked = parked.has(game.slug);
+    if (!isParked && openCount >= quota) continue;
     if (watchTabs[game.slug]) continue; // already has a tab
 
     const { id: watchWindowId } = await getOrCreateWatchWindow();
@@ -1079,8 +1088,8 @@ async function autoWatchTick() {
     const tab = await browser.tabs.create({ url, active: false, pinned: true, ...(watchWindowId ? { windowId: watchWindowId } : {}) });
     await browser.tabs.update(tab.id, { active: false, muted: true });
     watchTabs[game.slug] = tab.id;
-    openCount++;
-    log("opened watch tab for", game.slug, `tab=${tab.id}`, `(${openCount}/${quota})`);
+    if (!isParked) openCount++;
+    log("opened watch tab for", game.slug, `tab=${tab.id}`, isParked ? "(on another game than its campaign - not counted)" : `(${openCount}/${quota})`);
 
     if (game.pinnedChannel) {
       // the destination channel is already known (no directory pick to wait
@@ -1272,16 +1281,19 @@ async function applyResolvedSlug(badSlug, goodSlug) {
 // derives its own card slug - see currentStreamGame() in content.js); that
 // goes into the entry's `gameSlug` / `pinnedGameName`, which only say which
 // game the channel is on - never the key. (0.6.16 and older rewrote the key to
-// the game slug and refused when another entry already had it.) A switch to a
-// different game drops the entry's progress, which belonged to the old game's
-// campaigns; the tab itself is untouched (it is already on the right channel).
+// the game slug and refused when another entry already had it.) Which campaigns
+// the entry is tracking depends on the CHANNEL (inventory allow lists), not on
+// the game it plays at the moment, so a switch keeps its progress; what it
+// changes is whether the channel is earning them (entryPlaysWrongGame) - and
+// with that whether its tab holds a quota slot (see autoWatchTick). The tab
+// itself is untouched either way: it stays on the channel to see it come back.
 // ============================================================================
 async function handleChannelPlayingGame(msg, tab) {
   const { channel, slug, gameName } = msg;
   if (!tab || !channel || !slug) return;
 
   const changed = await serialized(async () => {
-    const cfg = await browser.storage.local.get(["watchList", "watchTabs", "watchMeta", "dropSignals", "campaignProgress"]);
+    const cfg = await browser.storage.local.get(["watchList", "watchTabs"]);
     const watchTabs = cfg.watchTabs || {};
     const key = Object.keys(watchTabs).find((s) => watchTabs[s] === tab.id);
     if (!key) return false;
@@ -1298,28 +1310,14 @@ async function handleChannelPlayingGame(msg, tab) {
     );
 
     const switched = !!prevGame && prevGame !== slug;
-    const patch = { watchList: nextWatchList };
-    if (switched) {
-      // progress is campaign-specific - never carried across a game switch -
-      // and the verify clock starts afresh (nothing to judge against a
-      // baseline taken on another game)
-      const nextProgress = { ...(cfg.campaignProgress || {}) };
-      delete nextProgress[key];
-      const nextWatchMeta = { ...(cfg.watchMeta || {}) };
-      nextWatchMeta[key] = { channel, tabId: tab.id, watchStartedAt: Date.now() };
-      const nextDropSignals = { ...(cfg.dropSignals || {}) };
-      delete nextDropSignals[key];
-      Object.assign(patch, { campaignProgress: nextProgress, watchMeta: nextWatchMeta, dropSignals: nextDropSignals });
-    }
-
     suppressWatchListReaction = true;
     try {
-      await browser.storage.local.set(patch);
+      await browser.storage.local.set({ watchList: nextWatchList });
     } finally {
       suppressWatchListReaction = false;
     }
     log("pinned channel", channel, prevGame ? (switched ? "switched game to" : "game is") : "resolved to game", slug, gameName ? `(${gameName})` : "");
-    return switched;
+    return prevGame !== slug; // a new game can change whether it earns (and so hold a slot): re-run the scheduler
   });
 
   if (changed) await serialized(autoWatchTick);
@@ -1386,10 +1384,19 @@ async function mergeInventoryProgress(campaigns) {
       const key = game.slug;
       const owned = campaigns
         .filter((c) => entryOwnsCard(game, c, ctx))
-        .map((c) => ({ ...c, expiredFinal: cardIsExpired(c, c.campaignId ? metaById[c.campaignId] || null : null, activeSlugs) }));
+        .map((c) => {
+          const meta = c.campaignId ? metaById[c.campaignId] || null : null;
+          return {
+            ...c,
+            expiredFinal: cardIsExpired(c, meta, activeSlugs),
+            gameSlugs: [...cardGameSlugs(c, meta, ctx.gameSlugMap)],
+            gameNames: meta && meta.gameName ? [normalizeGameName(meta.gameName)] : [],
+          };
+        });
       const agg = aggregateEntryProgress(owned, entryExpectedCampaignIds(game, ctx));
       if (!agg) continue;
       matchedKeys.add(key);
+      if (entryPlaysWrongGame(game, progress[key]) !== entryPlaysWrongGame(game, agg)) anyJustFinished = true; // parked <-> watching: re-run the scheduler
       progress[key] = { ...agg, updatedAt: Date.now(), missingScans: 0 };
       if ((agg.allComplete || agg.expired) && watchTabs[key]) {
         await closeWatchTab(watchTabs, key);

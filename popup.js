@@ -538,6 +538,12 @@ async function renderGameStatus() {
       }
     }
 
+    // a pinned channel matched to a campaign but streaming another game earns
+    // nothing - not "watching" (and its tab holds no quota slot, see autoWatchTick)
+    if (cfg.autoWatchEnabled && !isWaiting && !invalid && entryPlaysWrongGame(game, progress)) {
+      badge = badgeEl(t("badge_other_game"), "warn");
+    }
+
     if (!badge) {
       if (isWatching) badge = badgeEl(t("badge_watching"));
       else if (isCooling) badge = badgeEl(t("badge_queued_no_live"), "warn");

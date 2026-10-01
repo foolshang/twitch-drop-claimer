@@ -7,7 +7,7 @@
 // value out loud when asking for a fresh test - lets whoever's testing
 // confirm from the background console alone that Firefox is actually running
 // this exact source tree, not a stale reload/cached build/old .xpi.
-const BUILD_MARKER = "2026-10-02-r1";
+const BUILD_MARKER = "2026-10-02-r2";
 
 const ALIASES = {
   // Path of Exile
@@ -203,7 +203,11 @@ function claimBackoffAfterFailure(state, now) {
 //   a game entry ("Rust")        - cards of that game that are NOT restricted;
 //   a pinned entry ("@streamer") - cards of ACTIVE campaigns whose allowed
 //                                  channels include that channel (any number:
-//                                  it is done only when all of them are).
+//                                  it is done only when all of them are). The
+//                                  game the channel happens to be playing
+//                                  right now plays no part in WHICH campaigns
+//                                  those are - only in whether it is earning
+//                                  them (entryPlaysWrongGame).
 // A card that cannot be told apart is never lent to an entry it may not
 // belong to - the entry just has no progress yet ("unknown", still watched).
 
@@ -255,9 +259,7 @@ function entryOwnsCard(g, card, ctx = {}) {
   const games = cardGameSlugs(card, meta, ctx.gameSlugMap);
   if (g.pinnedChannel) {
     if (!channels.includes(lcChannel(g.channel))) return false;
-    if (cardIsExpired(card, meta, ctx.activeSlugs)) return false; // only ACTIVE campaigns count
-    const gs = entryGameSlug(g);
-    return !gs || games.size === 0 || games.has(gs);
+    return !cardIsExpired(card, meta, ctx.activeSlugs); // only ACTIVE campaigns count
   }
   return channels.length === 0 && games.has(g.slug);
 }
@@ -272,8 +274,6 @@ function entryExpectedCampaignIds(g, ctx = {}) {
     const games = cardGameSlugs(null, meta, ctx.gameSlugMap);
     if (g.pinnedChannel) {
       if (!channels.includes(lcChannel(g.channel))) continue;
-      const gs = entryGameSlug(g);
-      if (gs && games.size && !games.has(gs)) continue;
     } else if (channels.length > 0 || !games.has(g.slug)) {
       continue;
     }
@@ -297,6 +297,10 @@ function aggregateEntryProgress(cards, expectedIds) {
   const covered = !(expectedIds || []).some((id) => !seen.has(id));
   const known = use.every((c) => c.timeRemainingMin != null || complete(c));
   const expiries = use.map((c) => c.expiresAt).filter((t) => typeof t === "number");
+  // the games of the campaigns still to be earned (all of them once every card is complete)
+  const pending = use.filter((c) => !complete(c));
+  const earn = pending.length ? pending : use;
+  const uniq = (list) => [...new Set(list.filter(Boolean))];
   return {
     label: use[0].label,
     claimed: use.reduce((n, c) => n + c.claimed, 0),
@@ -308,5 +312,24 @@ function aggregateEntryProgress(cards, expectedIds) {
     timeRemainingMin: known ? use.reduce((n, c) => n + (c.timeRemainingMin || 0), 0) : null,
     campaignNames: use.map((c) => c.campaignName || (c.campaignId ? c.campaignId : null)).filter(Boolean),
     campaignIds: cards.map((c) => c.campaignId).filter(Boolean),
+    campaignGameSlugs: uniq(earn.flatMap((c) => c.gameSlugs || [])),
+    campaignGameNames: uniq(earn.flatMap((c) => c.gameNames || [])),
   };
+}
+
+// A pinned channel whose matched campaigns are for a game other than the one the
+// channel is streaming right now (seen live, 0.6.17: "@mrwobblestwitch" playing
+// I'm Only Sleeping while matched to the Rust campaign "Rust Isles Facemask"):
+// watching it earns nothing, so it is not "watching" - its tab stays only to see
+// the channel come back, and does not hold a quota slot meanwhile. False when
+// the entry is not pinned, has no matched campaign yet (it then watches whatever
+// the channel plays), is finished, or either game is unknown.
+function entryPlaysWrongGame(g, progress) {
+  if (!g || !g.pinnedChannel || !progress || progress.allComplete || progress.expired) return false;
+  const now = entryGameSlug(g);
+  const slugs = progress.campaignGameSlugs || [];
+  if (!now || slugs.length === 0 || slugs.includes(now)) return false;
+  const names = progress.campaignGameNames || [];
+  if (g.pinnedGameName && names.includes(normalizeGameName(g.pinnedGameName))) return false;
+  return true;
 }

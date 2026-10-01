@@ -353,7 +353,7 @@ function testOwnershipRules() {
   assert.ok(!owns(pin("a"), card({ channels: [] })), "pinned: never the general campaign");
   assert.ok(owns(pin("c"), card({ channels: ["a"] }), { metaById: { x: meta({ channels: ["a", "b", "c"] }) } }), "the complete list from the GQL beats the card's partial one");
   assert.ok(!owns(pin("a"), card({ channels: ["a"] }), { metaById: { x: meta({ channels: ["a"], status: "EXPIRED" }) } }), "expired -> not counted");
-  assert.ok(!owns(pin("a", { gameSlug: "diablo-iv" }), card({ channels: ["a"] })), "pinned: a campaign of another game than the channel plays");
+  assert.ok(owns(pin("a", { gameSlug: "diablo-iv" }), card({ channels: ["a"] })), "pinned: the game the channel streams NOW does not decide which campaigns are its (0.6.17 dropped them while it played another game)");
   assert.ok(owns(pin("a", { gameSlug: "rust" }), card({ channels: ["a"] })), "pinned: same game");
   assert.ok(owns(pin("a", { gameSlug: "diablo-iv" }), { slug: null, campaignId: null, channels: ["a"] }), "pinned: unknown game on the card does not block it");
   assert.ok(owns(pin("a", { slug: "rust" }), card({ channels: ["a"] })), "legacy pinned entry (key rewritten to the game slug by 0.6.16) still matches by channel");
@@ -489,6 +489,64 @@ async function testSavingTheListKeepsWhatWasLearnedAboutPinnedChannels() {
   console.log("  OK  popup: saving the list keeps the game already learned for a pinned channel that stays on it");
 }
 
+// ---- 0.6.18: matched to a campaign, but streaming another game ----------------------------------
+function testEntryPlaysWrongGameRules() {
+  const ctx = vm.createContext({});
+  vm.runInContext(read("shared.js"), ctx);
+  const wrong = vm.runInContext("entryPlaysWrongGame", ctx);
+  const pin = (extra) => ({ slug: "channel:mrwobblestwitch", channel: "mrwobblestwitch", pinnedChannel: true, gameSlug: "im-only-sleeping", pinnedGameName: "I'm Only Sleeping", ...extra });
+  const prog = (extra) => ({ allComplete: false, expired: false, campaignGameSlugs: ["rust"], campaignGameNames: ["rust"], ...extra });
+
+  assert.strictEqual(wrong(pin(), prog()), true, "matched to a Rust campaign, streaming I'm Only Sleeping");
+  assert.strictEqual(wrong(pin({ gameSlug: "rust", pinnedGameName: "Rust" }), prog()), false, "streaming the campaign's game");
+  assert.strictEqual(wrong(pin(), undefined), false, "not matched to any campaign yet: watches whatever it plays");
+  assert.strictEqual(wrong(pin(), prog({ campaignGameSlugs: [] })), false, "campaign game unknown: not judged");
+  assert.strictEqual(wrong(pin({ gameSlug: null, pinnedGameName: null }), prog()), false, "channel's game unknown: not judged");
+  assert.strictEqual(wrong(pin(), prog({ allComplete: true })), false, "a finished entry is done, not 'wrong game'");
+  assert.strictEqual(wrong(pin(), prog({ expired: true })), false);
+  assert.strictEqual(wrong({ slug: "rust" }, prog()), false, "a game entry is never 'on another game'");
+  assert.strictEqual(wrong(pin({ gameSlug: "tom-clancys-rainbow-six-siege", pinnedGameName: "Rainbow Six Siege" }), prog({ campaignGameSlugs: ["rainbow-six-siege"], campaignGameNames: ["rainbowsixsiege"] })), false,
+    "a renamed game (slug differs, name is the same) is not mistaken for another game");
+  assert.strictEqual(wrong(pin(), prog({ campaignGameSlugs: ["rust", "im-only-sleeping"] })), false, "any of the campaigns still to earn is for the current game");
+  console.log("  OK  entryPlaysWrongGame: only a pinned entry matched to a campaign of another game than the channel streams");
+}
+
+async function testMatchingFollowsTheChannelNotTheGameItPlaysNow() {
+  // 0.6.17 only matched a campaign while the channel played its game; once the channel switched, a stale
+  // reading stayed in the row. Now the campaign is the channel's, whatever it streams.
+  const watchList = [pinnedEntry("mrwobblestwitch", { gameSlug: "im-only-sleeping", pinnedGameName: "I'm Only Sleeping" })];
+  const cards = parseCards({ cards: [realCard({ campaign: FACEMASK, percent: 40 })], watchList });
+  const w = await world({ watchList });
+  await w.gql([gqlCampaign(FACEMASK)]);
+  await w.scan(cards);
+  const p = w.progress("channel:mrwobblestwitch");
+  assert.ok(p, "matched to its campaign although the channel streams another game");
+  assert.deepStrictEqual([...p.campaignNames], [FACEMASK.name]);
+  assert.deepStrictEqual([...p.campaignGameSlugs], ["rust"], "with the game that campaign is for");
+  assert.strictEqual(vm.runInContext("entryPlaysWrongGame", w.bg.ctx)(watchList[0], p), true);
+  console.log("  OK  a pinned channel stays matched to its campaign (and knows its game) while it streams something else");
+}
+
+async function testPopupSaysPlayingAnotherGame() {
+  const en = require("../i18n.js").I18N.en;
+  const progress = { "channel:mrwobblestwitch": { label: "Rust", claimed: 0, total: 1, allComplete: false, expired: false, timeRemainingMin: 36, campaignNames: [FACEMASK.name], campaignGameSlugs: ["rust"], campaignGameNames: ["rust"], updatedAt: 1 } };
+  const base = (extra) => ({ watchList: [pinnedEntry("mrwobblestwitch", extra)], watchTabs: { "channel:mrwobblestwitch": 7 }, campaignProgress: progress });
+
+  let rows = await renderPopupRows(base({ gameSlug: "im-only-sleeping", pinnedGameName: "I'm Only Sleeping" }));
+  assert.strictEqual(rows[0].badge, en.badge_other_game, "not 'watching': " + rows[0].badge);
+  assert.ok(/mrwobblestwitch \(I'm Only Sleeping\)/.test(rows[0].name), "the game it plays stays in brackets: " + rows[0].name);
+  assert.ok(rows[0].details.some((d) => d.includes(FACEMASK.name)), "and the campaign it is matched to");
+
+  rows = await renderPopupRows(base({ gameSlug: "rust", pinnedGameName: "Rust" }));
+  assert.strictEqual(rows[0].badge, en.badge_watching, "back on Rust: watching");
+
+  rows = await renderPopupRows({ watchList: [pinnedEntry("mrwobblestwitch", { gameSlug: "im-only-sleeping", pinnedGameName: "I'm Only Sleeping" })], watchTabs: { "channel:mrwobblestwitch": 7 } });
+  assert.strictEqual(rows[0].badge, en.badge_watching, "not matched to a campaign yet: watching whatever it plays");
+
+  for (const { code } of require("../i18n.js").I18N_LANGS) assert.ok(require("../i18n.js").I18N[code].badge_other_game, `${code}.badge_other_game`);
+  console.log("  OK  popup: 'playing another game - not earning drops' instead of 'watching' (9 languages); watching again on the right game");
+}
+
 module.exports = { realCard, claimedSection, gqlCampaign, inventoryResponse, parseCards, TAC, BOONIE, FACEMASK, GENERAL, RUST_ID };
 
 if (require.main === module) (async () => {
@@ -507,6 +565,9 @@ if (require.main === module) (async () => {
     await testPopupShowsPinnedRowsLikeGameRows();
     await testSavingTheListKeepsWhatWasLearnedAboutPinnedChannels();
     await testInventoryExtractorReadsCampaignsAndAllowLists();
+    testEntryPlaysWrongGameRules();
+    await testMatchingFollowsTheChannelNotTheGameItPlaysNow();
+    await testPopupSaysPlayingAnotherGame();
     console.log("\nALL PASSED");
     process.exit(0);
   } catch (e) {

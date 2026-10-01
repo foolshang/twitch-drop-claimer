@@ -228,10 +228,10 @@ async function testResolvesPinnedChannelToRealSlug() {
 }
 
 // -----------------------------------------------------------------------
-// A pinned channel that later plays a genuinely different game is re-recorded,
-// and does NOT carry the previous game's campaign progress with it
+// A pinned channel that later plays a genuinely different game is re-recorded;
+// its campaign progress (matched through the channel, not the game) is kept
 // -----------------------------------------------------------------------
-async function testGameSwitchDropsStaleProgress() {
+async function testGameSwitchKeepsCampaignProgress() {
   const { ctx, storageData, tabsById, flush } = makeSandbox();
   loadBackground(ctx);
   storageData.watchList = [
@@ -249,24 +249,27 @@ async function testGameSwitchDropsStaleProgress() {
   ]);
   await flush(10);
   assert.ok(storageData.campaignProgress["channel:teststreamer"], "sanity: progress recorded for the pinned entry from its own card");
+  const startedAt = storageData.watchMeta["channel:teststreamer"].watchStartedAt;
 
   // the channel switched to a different game entirely
-  const before = storageData.watchMeta["channel:teststreamer"].watchStartedAt;
-  await new Promise((r) => setTimeout(r, 5));
   await vm.runInContext("handleChannelPlayingGame", ctx)(
     { channel: "teststreamer", slug: "diablo-iv", gameName: "Diablo IV" }, { id: tabId }
   );
   await flush(20);
 
-  assert.ok(!storageData.campaignProgress["channel:teststreamer"], "the old game's progress must not linger (and nothing is invented for the new one)");
+  // the progress is the CAMPAIGN's (matched through the channel's allow list), not the game's:
+  // 0.6.17 deleted it here, and the row lost it while the campaign was still being earned elsewhere
+  const kept = storageData.campaignProgress["channel:teststreamer"];
+  assert.ok(kept, "the campaign progress survives a game switch");
+  assert.deepStrictEqual([kept.claimed, kept.total], [1, 3]);
   assert.strictEqual(storageData.watchTabs["channel:teststreamer"], tabId, "same tab, same key");
-  assert.ok(storageData.watchMeta["channel:teststreamer"].watchStartedAt > before, "the verify clock starts afresh on the new game");
+  assert.strictEqual(storageData.watchMeta["channel:teststreamer"].watchStartedAt, startedAt, "no verify clock reset");
   const entry = storageData.watchList.find((g) => g.channel === "teststreamer");
   assert.strictEqual(entry.gameSlug, "diablo-iv");
   assert.strictEqual(entry.pinnedGameName, "Diablo IV");
   assert.strictEqual(tabsById.size, 2, "still just the one watch tab + the always-open inventory tab throughout");
 
-  console.log("  OK  handleChannelPlayingGame: switching to a different game drops the stale progress, tab and key untouched");
+  console.log("  OK  handleChannelPlayingGame: switching to a different game keeps the campaign progress, tab and key untouched");
 }
 
 // -----------------------------------------------------------------------
@@ -385,6 +388,81 @@ async function testEntryWithoutACardIsStillWatched() {
 
   console.log("  OK  an entry without an inventory card yet is unknown, not done, and keeps being watched (pinned and game)");
 }
+
+// -----------------------------------------------------------------------
+// A pinned channel matched to a campaign but streaming ANOTHER game earns
+// nothing: its tab stays (to see the channel come back) but frees its quota
+// slot for the next queued entry; back on the campaign's game it counts again.
+// Seen live in 0.6.17: "@mrwobblestwitch (I'm Only Sleeping)" matched to the
+// Rust campaign "Rust Isles Facemask", shown as watching and holding a slot.
+// -----------------------------------------------------------------------
+async function testWrongGameFreesTheSlotAndComingBackRestoresIt() {
+  const { ctx, storageData, tabsById, flush } = makeSandbox();
+  loadBackground(ctx);
+  storageData.tabQuota = 1;
+  storageData.watchList = [
+    { input: "@teststreamer", slug: "channel:teststreamer", channel: "teststreamer", pinnedChannel: true },
+    { input: "poe2", slug: "path-of-exile-2" },
+    { input: "warframe", slug: "warframe" },
+  ];
+  await flush(30);
+  const PINNED = "channel:teststreamer";
+  const pinnedTab = storageData.watchTabs[PINNED];
+  assert.deepStrictEqual(Object.keys(storageData.watchTabs), [PINNED], "quota 1: only the first entry (the pinned channel) has a tab");
+
+  const report = (slug, gameName) => vm.runInContext("handleChannelPlayingGame", ctx)({ channel: "teststreamer", slug, gameName }, { id: pinnedTab });
+  const entry = () => storageData.watchList.find((g) => g.channel === "teststreamer");
+  const wrong = () => vm.runInContext("entryPlaysWrongGame", ctx)(entry(), storageData.campaignProgress[PINNED]);
+
+  // matched to a Diablo campaign (its channel list names it); the channel plays Diablo: earning, holds the slot
+  await report("diablo-iv", "Diablo IV");
+  await vm.runInContext("mergeInventoryProgress", ctx)([
+    { slug: "diablo-iv", label: "Diablo IV", campaignId: "c1", campaignName: "Streamer drops", channels: ["teststreamer"], claimed: 0, total: 1, timeRemainingMin: 60 },
+  ]);
+  await flush(20);
+  assert.deepStrictEqual(Object.keys(storageData.watchTabs), [PINNED], "same game as its campaign: earning, and it holds the only slot");
+
+  // the channel switches to another game: matched campaign unchanged (it follows the channel), but not earning now
+  await report("just-chatting", "Just Chatting");
+  await flush(30);
+  assert.ok(storageData.watchTabs["path-of-exile-2"], "streaming another game than its campaign's: its slot went to the next queued entry");
+  assert.ok(!storageData.watchTabs["warframe"], "and only one: the quota still holds for the others");
+  assert.strictEqual(storageData.watchTabs[PINNED], pinnedTab, "its tab stays, to notice the channel coming back");
+  assert.ok(tabsById.has(pinnedTab));
+  assert.strictEqual(storageData.campaignProgress[PINNED].campaignNames[0], "Streamer drops", "still matched to its campaign");
+  assert.strictEqual(wrong(), true, "not earning");
+
+  // back on the campaign's game: watching again, nothing closed to make room, nothing new opened
+  const before = { ...storageData.watchTabs };
+  await report("diablo-iv", "Diablo IV");
+  await flush(30);
+  assert.deepStrictEqual({ ...storageData.watchTabs }, before, "no tab closed or opened by the switch back (the total may exceed the quota until one finishes)");
+  assert.strictEqual(wrong(), false, "back on the right game: earning again");
+
+  console.log("  OK  pinned + matched campaign + channel on another game: tab kept, quota slot freed; back on the right game: watching again");
+}
+
+async function testUnmatchedPinnedKeepsWatchingWhateverItPlays() {
+  const { ctx, storageData, flush } = makeSandbox();
+  loadBackground(ctx);
+  storageData.tabQuota = 1;
+  storageData.watchList = [
+    { input: "@teststreamer", slug: "channel:teststreamer", channel: "teststreamer", pinnedChannel: true },
+    { input: "poe2", slug: "path-of-exile-2" },
+  ];
+  await flush(30);
+  const PINNED = "channel:teststreamer";
+  const tabId = storageData.watchTabs[PINNED];
+  for (const [slug, name] of [["just-chatting", "Just Chatting"], ["diablo-iv", "Diablo IV"]]) {
+    await vm.runInContext("handleChannelPlayingGame", ctx)({ channel: "teststreamer", slug, gameName: name }, { id: tabId });
+    await flush(20);
+    assert.deepStrictEqual(Object.keys(storageData.watchTabs), [PINNED], "no matched campaign yet: it watches whatever the channel plays and keeps its slot (the queued entry waits)");
+    const entry = storageData.watchList.find((g) => g.channel === "teststreamer");
+    assert.strictEqual(vm.runInContext("entryPlaysWrongGame", ctx)(entry, (storageData.campaignProgress || {})[PINNED]), false);
+  }
+  console.log("  OK  a pinned channel not matched to any campaign yet keeps watching whatever game it plays");
+}
+
 (async () => {
   console.log("Running pinned-channel ('@channel') tests (no real browser, no network)...\n");
   try {
@@ -392,10 +470,12 @@ async function testEntryWithoutACardIsStillWatched() {
     await testAutoWatchOpensChannelDirectly();
     await testCombinedQuotaAcrossGamesAndChannels();
     await testResolvesPinnedChannelToRealSlug();
-    await testGameSwitchDropsStaleProgress();
+    await testGameSwitchKeepsCampaignProgress();
     await testResolvesAlongsideAGameEntryWithTheSameSlug();
     await testStalledPinnedChannelIsNeverRotated();
     await testEntryWithoutACardIsStillWatched();
+    await testWrongGameFreesTheSlotAndComingBackRestoresIt();
+    await testUnmatchedPinnedKeepsWatchingWhateverItPlays();
     console.log("\nALL PASSED");
     process.exit(0);
   } catch (e) {

@@ -46,6 +46,10 @@ whose channel list (from the Inventory GraphQL response and the "including
 of them are. Until a card shows up for an entry (it only appears once minutes
 start accruing) its progress is unknown - the popup says so, it is never
 marked done, and it keeps being watched.
+A pinned channel that streams a different game than its matched campaign's earns
+nothing: the popup says "playing another game - not earning drops" instead of
+"watching", and its tab - kept open to notice the channel coming back - does not
+hold a quota slot until it is back on the campaign's game.
 
 Two priority modes decide which queued games get a tab first
 when the list is longer than the quota: list order, or soonest-campaign-

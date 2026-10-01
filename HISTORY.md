@@ -2367,3 +2367,63 @@ Signed to the UNLISTED channel on 2026-10-02 (`npm run submit`, no
 `.amo-submitted-versions.json`. Not submitted to the listed channel. AMO does
 not allow reusing a version number, so if the test goes well the same code
 ships to listed as 0.6.18 (manifest + `BUILD_MARKER` bump only).
+
+
+## 0.6.18 - a pinned channel on the wrong game is not "watching" and holds no slot
+
+**Problem (found in real use of 0.6.17):** the row "@mrwobblestwitch (I'm Only
+Sleeping)" was matched to the campaign "Rust Isles Facemask", but the channel was
+streaming I'm Only Sleeping, not Rust. Drops do not credit in that state, yet the
+popup said "watching" and the entry held a tab slot (quota 3 = one slot burnt on
+nothing, and the queued entries behind it waited).
+
+**Cause, two layers:** (1) 0.6.17 only let a pinned entry own a campaign's card
+while the channel's current game matched the card's game, and deleted the entry's
+progress on a game switch - so when the channel changed game, whatever was
+matched before stayed in the row as a stale reading (neither refreshed nor
+cleared); (2) nothing compared the channel's current game with the matched
+campaign's game at all.
+
+**Fix:**
+- Which campaigns a pinned entry tracks depends only on the CHANNEL (allow
+  lists); the game it streams at the moment no longer plays a part in the
+  matching (`entryOwnsCard`, `entryExpectedCampaignIds`), and a game switch keeps
+  its progress (`handleChannelPlayingGame` only records `gameSlug` /
+  `pinnedGameName`; it re-runs the scheduler when the game changed).
+- The progress record carries the games of the campaigns still to be earned
+  (`campaignGameSlugs` / `campaignGameNames`). `entryPlaysWrongGame()` (shared.js):
+  a pinned entry matched to a campaign whose game is not the one the channel is
+  streaming (a renamed game whose slug differs but whose name is the same is not
+  mistaken for another game). False while the entry has no matched campaign yet
+  (it then watches whatever the channel plays, as before), is done/expired, or
+  either game is unknown.
+- `autoWatchTick`: such an entry keeps its tab - that is how it notices the
+  channel coming back, like an offline pinned channel waiting to go live (the
+  content script keeps reporting the game) - but does not count against
+  `tabQuota`, so the next queued entry gets the slot; a parked entry that has no
+  tab (after a restart) gets one without taking a slot. Back on the campaign's
+  game it counts again; nothing is closed to make room, so the number of tabs can
+  exceed the quota until one finishes. The scheduler re-runs when the channel's
+  game changes and when a scan flips the state.
+- Popup: `badge_other_game` ("playing another game - not earning drops", 9
+  languages) instead of "watching" for such a row; the game in brackets and the
+  matched campaign name stay on the row. An unmatched pinned row says "watching"
+  as before.
+
+**Not verified live** (README rule): checked with the real background.js tab
+registry (quota 1: pinned on its game holds the slot; on another game the next
+queued entry gets it and a third gets none; switching back opens/closes nothing)
+and the real popup.js in jsdom.
+
+**Tests:** `pinned-channel.test.js`: slot freed on the wrong game and restored on
+the way back; an unmatched pinned channel keeps watching whatever it plays; a game
+switch now keeps the campaign progress (replaces the test that required it to be
+dropped). `campaign-matching.test.js`: `entryPlaysWrongGame` rules (incl. renamed
+game, unknown games, finished, not pinned), a pinned channel stays matched while
+it streams something else, the popup badge on the wrong game / back on the right
+game / unmatched (9 languages), ownership independent of the game played. Each
+new case fails against 0.6.17 (run one by one: e.g. the popup showed "watching",
+and the slot went to nobody). All 16 test files pass; `web-ext lint` clean
+(0/0/0); i18n key parity holds (83/language).
+
+`BUILD_MARKER` -> `2026-10-02-r2`, `manifest.json` -> 0.6.18.
