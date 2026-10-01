@@ -237,6 +237,38 @@
     },
   };
 
+  // The Inventory operation also lists every campaign the user has in progress
+  // with what it takes to earn it (captured 2026-10-01: id, name, status,
+  // game{id,name}, and allow.channels[{id,name,url}] - null when anyone's
+  // channel counts). background.js uses it to tell a game's general campaign
+  // from the ones restricted to named channels, whose inventory cards look the
+  // same (see entryOwnsCard in shared.js). Always a full snapshot: a campaign
+  // that is no longer in progress must disappear.
+  const CAMPAIGN_EXTRACTORS = {
+    Inventory(body) {
+      const list = body?.data?.currentUser?.inventory?.dropCampaignsInProgress;
+      if (!Array.isArray(list)) return null;
+      const campaigns = list
+        .filter((c) => c && c.id)
+        .map((c) => {
+          const channels = Array.isArray(c.allow && c.allow.channels)
+            ? c.allow.channels.map((ch) => String((ch && ch.name) || "").toLowerCase()).filter(Boolean)
+            : [];
+          const endAt = c.endAt ? Date.parse(c.endAt) : NaN;
+          return {
+            id: String(c.id),
+            name: c.name || null,
+            status: c.status || null,
+            endAt: Number.isNaN(endAt) ? null : endAt,
+            gameId: c.game && c.game.id ? String(c.game.id) : null,
+            gameName: (c.game && (c.game.name || c.game.displayName)) || null,
+            channels: channels.length ? channels : null,
+          };
+        });
+      return { kind: "inventoryCampaigns", campaigns };
+    },
+  };
+
   // claim requests made by this page so far, numbered in request order and
   // announced as `claimRequest` when they go out; the response's `seq` is the
   // request's (content.js pairs them with its own clicks)
@@ -277,6 +309,11 @@
           if (claimSeqs && claimSeqs[i] != null) signal.seq = claimSeqs[i];
           post({ operationName: name, signal: { ...signal, operationName: name }, at: Date.now() });
         }
+      }
+      const campaigns = CAMPAIGN_EXTRACTORS[name];
+      if (campaigns) {
+        const signal = campaigns(resEntry);
+        if (signal) post({ operationName: name, signal, at: Date.now() });
       }
       const extractor = EXTRACTORS[name];
       if (!extractor) return;

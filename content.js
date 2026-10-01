@@ -743,20 +743,57 @@
   // required now that no card shows a game name as text at all. A card
   // whose boxart id isn't in the map yet is skipped, not guessed at - it
   // picks itself back up the next scan once background.js has learned it.
+  // Which campaign a card is (real capture, 2026-10-01): its title is a link to
+  // `/drops/campaigns?dropID=<campaign id>`. Two cards of one game share the
+  // boxart, so this id (not the game) is what tells them apart.
+  function extractCardCampaign(card) {
+    const a = card.querySelector && card.querySelector('a[href*="dropID="]');
+    if (!a) return { id: null, name: null };
+    const m = (a.getAttribute("href") || "").match(/[?&]dropID=([0-9A-Za-z-]+)/);
+    return { id: m ? m[1] : null, name: (a.textContent || "").trim() || null };
+  }
+
+  // The channels a restricted campaign's card names ("To continue the
+  // progress, go to a participating live channel including /a and /b" - real
+  // links https://www.twitch.tv/<login>). Possibly only some of them for a
+  // campaign with many; the Inventory GQL has the complete list.
+  function extractCardChannels(card) {
+    const out = new Set();
+    for (const a of card.querySelectorAll("a[href]")) {
+      const m = (a.getAttribute("href") || "").match(/^https?:\/\/(?:www\.)?twitch\.tv\/([A-Za-z0-9_]{1,25})\/?(?:[?#].*)?$/);
+      if (m && !RESERVED_PATHS.has(m[1].toLowerCase())) out.add(m[1].toLowerCase());
+    }
+    return [...out];
+  }
+
+  // One entry per inventory card of a game/channel we track. Cards of one game
+  // are NOT merged any more: a game's general campaign and the campaigns
+  // restricted to named channels have different cards, and which of them an
+  // entry owns is decided by background.js (entryOwnsCard in shared.js).
   function parseInventoryCampaigns(watchList, gameIdMap, claimedCounts) {
     const imgs = [...document.querySelectorAll(GAME_CARD_IMAGE_SELECTOR)];
     if (imgs.length === 0) return [];
 
+    const trackedGames = new Set(watchList.map(entryGameSlug).filter(Boolean));
+    const pinnedChannels = new Set(watchList.filter((g) => g.pinnedChannel).map((g) => lcChannel(g.channel)));
+
     const results = [];
     for (const img of imgs) {
       const gameId = extractGameIdFromBoxart(img);
-      const name = gameId && gameIdMap && gameIdMap[gameId];
-      if (!name) continue; // id not learned yet - fails closed, see comment above
-
-      const slug = toSlug(name);
-      if (!watchList.some((g) => g.slug === slug)) continue; // not a game we're tracking
+      const gameName = gameId && gameIdMap && gameIdMap[gameId];
+      const slug = gameName ? toSlug(gameName) : null; // id not learned yet: no game, see comment above
 
       const card = findCampaignCardBoundary(img);
+      const ref = extractCardCampaign(card);
+      const channels = extractCardChannels(card);
+      // a game we track, a channel we pin, or - with pinned channels around,
+      // whose game may not be known yet - any card that names its campaign
+      // (background.js discards what no entry owns)
+      const wanted = (slug && trackedGames.has(slug)) ||
+        channels.some((c) => pinnedChannels.has(c)) ||
+        (pinnedChannels.size > 0 && !!ref.id);
+      if (!wanted) continue;
+      const name = gameName || ref.name;
       const cardText = card.innerText || "";
       const accountNotConnected = /connect.*account|link.*account|account not connected|เชื่อมต่อบัญชี/i.test(cardText);
       // real capture: current text is "This reward is no longer
@@ -800,6 +837,9 @@
       results.push({
         slug,
         label: name,
+        campaignId: ref.id,
+        campaignName: ref.name,
+        channels,
         claimed,
         total: bars.length,
         accountNotConnected,
@@ -808,7 +848,7 @@
         timeRemainingMin: foundDuration ? timeRemainingMin : null,
       });
     }
-    return dedupeBySlugPreferringActive(results);
+    return dedupeByCampaign(results);
   }
 
   // A game can have more than one campaign card showing at once (e.g. an
@@ -821,13 +861,19 @@
   // reason if the active one loses, or permanently abandoning a still-live
   // campaign if the expired one loses. A slug only counts as expired if
   // every one of its cards is expired.
-  function dedupeBySlugPreferringActive(results) {
-    const bySlug = new Map();
+  // the same campaign twice (a re-render caught mid-way): keep the active
+  // one. Cards without a campaign id are all kept - telling them apart by game
+  // is exactly what used to pick the wrong card.
+  function dedupeByCampaign(results) {
+    const byId = new Map();
+    const out = [];
     for (const r of results) {
-      const existing = bySlug.get(r.slug);
-      if (!existing || (existing.expired && !r.expired)) bySlug.set(r.slug, r);
+      if (!r.campaignId) { out.push(r); continue; }
+      const i = byId.get(r.campaignId);
+      if (i === undefined) { byId.set(r.campaignId, out.length); out.push(r); continue; }
+      if (out[i].expired && !r.expired) out[i] = r;
     }
-    return [...bySlug.values()];
+    return out;
   }
 
   // =========================================================================

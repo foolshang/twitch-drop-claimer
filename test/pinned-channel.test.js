@@ -180,8 +180,8 @@ async function testCombinedQuotaAcrossGamesAndChannels() {
 }
 
 // -----------------------------------------------------------------------
-// handleChannelPlayingGame: binds a pinned entry to the real game slug once
-// content.js reports it, migrating storage keys without touching the tab
+// handleChannelPlayingGame: records the game a pinned entry's channel plays once
+// content.js reports it - the entry keeps its own key and its tab
 // -----------------------------------------------------------------------
 async function testResolvesPinnedChannelToRealSlug() {
   const { ctx, storageData, tabsById, flush } = makeSandbox();
@@ -192,6 +192,7 @@ async function testResolvesPinnedChannelToRealSlug() {
   await flush(30);
   const tabId = storageData.watchTabs["channel:teststreamer"];
   const tabsBefore = tabsById.size;
+  const startedAt = storageData.watchMeta["channel:teststreamer"].watchStartedAt;
 
   await vm.runInContext("handleChannelPlayingGame", ctx)(
     { channel: "teststreamer", slug: "path-of-exile-2", gameName: "Path of Exile 2" },
@@ -199,36 +200,36 @@ async function testResolvesPinnedChannelToRealSlug() {
   );
   await flush(20);
 
-  assert.ok(!storageData.watchTabs["channel:teststreamer"], "pseudo key must be gone after resolution");
-  assert.strictEqual(storageData.watchTabs["path-of-exile-2"], tabId, "same tab, just re-keyed to the real slug");
+  // 0.6.16 rewrote the entry's key to the game slug here (and refused when another entry had it)
+  assert.strictEqual(storageData.watchTabs["channel:teststreamer"], tabId, "the entry keeps its own key and its tab");
+  assert.ok(!storageData.watchTabs["path-of-exile-2"], "the game slug is not an entry key of the pinned channel");
   assert.strictEqual(tabsById.size, tabsBefore, "resolving must never close/recreate the tab");
 
   const entry = storageData.watchList.find((g) => g.channel === "teststreamer");
-  assert.strictEqual(entry.slug, "path-of-exile-2");
-  assert.strictEqual(entry.pinnedChannel, true, "still marked pinned - must keep behaving like a pinned entry");
+  assert.strictEqual(entry.slug, "channel:teststreamer", "key unchanged");
+  assert.strictEqual(entry.pinnedChannel, true);
+  assert.strictEqual(entry.gameSlug, "path-of-exile-2", "the game it plays is recorded next to the key");
   assert.strictEqual(entry.pinnedGameName, "Path of Exile 2");
 
-  const meta = storageData.watchMeta["path-of-exile-2"];
-  assert.ok(meta, "watchMeta must exist under the new real-slug key");
+  const meta = storageData.watchMeta["channel:teststreamer"];
   assert.strictEqual(meta.channel, "teststreamer");
   assert.strictEqual(meta.tabId, tabId);
-  assert.ok(!storageData.watchMeta["channel:teststreamer"], "old pseudo-key watchMeta must be gone");
+  assert.strictEqual(meta.watchStartedAt, startedAt, "finding out the game does not restart the verify clock");
 
   // reporting the exact same slug again must be a no-op (no churn)
-  const startedAt = meta.watchStartedAt;
   await vm.runInContext("handleChannelPlayingGame", ctx)(
     { channel: "teststreamer", slug: "path-of-exile-2", gameName: "Path of Exile 2" },
     { id: tabId }
   );
   await flush(20);
-  assert.strictEqual(storageData.watchMeta["path-of-exile-2"].watchStartedAt, startedAt, "re-reporting the same game must not reset the verify clock");
+  assert.strictEqual(storageData.watchMeta["channel:teststreamer"].watchStartedAt, startedAt, "re-reporting the same game must not reset the verify clock");
 
-  console.log("  OK  handleChannelPlayingGame: pinned entry is rebound to the real game slug in place, tab untouched");
+  console.log("  OK  handleChannelPlayingGame: the game is recorded on the pinned entry, key and tab untouched");
 }
 
 // -----------------------------------------------------------------------
-// A pinned channel that later plays a genuinely different game gets rebound
-// again, and does NOT carry the previous game's campaign progress with it
+// A pinned channel that later plays a genuinely different game is re-recorded,
+// and does NOT carry the previous game's campaign progress with it
 // -----------------------------------------------------------------------
 async function testGameSwitchDropsStaleProgress() {
   const { ctx, storageData, tabsById, flush } = makeSandbox();
@@ -244,32 +245,35 @@ async function testGameSwitchDropsStaleProgress() {
   );
   await flush(10);
   await vm.runInContext("mergeInventoryProgress", ctx)([
-    { slug: "path-of-exile-2", label: "PoE2", claimed: 1, total: 3, timeRemainingMin: 90 },
+    { slug: "path-of-exile-2", label: "PoE2", campaignId: "c1", campaignName: "PoE2 streamer drops", channels: ["teststreamer"], claimed: 1, total: 3, timeRemainingMin: 90 },
   ]);
   await flush(10);
-  assert.ok(storageData.campaignProgress["path-of-exile-2"], "sanity: progress recorded for the first game");
+  assert.ok(storageData.campaignProgress["channel:teststreamer"], "sanity: progress recorded for the pinned entry from its own card");
 
   // the channel switched to a different game entirely
+  const before = storageData.watchMeta["channel:teststreamer"].watchStartedAt;
+  await new Promise((r) => setTimeout(r, 5));
   await vm.runInContext("handleChannelPlayingGame", ctx)(
     { channel: "teststreamer", slug: "diablo-iv", gameName: "Diablo IV" }, { id: tabId }
   );
   await flush(20);
 
-  assert.ok(!storageData.campaignProgress["path-of-exile-2"], "old game's progress must not linger under the old slug");
-  assert.ok(!storageData.campaignProgress["diablo-iv"], "new game's progress must start fresh (not invented)");
-  assert.strictEqual(storageData.watchTabs["diablo-iv"], tabId, "same tab, migrated to the new slug");
-  assert.ok(!storageData.watchTabs["path-of-exile-2"], "old slug entry must be gone");
-  assert.strictEqual(storageData.watchList.find((g) => g.channel === "teststreamer").pinnedGameName, "Diablo IV");
+  assert.ok(!storageData.campaignProgress["channel:teststreamer"], "the old game's progress must not linger (and nothing is invented for the new one)");
+  assert.strictEqual(storageData.watchTabs["channel:teststreamer"], tabId, "same tab, same key");
+  assert.ok(storageData.watchMeta["channel:teststreamer"].watchStartedAt > before, "the verify clock starts afresh on the new game");
+  const entry = storageData.watchList.find((g) => g.channel === "teststreamer");
+  assert.strictEqual(entry.gameSlug, "diablo-iv");
+  assert.strictEqual(entry.pinnedGameName, "Diablo IV");
   assert.strictEqual(tabsById.size, 2, "still just the one watch tab + the always-open inventory tab throughout");
 
-  console.log("  OK  handleChannelPlayingGame: switching to a different game rebinds cleanly, drops stale progress");
+  console.log("  OK  handleChannelPlayingGame: switching to a different game drops the stale progress, tab and key untouched");
 }
 
 // -----------------------------------------------------------------------
-// Binding must refuse to collide with a slug already tracked by another
-// (ordinary) watch-list entry, rather than corrupting both entries' state
+// A pinned channel playing the game another entry is about must coexist with
+// it: two entries, two tabs, two states (0.6.16 refused to bind here)
 // -----------------------------------------------------------------------
-async function testResolutionSkipsOnCollision() {
+async function testResolvesAlongsideAGameEntryWithTheSameSlug() {
   const { ctx, storageData, flush } = makeSandbox();
   loadBackground(ctx);
   storageData.watchList = [
@@ -277,20 +281,27 @@ async function testResolutionSkipsOnCollision() {
     { input: "@teststreamer", slug: "channel:teststreamer", channel: "teststreamer", pinnedChannel: true },
   ];
   await flush(30);
-  const tabId = storageData.watchTabs["channel:teststreamer"];
+  const gameTab = storageData.watchTabs["path-of-exile-2"];
+  const pinnedTab = storageData.watchTabs["channel:teststreamer"];
+  assert.ok(gameTab && pinnedTab && gameTab !== pinnedTab, "sanity: each entry has a tab of its own");
+  const gameMeta = { ...storageData.watchMeta["path-of-exile-2"] };
 
+  // the pinned channel turns out to play the very game the other entry is about
   await vm.runInContext("handleChannelPlayingGame", ctx)(
-    { channel: "teststreamer", slug: "path-of-exile-2", gameName: "Path of Exile 2" }, { id: tabId }
+    { channel: "teststreamer", slug: "path-of-exile-2", gameName: "Path of Exile 2" }, { id: pinnedTab }
   );
   await flush(20);
 
-  assert.strictEqual(storageData.watchTabs["channel:teststreamer"], tabId, "pinned entry stays parked under its pseudo slug on collision");
-  assert.ok(!storageData.watchMeta["path-of-exile-2"] || storageData.watchMeta["path-of-exile-2"].channel !== "teststreamer",
-    "must not steal the other entry's slot");
-  const entry = storageData.watchList.find((g) => g.channel === "teststreamer");
-  assert.strictEqual(entry.slug, "channel:teststreamer", "unresolved - left parked rather than corrupting the existing game entry");
+  assert.strictEqual(storageData.watchTabs["path-of-exile-2"], gameTab, "the game entry keeps its tab");
+  assert.strictEqual(storageData.watchTabs["channel:teststreamer"], pinnedTab, "and the pinned entry keeps its own");
+  assert.deepStrictEqual({ ...storageData.watchMeta["path-of-exile-2"] }, gameMeta, "the game entry's state is not touched");
+  assert.strictEqual(storageData.watchMeta["channel:teststreamer"].channel, "teststreamer");
+  const pinned = storageData.watchList.find((g) => g.channel === "teststreamer");
+  assert.strictEqual(pinned.slug, "channel:teststreamer");
+  assert.strictEqual(pinned.gameSlug, "path-of-exile-2", "it just knows its game now");
+  assert.strictEqual(storageData.watchList.find((g) => g.input === "poe2").slug, "path-of-exile-2");
 
-  console.log("  OK  handleChannelPlayingGame: refuses to bind onto a slug another watch-list entry already owns");
+  console.log("  OK  handleChannelPlayingGame: a pinned channel playing a listed game coexists with that game's entry (no collision)");
 }
 
 // -----------------------------------------------------------------------
@@ -305,6 +316,8 @@ async function testStalledPinnedChannelIsNeverRotated() {
   ];
   await flush(30);
   const tabId = storageData.watchTabs["channel:teststreamer"];
+  const KEY = "channel:teststreamer";
+  const card = { slug: "path-of-exile-2", label: "PoE2", campaignId: "c1", campaignName: "PoE2 streamer drops", channels: ["teststreamer"], claimed: 0, total: 3, timeRemainingMin: 120 };
 
   await vm.runInContext("handleChannelPlayingGame", ctx)(
     { channel: "teststreamer", slug: "path-of-exile-2", gameName: "Path of Exile 2" }, { id: tabId }
@@ -312,26 +325,22 @@ async function testStalledPinnedChannelIsNeverRotated() {
   await flush(10);
 
   const VERIFY_DELAY_MS = vm.runInContext("VERIFY_DELAY_MS", ctx);
-  storageData.watchMeta["path-of-exile-2"].watchStartedAt = Date.now() - VERIFY_DELAY_MS - 5_000;
+  storageData.watchMeta[KEY].watchStartedAt = Date.now() - VERIFY_DELAY_MS - 5_000;
 
-  await vm.runInContext("mergeInventoryProgress", ctx)([
-    { slug: "path-of-exile-2", label: "PoE2", claimed: 0, total: 3, timeRemainingMin: 120 },
-  ]);
+  await vm.runInContext("mergeInventoryProgress", ctx)([card]);
   await vm.runInContext("verifySweep", ctx)(); // captures baseline
   await flush(10);
-  storageData.watchMeta["path-of-exile-2"].baselineCapturedAt = Date.now() - VERIFY_DELAY_MS - 5_000;
+  storageData.watchMeta[KEY].baselineCapturedAt = Date.now() - VERIFY_DELAY_MS - 5_000;
 
   // no movement at all since the baseline - would rotate a normal channel
-  await vm.runInContext("mergeInventoryProgress", ctx)([
-    { slug: "path-of-exile-2", label: "PoE2", claimed: 0, total: 3, timeRemainingMin: 120 },
-  ]);
+  await vm.runInContext("mergeInventoryProgress", ctx)([card]);
   await vm.runInContext("verifySweep", ctx)();
   await flush(10);
 
-  assert.strictEqual(storageData.watchTabs["path-of-exile-2"], tabId, "pinned channel's tab must survive a stalled verify sweep");
-  assert.ok(storageData.watchMeta["path-of-exile-2"], "watchMeta must not be cleared - it's the same channel by design, not a rejection");
+  assert.strictEqual(storageData.watchTabs[KEY], tabId, "pinned channel's tab must survive a stalled verify sweep");
+  assert.ok(storageData.watchMeta[KEY], "watchMeta must not be cleared - it's the same channel by design, not a rejection");
   assert.ok(
-    !(storageData.blockedChannels && storageData.blockedChannels["path-of-exile-2"] && storageData.blockedChannels["path-of-exile-2"].teststreamer),
+    !(storageData.blockedChannels && storageData.blockedChannels[KEY] && storageData.blockedChannels[KEY].teststreamer),
     "pinned channel must never be added to blockedChannels"
   );
   assert.ok(tabsById.has(tabId), "tab itself must still be open");
@@ -339,6 +348,43 @@ async function testStalledPinnedChannelIsNeverRotated() {
   console.log("  OK  verifySweep: a stalled pinned channel is left watching, never rotated/blocklisted");
 }
 
+
+// -----------------------------------------------------------------------
+// An entry with no inventory card yet (a card only appears once minutes start
+// accruing) has unknown progress - never done, and its tab stays open. This
+// holds for a pinned channel and for a game entry whose general campaign has
+// no card, even when the inventory shows restricted cards of other channels.
+// -----------------------------------------------------------------------
+async function testEntryWithoutACardIsStillWatched() {
+  const { ctx, storageData, tabsById, flush } = makeSandbox();
+  loadBackground(ctx);
+  storageData.tabQuota = 3;
+  storageData.watchList = [
+    { input: "poe2", slug: "path-of-exile-2" },
+    { input: "@teststreamer", slug: "channel:teststreamer", channel: "teststreamer", pinnedChannel: true },
+  ];
+  await flush(30);
+  const keys = Object.keys(storageData.watchTabs).sort();
+  assert.deepStrictEqual(keys, ["channel:teststreamer", "path-of-exile-2"], "sanity: each entry has a watch tab");
+  const tabIds = { ...storageData.watchTabs };
+
+  // the inventory only has a card of a campaign restricted to somebody else's channel
+  await vm.runInContext("mergeInventoryProgress", ctx)([
+    { slug: "path-of-exile-2", label: "PoE2", campaignId: "c9", campaignName: "Someone else's drops", channels: ["othercaster"], claimed: 1, total: 1, timeRemainingMin: 0 },
+  ]);
+  await vm.runInContext("serialized(autoWatchTick)", ctx);
+  await flush(20);
+
+  assert.ok(!storageData.campaignProgress || !storageData.campaignProgress["path-of-exile-2"], "the game entry is not lent the restricted card");
+  assert.ok(!storageData.campaignProgress || !storageData.campaignProgress["channel:teststreamer"], "the pinned entry has no card -> no reading");
+  const isGameDone = vm.runInContext("isGameDone", ctx);
+  assert.strictEqual(isGameDone("path-of-exile-2", storageData.campaignProgress || {}, {}), false);
+  assert.strictEqual(isGameDone("channel:teststreamer", storageData.campaignProgress || {}, {}), false);
+  assert.deepStrictEqual({ ...storageData.watchTabs }, tabIds, "both tabs are still there, untouched");
+  for (const id of Object.values(tabIds)) assert.ok(tabsById.has(id), "and open");
+
+  console.log("  OK  an entry without an inventory card yet is unknown, not done, and keeps being watched (pinned and game)");
+}
 (async () => {
   console.log("Running pinned-channel ('@channel') tests (no real browser, no network)...\n");
   try {
@@ -347,8 +393,9 @@ async function testStalledPinnedChannelIsNeverRotated() {
     await testCombinedQuotaAcrossGamesAndChannels();
     await testResolvesPinnedChannelToRealSlug();
     await testGameSwitchDropsStaleProgress();
-    await testResolutionSkipsOnCollision();
+    await testResolvesAlongsideAGameEntryWithTheSameSlug();
     await testStalledPinnedChannelIsNeverRotated();
+    await testEntryWithoutACardIsStillWatched();
     console.log("\nALL PASSED");
     process.exit(0);
   } catch (e) {

@@ -2258,3 +2258,103 @@ Signed to the UNLISTED channel on 2026-09-30 (`npm run submit`, no
 `.amo-submitted-versions.json`. Not submitted to the listed channel. AMO does
 not allow reusing a version number, so if the test goes well the same code
 ships to listed as 0.6.17 (manifest + `BUILD_MARKER` bump only).
+
+
+## 0.6.17 - "Rust" and "@streamer" side by side: progress per campaign, not per game
+
+(Not released together with 0.6.16, which was signed to the unlisted channel
+for testing; this is the next version after it.)
+
+**Request:** a game entry ("Rust") and a pinned channel ("@streamer", a channel
+that plays Rust) on the same list, each with its own tab and its own progress -
+"Rust" = the regular campaign (any channel), "@streamer" = the campaign
+restricted to that channel - and the pinned row shown like a game row.
+
+**Problem 1 - they could not coexist:** `handleChannelPlayingGame` rewrote a
+pinned entry's key to the game's slug and, when another entry already had that
+slug, refused (`pinned channel X - won't bind to rust - already tracked by
+another watch-list entry`), leaving the pinned entry parked under its synthetic
+`channel:<name>` key with no game known.
+
+**Problem 2 - progress was per game, so the wrong card could decide:**
+`parseInventoryCampaigns` collapsed all cards of a game into the first active one
+(`dedupeBySlugPreferringActive`). A game can have a general campaign and many
+campaigns that only count on named channels, and their inventory cards share the
+boxart. So a "Rust" entry took the numbers of whichever card came first in the
+DOM - possibly a campaign restricted to other channels, one that watching the
+directory's lowest-viewer channel can never earn - and could be called done on
+it. (Real inventory on 2026-10-01: five Rust cards, all restricted to two
+channels each; the general campaign, "Rust Isles General Drops", had none yet.)
+
+**What the real data shows** (one-time capture on 2026-10-01 from a copy of the
+user's profile, per the user's explicit exception to the README rule; read-only,
+our extension removed from the copy, only POST data/responses and card HTML
+saved, copy deleted afterwards):
+- The inventory card's title is a link to `/drops/campaigns?dropID=<campaign id>`;
+  a restricted campaign's card also says "including /a and /b" with real
+  `https://www.twitch.tv/<login>` links (possibly only some channels of many).
+  Neither the campaign nor the reward name contains a channel name.
+- The Inventory GQL's `dropCampaignsInProgress[]` carries `id`, `name`,
+  `status`, `game{id,name}`, `self.isAccountConnected`, `timeBasedDrops[]`
+  (reward names, `requiredMinutesWatched`, `self.currentMinutesWatched`) and the
+  complete `allow.channels[{id,name,url}]` (`null` for a campaign that is not
+  restricted). `DropCampaignDetails` returns the same list (plus
+  `allow.isEnabled`), matched to the inventory by campaign `id`; the dashboard
+  (161 campaigns) has no `allow`. A campaign appears in the inventory only once
+  minutes accrue. A channel can be in several campaigns (an expired one and an
+  active one in the capture).
+
+**Fix (D1: type just `@streamer`, matching by channel):**
+- A pinned entry keeps its `channel:<name>` key for good; `handleChannelPlayingGame`
+  only records `gameSlug`/`pinnedGameName` on it (a switch to another game drops
+  its progress and restarts its verify clock). Popup Save carries these over.
+- inject.js sends the Inventory GQL's campaigns as an `inventoryCampaigns`
+  snapshot (`CAMPAIGN_EXTRACTORS`); background.js stores it
+  (`inventoryCampaigns`) and re-judges the latest card scan when it arrives late.
+- content.js reports every inventory card of a tracked game/pinned channel with
+  its campaign id/name (title link) and the channels it names; nothing is merged
+  by game any more (`dedupeByCampaign`, only a re-render duplicate of the same id).
+- shared.js `entryOwnsCard`: a game entry owns the cards of its game that are
+  NOT restricted; a pinned entry owns the cards of ACTIVE campaigns whose channel
+  list contains its channel (the GQL's complete list beats the card's possibly
+  partial one; the card's own links are used until the GQL arrives; a campaign
+  of another game than the channel plays is skipped). `aggregateEntryProgress`:
+  an entry is done only when EVERY card it owns is complete and the GQL lists no
+  campaign for it that has no card; expired only when all are; claimed/total/time
+  left add up. `mergeInventoryProgress` now writes per ENTRY.
+- No card yet = no progress: unknown, never done, and the tab stays open (a card
+  only appears once minutes accrue). A vanished card counts as claimed only after
+  the usual corroboration AND once the Inventory GQL no longer lists the entry's
+  campaigns.
+- A game entry's directory pick never lands on a channel another entry watches or
+  pins (`isWatchTab` blocked list).
+- Popup: a pinned row shows the matched campaign name(s) and progress/time
+  left/done state like a game row; without a card it says "progress unknown -
+  waiting for the first minutes to accrue" (`detail_pinned_unknown`,
+  `row_campaign`, 9 languages).
+
+**Not verified:** the card of a campaign that is NOT restricted was never captured
+(the account had none in progress) - it is assumed to show no channel links, and
+the Inventory GQL (`allow.channels` null) is the primary classifier anyway, the
+card's links only the fallback. No live run of 0.6.17 (README rule: no live tests
+with a real session); the matching is exercised with fixtures that follow the
+captured structure, scrubbed of any user id/name.
+
+**Tests:** new `test/campaign-matching.test.js` (13 cases, real content.js on a
+jsdom page + real background.js + real popup.js): Rust with a restricted card at
+100% first and the general card at 6% = 6% and not done, while `@itsryanhiga`
+gets its own card and is done; each entry shows its own numbers; finishing one
+closes only its own tab (both directions); no card = unknown, never done, nothing
+borrowed; a channel in two active campaigns is done only when both are (and not
+when one card is missing); expired campaigns ignored; classification from the
+card's links until the GQL arrives, then re-judged; a vanished card is not
+"claimed" while the GQL lists the campaign; directory pick avoids the pinned
+channel; ownership rules; popup rows (campaign name, progress, done, unknown);
+Save keeps the learned game; the Inventory GQL extractor. `pinned-channel.test.js`
+rewritten for keys that stay (no rekey, coexistence with a game entry) plus
+"an entry without a card is still watched" through the real scheduler;
+`inventory-parse.test.js` now expects one record per card. Every new or rewritten case of the first two files fails
+against 0.6.16 (run one by one). All 16 test files pass; `web-ext lint` clean
+(0/0/0); i18n key parity holds (82/language).
+
+`BUILD_MARKER` -> `2026-10-02-r1`, `manifest.json` -> 0.6.17.

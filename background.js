@@ -1262,178 +1262,175 @@ async function applyResolvedSlug(badSlug, goodSlug) {
 }
 
 // ============================================================================
-// pinned-channel resolution - a watch-list entry typed as "@channel" starts
-// with a synthetic "channel:<name>" slug (see parseWatchList). Once
-// content.js's channel-page monitor sees that channel live and reports what
-// game it's playing (msg.slug, already run through toSlug()+ALIASES the same
-// way parseInventoryCampaigns derives its own card slug - see
-// currentStreamGame() in content.js), rewrite the entry's slug to that real
-// category slug so every existing per-slug system (inventory-progress
-// matching, badges, isGameDone, verifyDropStatus) treats it exactly like an
-// ordinary typed-game entry from here on. Also fires again if a pinned
-// channel later switches to a genuinely different game - campaign progress
-// belongs to a specific game and is never carried across that switch, but
-// the tab itself is untouched (it's already sitting on the right channel).
+// pinned-channel resolution - a watch-list entry typed as "@channel" has the
+// synthetic key "channel:<name>" (see parseWatchList) for good: every per-entry
+// storage map (watchTabs, watchMeta, campaignProgress, blockedChannels, ...) is
+// indexed by it, so "Rust" and "@streamer" (whose channel plays Rust) are two
+// entries with a tab and a state of their own. When content.js's channel-page
+// monitor sees the channel live it reports what game it is playing (msg.slug,
+// already run through toSlug()+ALIASES the same way parseInventoryCampaigns
+// derives its own card slug - see currentStreamGame() in content.js); that
+// goes into the entry's `gameSlug` / `pinnedGameName`, which only say which
+// game the channel is on - never the key. (0.6.16 and older rewrote the key to
+// the game slug and refused when another entry already had it.) A switch to a
+// different game drops the entry's progress, which belonged to the old game's
+// campaigns; the tab itself is untouched (it is already on the right channel).
 // ============================================================================
 async function handleChannelPlayingGame(msg, tab) {
   const { channel, slug, gameName } = msg;
   if (!tab || !channel || !slug) return;
 
   const changed = await serialized(async () => {
-    const cfg = await browser.storage.local.get([
-      "watchList", "watchTabs", "watchMeta", "dropSignals", "campaignProgress",
-      "invalidSlugs", "emptyUntil", "gameWaitUntil", "blockedChannels",
-    ]);
+    const cfg = await browser.storage.local.get(["watchList", "watchTabs", "watchMeta", "dropSignals", "campaignProgress"]);
     const watchTabs = cfg.watchTabs || {};
-    const fromSlug = Object.keys(watchTabs).find((s) => watchTabs[s] === tab.id);
-    if (!fromSlug || fromSlug === slug) return false;
+    const key = Object.keys(watchTabs).find((s) => watchTabs[s] === tab.id);
+    if (!key) return false;
 
     const watchList = cfg.watchList || [];
-    const game = watchList.find((g) => g.slug === fromSlug);
+    const game = watchList.find((g) => g.slug === key);
     if (!game || !game.pinnedChannel) return false; // not a pinned-channel watch tab
 
-    if (watchList.some((g) => g.slug === slug)) {
-      log("pinned channel", channel, "- won't bind to", slug, "- already tracked by another watch-list entry");
-      return false;
-    }
+    const prevGame = entryGameSlug(game);
+    if (prevGame === slug && game.pinnedGameName === (gameName || game.pinnedGameName || null)) return false;
 
     const nextWatchList = watchList.map((g) =>
-      g.slug === fromSlug ? { ...g, slug, pinnedGameName: gameName || null } : g
+      g.slug === key ? { ...g, gameSlug: slug, pinnedGameName: gameName || null } : g
     );
 
-    const rekey = (obj) => {
-      if (!obj || typeof obj !== "object" || Array.isArray(obj) || !(fromSlug in obj)) return obj || {};
-      const next = { ...obj, [slug]: obj[fromSlug] };
-      delete next[fromSlug];
-      return next;
-    };
-    const nextWatchTabs = rekey(watchTabs);
-    const nextInvalidSlugs = rekey(cfg.invalidSlugs && !Array.isArray(cfg.invalidSlugs) ? cfg.invalidSlugs : {});
-    const nextEmptyUntil = rekey(cfg.emptyUntil || {});
-    const nextGameWaitUntil = rekey(cfg.gameWaitUntil || {});
-    const nextBlockedChannels = rekey(cfg.blockedChannels || {});
-
-    // campaign progress is game-specific - never carried across a pinned
-    // channel binding to a game for the first time (nothing to carry) or
-    // switching to a different one (would misattribute the old game's numbers)
-    const nextCampaignProgress = { ...(cfg.campaignProgress || {}) };
-    delete nextCampaignProgress[fromSlug];
-
-    // fresh verify clock - can't judge progress against a baseline from
-    // before this game was even known
-    const nextWatchMeta = { ...(cfg.watchMeta || {}) };
-    delete nextWatchMeta[fromSlug];
-    nextWatchMeta[slug] = { channel, tabId: tab.id, watchStartedAt: Date.now() };
-    const nextDropSignals = { ...(cfg.dropSignals || {}) };
-    delete nextDropSignals[fromSlug];
+    const switched = !!prevGame && prevGame !== slug;
+    const patch = { watchList: nextWatchList };
+    if (switched) {
+      // progress is campaign-specific - never carried across a game switch -
+      // and the verify clock starts afresh (nothing to judge against a
+      // baseline taken on another game)
+      const nextProgress = { ...(cfg.campaignProgress || {}) };
+      delete nextProgress[key];
+      const nextWatchMeta = { ...(cfg.watchMeta || {}) };
+      nextWatchMeta[key] = { channel, tabId: tab.id, watchStartedAt: Date.now() };
+      const nextDropSignals = { ...(cfg.dropSignals || {}) };
+      delete nextDropSignals[key];
+      Object.assign(patch, { campaignProgress: nextProgress, watchMeta: nextWatchMeta, dropSignals: nextDropSignals });
+    }
 
     suppressWatchListReaction = true;
     try {
-      await browser.storage.local.set({
-        watchList: nextWatchList,
-        watchTabs: nextWatchTabs,
-        watchMeta: nextWatchMeta,
-        dropSignals: nextDropSignals,
-        campaignProgress: nextCampaignProgress,
-        invalidSlugs: nextInvalidSlugs,
-        emptyUntil: nextEmptyUntil,
-        gameWaitUntil: nextGameWaitUntil,
-        blockedChannels: nextBlockedChannels,
-      });
+      await browser.storage.local.set(patch);
     } finally {
       suppressWatchListReaction = false;
     }
-    log(
-      "pinned channel", channel, fromSlug.startsWith("channel:") ? "resolved to game" : "switched game to",
-      slug, gameName ? `(${gameName})` : ""
-    );
-    return true;
+    log("pinned channel", channel, prevGame ? (switched ? "switched game to" : "game is") : "resolved to game", slug, gameName ? `(${gameName})` : "");
+    return switched;
   });
 
   if (changed) await serialized(autoWatchTick);
 }
 
+// The latest DOM scan of /drops/inventory's cards and, from the Inventory GQL
+// (inject.js `inventoryCampaigns`), what each campaign is: either may arrive
+// first, so a late snapshot re-judges the scan that is already here.
+let lastInventoryCards = null; // { at, cards }
+const INVENTORY_REJUDGE_MAX_AGE_MS = 5 * 60 * 1000;
+
+async function handleInventoryCampaigns(signal) {
+  const byId = {};
+  for (const c of signal.campaigns || []) if (c && c.id) byId[c.id] = c;
+  await browser.storage.local.set({ inventoryCampaigns: { at: Date.now(), byId } });
+  if (lastInventoryCards && Date.now() - lastInventoryCards.at < INVENTORY_REJUDGE_MAX_AGE_MS) {
+    await mergeInventoryProgress(lastInventoryCards.cards);
+  }
+}
+
+// Turns the cards content.js scanned into per-ENTRY progress. A game entry owns
+// the cards of its game that are not restricted to named channels (its general
+// campaign); a pinned entry owns the cards of ACTIVE campaigns that name its
+// channel; an entry that owns no card yet simply has no progress - "unknown",
+// never done, and still watched (shared.js: entryOwnsCard). Finished = every
+// owned card complete (aggregateEntryProgress).
 async function mergeInventoryProgress(campaigns) {
-  // campaigns may legitimately be [] (every watched game's card is gone from
+  // campaigns may legitimately be [] (every watched entry's card is gone from
   // "In Progress") - still need to run so the missing-card reconciliation
   // below gets a chance to fire. Only a genuinely missing/malformed message
   // short-circuits.
   if (!campaigns) return;
+  lastInventoryCards = { at: Date.now(), cards: campaigns };
 
   return serialized(async () => {
     const cfg = await browser.storage.local.get([
       "campaignProgress", "watchTabs", "watchMeta", "dropSignals", "gameIdMap", "gameActiveIds", "watchList",
+      "inventoryCampaigns", "gameSlugMap",
     ]);
-    const progress = cfg.campaignProgress || {};
+    const progress = { ...(cfg.campaignProgress || {}) };
     const watchTabs = { ...(cfg.watchTabs || {}) };
     const watchMeta = { ...(cfg.watchMeta || {}) };
     const dropSignals = { ...(cfg.dropSignals || {}) };
     const watchList = cfg.watchList || [];
     let anyJustFinished = false;
 
-    // GQL's own campaign.status ("ACTIVE"/"EXPIRED", learned alongside
-    // gameIdMap - see inject.js's Inventory extractor) is a more reliable
-    // "is there still a live campaign for this game" check than content.js's
-    // DOM text scrape, which has no way to disambiguate when a game shows
-    // more than one campaign card at once (an old, past-end-date one
-    // alongside a current one) - real capture caught exactly that for
-    // marvel-rivals. Build slug -> confirmed-still-active once per merge.
+    // GQL's own campaign.status ("ACTIVE"/"EXPIRED") is the reliable "is this
+    // campaign over" check (see cardIsExpired); without a record for a card the
+    // old per-game rule applies: a game with an ACTIVE campaign is never called
+    // expired by the card's "no longer available" text alone (real capture:
+    // marvel-rivals showed an ended card next to a current one). Slug set built
+    // once per merge.
     const gameIdMap = cfg.gameIdMap || {};
     const gameActiveIds = cfg.gameActiveIds || {};
     const activeSlugs = new Set();
     for (const [id, name] of Object.entries(gameIdMap)) {
       if (gameActiveIds[id]) activeSlugs.add(toSlug(name));
     }
+    const metaById = (cfg.inventoryCampaigns && cfg.inventoryCampaigns.byId) || {};
+    const ctx = { metaById, gameSlugMap: cfg.gameSlugMap || {}, activeSlugs };
 
-    for (const c of campaigns) {
-      const allComplete = c.total > 0 && c.claimed >= c.total && !c.accountNotConnected;
-      const expired = !!c.expired && !activeSlugs.has(c.slug);
-      progress[c.slug] = {
-        label: c.label,
-        claimed: c.claimed,
-        total: c.total,
-        accountNotConnected: !!c.accountNotConnected,
-        expired,
-        allComplete,
-        expiresAt: typeof c.expiresAt === "number" ? c.expiresAt : null,
-        timeRemainingMin: c.timeRemainingMin ?? null,
-        updatedAt: Date.now(),
-        missingScans: 0,
-      };
-      if ((allComplete || expired) && watchTabs[c.slug]) {
-        await closeWatchTab(watchTabs, c.slug);
-        delete watchMeta[c.slug];
-        delete dropSignals[c.slug];
+    const matchedKeys = new Set();
+    for (const game of watchList) {
+      const key = game.slug;
+      const owned = campaigns
+        .filter((c) => entryOwnsCard(game, c, ctx))
+        .map((c) => ({ ...c, expiredFinal: cardIsExpired(c, c.campaignId ? metaById[c.campaignId] || null : null, activeSlugs) }));
+      const agg = aggregateEntryProgress(owned, entryExpectedCampaignIds(game, ctx));
+      if (!agg) continue;
+      matchedKeys.add(key);
+      progress[key] = { ...agg, updatedAt: Date.now(), missingScans: 0 };
+      if ((agg.allComplete || agg.expired) && watchTabs[key]) {
+        await closeWatchTab(watchTabs, key);
+        delete watchMeta[key];
+        delete dropSignals[key];
         anyJustFinished = true;
-        log(c.slug, allComplete ? "fully claimed" : "expired", "- closed its tab");
+        log(key, agg.allComplete ? "fully claimed" : "expired", "- closed its tab");
       }
     }
 
-    // Reconcile watched games whose card wasn't in this scan at all. Only
-    // acts on a slug that: is still on the watch list, has a prior reading
-    // with real progress (total > 0 - never invent completion for a game we
+    // Reconcile watched entries whose card wasn't in this scan at all. Only
+    // acts on an entry that: is still on the watch list, has a prior reading
+    // with real progress (total > 0 - never invent completion for an entry we
     // never actually saw a card for), and isn't already resolved. See
     // REQUIRED_MISSING_SCANS above for why this waits for corroboration
-    // instead of acting on the first miss.
-    const seenSlugs = new Set(campaigns.map((c) => c.slug));
+    // instead of acting on the first miss. And never while the Inventory GQL
+    // still lists one of its campaigns as in progress: then the card is merely
+    // not (yet) readable, not claimed.
     for (const game of watchList) {
-      const slug = game.slug;
-      if (seenSlugs.has(slug)) continue;
-      const p = progress[slug];
+      const key = game.slug;
+      if (matchedKeys.has(key)) continue;
+      const p = progress[key];
       if (!p || p.allComplete || p.expired || !(p.total > 0)) continue;
+
+      if ((p.campaignIds || []).some((id) => metaById[id] && metaById[id].status === "ACTIVE")) {
+        progress[key] = { ...p, missingScans: 0 };
+        continue;
+      }
 
       const missingScans = (p.missingScans || 0) + 1;
       if (missingScans >= REQUIRED_MISSING_SCANS) {
-        progress[slug] = { ...p, allComplete: true, missingScans: 0, updatedAt: Date.now() };
-        if (watchTabs[slug]) {
-          await closeWatchTab(watchTabs, slug);
-          delete watchMeta[slug];
-          delete dropSignals[slug];
+        progress[key] = { ...p, allComplete: true, missingScans: 0, updatedAt: Date.now() };
+        if (watchTabs[key]) {
+          await closeWatchTab(watchTabs, key);
+          delete watchMeta[key];
+          delete dropSignals[key];
           anyJustFinished = true;
         }
-        log(slug, "card vanished from In Progress across", missingScans, "scans - treating as fully claimed");
+        log(key, "card vanished from In Progress across", missingScans, "scans - treating as fully claimed");
       } else {
-        progress[slug] = { ...p, missingScans };
+        progress[key] = { ...p, missingScans };
       }
     }
 
@@ -1911,6 +1908,7 @@ async function handleGqlDropSignal(msg, tab) {
   // are for content.js, which knows which reward it clicked: nothing to do here.)
   if (msg.signal.kind === "integrityFailed" || msg.signal.kind === "dropsOpOk") return handleIntegritySignal(msg.signal);
   if (msg.signal.kind === "claimNotLinked" || msg.signal.kind === "claimRequest") return;
+  if (msg.signal.kind === "inventoryCampaigns") return handleInventoryCampaigns(msg.signal);
 
   // openCampaigns is a full snapshot of every drop campaign Twitch currently
   // lists (captured while the user has /drops/campaigns open)
@@ -2082,7 +2080,7 @@ browser.runtime.onMessage.addListener((msg, sender) => {
     case "isWatchTab":
       return (async () => {
         const cfg = await browser.storage.local.get([
-          "enabled", "autoWatchEnabled", "watchTabs", "watchList", "blockedChannels",
+          "enabled", "autoWatchEnabled", "watchTabs", "watchList", "blockedChannels", "watchMeta",
         ]);
         if (!cfg.enabled || !cfg.autoWatchEnabled || !sender.tab) {
           return { isWatchTab: false, activeGame: null, blockedChannels: [] };
@@ -2094,6 +2092,16 @@ browser.runtime.onMessage.addListener((msg, sender) => {
         const now = Date.now();
         const blockedForSlug = (cfg.blockedChannels || {})[slug] || {};
         const blockedChannels = Object.keys(blockedForSlug).filter((name) => blockedForSlug[name] > now);
+        // a game entry's directory pick must not land on a channel another entry
+        // already watches or pins ("Rust" next to "@streamer" playing Rust)
+        if (!game.pinnedChannel) {
+          const meta = cfg.watchMeta || {};
+          for (const g of cfg.watchList || []) {
+            if (g.slug === slug) continue;
+            const taken = [g.pinnedChannel ? g.channel : null, meta[g.slug] && meta[g.slug].channel];
+            for (const ch of taken) if (ch && !blockedChannels.includes(lcChannel(ch))) blockedChannels.push(lcChannel(ch));
+          }
+        }
         return { isWatchTab: true, activeGame: game, blockedChannels };
       })();
 

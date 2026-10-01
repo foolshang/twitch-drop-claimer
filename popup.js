@@ -142,7 +142,7 @@ function badgeEl(text, cls) {
   return span;
 }
 
-function gameRowEl(game, index, isWatching, badge, detail, waitUntil) {
+function gameRowEl(game, index, isWatching, badge, detail, waitUntil, campaignNames) {
   const row = document.createElement("div");
   row.className = isWatching ? "game-status-row current" : "game-status-row";
 
@@ -166,6 +166,14 @@ function gameRowEl(game, index, isWatching, badge, detail, waitUntil) {
     alias.className = "g-detail";
     alias.textContent = t("row_typed_as", { input: game.input });
     row.appendChild(alias);
+  }
+
+  // a pinned channel is tracked through the campaign(s) that name it: say which
+  if (campaignNames && campaignNames.length) {
+    const camp = document.createElement("div");
+    camp.className = "g-detail";
+    camp.textContent = t("row_campaign", { name: campaignNames.join(", ") });
+    row.appendChild(camp);
   }
 
   const detailLine = document.createElement("div");
@@ -511,7 +519,11 @@ async function renderGameStatus() {
       if (priorityMode === "expiry" && !campEnd) {
         parts.push(t("detail_no_expiry_known"));
       }
-      detail = parts.length ? parts.join(" · ") : t("detail_tracking");
+      // a pinned channel without a matching inventory card yet (a card only
+      // appears once minutes start accruing): unknown - not "nothing to do",
+      // and still being watched
+      detail = parts.length ? parts.join(" · ")
+        : (game.pinnedChannel ? t("detail_pinned_unknown") : t("detail_tracking"));
 
       // ViewerDropsDashboard's self.isAccountConnected can be stale - if the
       // /drops/inventory page is actually showing an in-progress drop card
@@ -532,7 +544,8 @@ async function renderGameStatus() {
       else if (cfg.autoWatchEnabled) badge = badgeEl(t("badge_queued"));
     }
 
-    $gameStatusList.appendChild(gameRowEl(game, i, isWatching, badge, detail, waitUntil));
+    $gameStatusList.appendChild(gameRowEl(game, i, isWatching, badge, detail, waitUntil,
+      game.pinnedChannel && progress ? progress.campaignNames : null));
   });
 }
 
@@ -656,6 +669,17 @@ $reportBug.addEventListener("click", async () => {
 document.getElementById("save").addEventListener("click", async () => {
   const watchListRaw = $gamesList.value;
   const watchList = parseWatchList(watchListRaw);
+  // parseWatchList starts every pinned channel from scratch; the game it was
+  // seen playing is learned from its page (and only re-reported when it
+  // changes), so carry it over for channels that stay on the list
+  const prevList = (await browser.storage.local.get("watchList")).watchList || [];
+  for (const g of watchList) {
+    const prev = g.pinnedChannel && prevList.find((p) => p.slug === g.slug);
+    if (prev) {
+      if (prev.gameSlug) g.gameSlug = prev.gameSlug;
+      if (prev.pinnedGameName) g.pinnedGameName = prev.pinnedGameName;
+    }
+  }
   const quota = Math.max(1, Math.min(10, parseInt($tabQuota.value, 10) || DEFAULT_TAB_QUOTA));
   $tabQuota.value = quota;
 

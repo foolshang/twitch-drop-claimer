@@ -7,7 +7,7 @@
 // value out loud when asking for a fresh test - lets whoever's testing
 // confirm from the background console alone that Firefox is actually running
 // this exact source tree, not a stale reload/cached build/old .xpi.
-const BUILD_MARKER = "2026-09-30-r4";
+const BUILD_MARKER = "2026-10-02-r1";
 
 const ALIASES = {
   // Path of Exile
@@ -185,4 +185,128 @@ function claimBackoffAfterFailure(state, now) {
   const f = ((state && state.f) || 0) + 1;
   if (f >= CLAIM_MAX_FAILURES) return { f, next: 0, stop: true };
   return { f, next: now + CLAIM_BACKOFF_MS[Math.min(f - 1, CLAIM_BACKOFF_MS.length - 1)], stop: false };
+}
+
+// ---- inventory campaigns -> watch-list entries (0.6.17) ---------------------
+// A game can have several campaigns at once: one for everybody ("Rust Isles
+// General Drops": no channel restriction) and many that only count on named
+// channels ("Rust Isles Tac Gloves": allow.channels = [itsryanhiga, welyn]).
+// Their inventory cards share the game's boxart, so the card's game says
+// nothing about WHICH campaign it is. What does (real captures, 2026-10-01):
+//   - the card's title link `/drops/campaigns?dropID=<campaign id>` and, for a
+//     restricted campaign, the channel links of its "including /a and /b" hint;
+//   - the Inventory GQL's dropCampaignsInProgress[] (inject.js
+//     `inventoryCampaigns` signal): id, name, status, game and the complete
+//     allow.channels (null for an unrestricted campaign).
+// Entries then own cards like this (a "card" is what content.js's
+// parseInventoryCampaigns reports, `meta` the GQL record of its campaign id):
+//   a game entry ("Rust")        - cards of that game that are NOT restricted;
+//   a pinned entry ("@streamer") - cards of ACTIVE campaigns whose allowed
+//                                  channels include that channel (any number:
+//                                  it is done only when all of them are).
+// A card that cannot be told apart is never lent to an entry it may not
+// belong to - the entry just has no progress yet ("unknown", still watched).
+
+// the game an entry is about: its slug, or for a pinned channel the game it was
+// last seen playing (null until known; legacy entries rewritten by 0.6.16 and
+// older keep the game slug in `slug`)
+function entryGameSlug(g) {
+  if (!g) return null;
+  if (!g.pinnedChannel) return g.slug || null;
+  if (g.gameSlug) return g.gameSlug;
+  return g.slug && !String(g.slug).startsWith("channel:") ? g.slug : null;
+}
+
+const lcChannel = (s) => String(s || "").trim().replace(/^@/, "").toLowerCase();
+
+// lower-case logins of the channels a card's campaign is restricted to ([] =
+// not restricted): the GQL record of its campaign id when known, else the
+// channel links the card itself shows
+function cardChannels(card, meta) {
+  const list = meta ? meta.channels : (card && card.channels);
+  return Array.isArray(list) ? list.map(lcChannel).filter(Boolean) : [];
+}
+
+// every slug the card's game can be known by
+function cardGameSlugs(card, meta, gameSlugMap) {
+  const out = new Set();
+  if (card && card.slug) out.add(card.slug);
+  if (meta) {
+    if (meta.gameName) out.add(toSlug(meta.gameName));
+    if (meta.gameId && gameSlugMap && gameSlugMap[meta.gameId]) out.add(gameSlugMap[meta.gameId]);
+  }
+  return out;
+}
+
+// is the card's campaign over? Twitch's own status when the GQL record is
+// there, else the card's "no longer available" text - but a game whose GQL
+// campaigns include an ACTIVE one is never called expired by text alone (the
+// real capture of two same-game cards, one ended and one current)
+function cardIsExpired(card, meta, activeSlugs) {
+  if (meta && meta.status) return meta.status !== "ACTIVE";
+  if (!card || !card.expired) return false;
+  return !(activeSlugs && card.slug && activeSlugs.has(card.slug));
+}
+
+// ctx: { metaById, gameSlugMap, activeSlugs } - all optional
+function entryOwnsCard(g, card, ctx = {}) {
+  const meta = card && card.campaignId && ctx.metaById ? ctx.metaById[card.campaignId] || null : null;
+  const channels = cardChannels(card, meta);
+  const games = cardGameSlugs(card, meta, ctx.gameSlugMap);
+  if (g.pinnedChannel) {
+    if (!channels.includes(lcChannel(g.channel))) return false;
+    if (cardIsExpired(card, meta, ctx.activeSlugs)) return false; // only ACTIVE campaigns count
+    const gs = entryGameSlug(g);
+    return !gs || games.size === 0 || games.has(gs);
+  }
+  return channels.length === 0 && games.has(g.slug);
+}
+
+// the campaigns the Inventory GQL says an entry has in progress (for "is every
+// one of them accounted for"): same rules as entryOwnsCard on the GQL records
+function entryExpectedCampaignIds(g, ctx = {}) {
+  const out = [];
+  for (const meta of Object.values(ctx.metaById || {})) {
+    if (!meta || meta.status !== "ACTIVE") continue;
+    const channels = cardChannels(null, meta);
+    const games = cardGameSlugs(null, meta, ctx.gameSlugMap);
+    if (g.pinnedChannel) {
+      if (!channels.includes(lcChannel(g.channel))) continue;
+      const gs = entryGameSlug(g);
+      if (gs && games.size && !games.has(gs)) continue;
+    } else if (channels.length > 0 || !games.has(g.slug)) {
+      continue;
+    }
+    out.push(meta.id);
+  }
+  return out;
+}
+
+// the progress record of an entry from the cards it owns. "Done" needs EVERY
+// owned active card complete (and, when the GQL tells which campaigns the entry
+// has in progress, every one of those to have a card); "expired" only when
+// every owned card is expired. A card that is not complete is never hidden
+// behind one that is.
+function aggregateEntryProgress(cards, expectedIds) {
+  if (!cards || cards.length === 0) return null;
+  const expiredOf = (c) => !!c.expiredFinal;
+  const active = cards.filter((c) => !expiredOf(c));
+  const use = active.length ? active : cards;
+  const complete = (c) => c.total > 0 && c.claimed >= c.total && !c.accountNotConnected;
+  const seen = new Set(cards.map((c) => c.campaignId).filter(Boolean));
+  const covered = !(expectedIds || []).some((id) => !seen.has(id));
+  const known = use.every((c) => c.timeRemainingMin != null || complete(c));
+  const expiries = use.map((c) => c.expiresAt).filter((t) => typeof t === "number");
+  return {
+    label: use[0].label,
+    claimed: use.reduce((n, c) => n + c.claimed, 0),
+    total: use.reduce((n, c) => n + c.total, 0),
+    accountNotConnected: use.some((c) => c.accountNotConnected),
+    expired: active.length === 0,
+    allComplete: active.length > 0 && active.every(complete) && covered,
+    expiresAt: expiries.length ? Math.min(...expiries) : null,
+    timeRemainingMin: known ? use.reduce((n, c) => n + (c.timeRemainingMin || 0), 0) : null,
+    campaignNames: use.map((c) => c.campaignName || (c.campaignId ? c.campaignId : null)).filter(Boolean),
+    campaignIds: cards.map((c) => c.campaignId).filter(Boolean),
+  };
 }

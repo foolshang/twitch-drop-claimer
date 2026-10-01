@@ -351,13 +351,17 @@ async function testSameSlugTwoCampaignsExpiredFirstStaysExpired() {
   const watchList = [{ input: "marvel rivals", slug: "marvel-rivals" }];
   const gameIdMap = { "1264310518": "Marvel Rivals" };
 
+  // Cards of one game are no longer merged here (that picked the wrong card
+  // whenever a game had several campaigns - which of them an entry owns, and
+  // that an active card wins over an expired one, is decided in
+  // shared.js entryOwnsCard / aggregateEntryProgress: see campaign-matching.test.js)
   const result = callParse(ctx, watchList, gameIdMap);
-  assert.strictEqual(result.length, 1, "two same-slug cards must collapse into one result, not one per card");
-  assert.strictEqual(result[0].expired, false, "an active card for the same slug must win over an expired one, regardless of DOM order");
-  assert.strictEqual(result[0].claimed, 0);
-  assert.strictEqual(result[0].total, 1);
+  assert.strictEqual(result.length, 2, "both cards are reported, one record per card");
+  assert.deepStrictEqual(Array.from(result.map((r) => r.expired)), [true, false], "each card carries its own expired flag, DOM order kept");
+  assert.strictEqual(result[1].claimed, 0);
+  assert.strictEqual(result[1].total, 1);
 
-  console.log("  OK  a slug with both an expired and an active campaign card only reports the active one (expired-first DOM order)");
+  console.log("  OK  a game's expired and active campaign cards are both reported, each with its own state (expired-first DOM order)");
 }
 
 async function testSameSlugTwoCampaignsActiveFirstStillWins() {
@@ -379,10 +383,10 @@ async function testSameSlugTwoCampaignsActiveFirstStillWins() {
   const gameIdMap = { "1264310518": "Marvel Rivals" };
 
   const result = callParse(ctx, watchList, gameIdMap);
-  assert.strictEqual(result.length, 1);
-  assert.strictEqual(result[0].expired, false, "a still-active campaign must never be silently abandoned because an unrelated expired card for the same game also exists");
+  assert.strictEqual(result.length, 2, "both cards are reported");
+  assert.deepStrictEqual(Array.from(result.map((r) => r.expired)), [false, true], "the active card is not hidden by (or merged into) the expired one");
 
-  console.log("  OK  a slug with both an active and an expired campaign card only reports the active one (active-first DOM order)");
+  console.log("  OK  a game's active and expired campaign cards are both reported, each with its own state (active-first DOM order)");
 }
 
 async function testHundredPercentNotInClaimedIsNotClaimed() {

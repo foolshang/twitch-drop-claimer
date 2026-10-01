@@ -33,11 +33,19 @@ channel instead of a game - its tab goes straight to that channel (never
 the directory's auto-pick), waits for it to go live rather than rotating to
 another channel if it's offline, and is never rotated/blocklisted for
 stalled drop progress the way an auto-picked channel would be. It shares
-the same priority-ordered list and tab quota as game entries. Once the
-channel is live, the background script binds it to whatever game it's
-actually playing (read from the channel page's own category link) and
-tracks/claims progress for it exactly like a typed game entry from then on;
-switching games later re-binds automatically.
+the same priority-ordered list and tab quota as game entries, and may sit
+next to a game entry for the very game the channel plays ("Rust" +
+"@streamer"): each has its own tab and its own progress.
+
+Progress is tracked per campaign, not per game. A game can have a general
+campaign for everybody and many that only count on named channels (their
+inventory cards share the game's boxart). A game entry ("Rust") tracks its
+game's general campaign only; a pinned entry tracks the active campaigns
+whose channel list (from the Inventory GraphQL response and the "including
+/a and /b" links on the card) names that channel, and is done only when all
+of them are. Until a card shows up for an entry (it only appears once minutes
+start accruing) its progress is unknown - the popup says so, it is never
+marked done, and it keeps being watched.
 
 Two priority modes decide which queued games get a tab first
 when the list is longer than the quota: list order, or soonest-campaign-
