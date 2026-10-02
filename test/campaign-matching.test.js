@@ -367,7 +367,9 @@ function testOwnershipRules() {
 async function renderPopupRows(storage) {
   const dom = new JSDOM(read("popup.html").replace(/<script[^>]*src="[^"]*"[^>]*><\/script>/g, ""), { runScripts: "outside-only", url: "moz-extension://test/popup.html" });
   const w = dom.window;
-  const data = { enabled: true, autoWatchEnabled: true, ...storage };
+  // unless a test says otherwise, every pinned channel's page has reported "live" (what the popup needs to call it watching)
+  const liveStates = Object.fromEntries(Object.entries(storage.watchTabs || {}).filter(([slug]) => slug.startsWith("channel:")).map(([slug, tabId]) => [slug, { tabId, state: "live" }]));
+  const data = { enabled: true, autoWatchEnabled: true, pinnedLive: liveStates, ...storage };
   const pick = (keys) => {
     if (keys == null) return { ...data };
     if (typeof keys === "string") return { [keys]: data[keys] };

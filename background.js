@@ -2060,10 +2060,24 @@ async function reloadPinnedTab(tabId, channel, reason, logState = "reload") {
   try { await browser.tabs.reload(tabId); } catch (e) { log("reloadPinnedTab: tab already gone", tabId, e); }
 }
 
+// What the popup shows for a pinned channel: what its page last reported (live /
+// offline / loading). Written only when it changes, keyed with the tab it came from
+// (the popup ignores it once the entry has another tab) - an offline channel is not
+// "watching", a page that has not reported yet is "checking".
+const pinnedStateWritten = new Map(); // tabId -> last state written
+async function recordPinnedLiveState(tabId, slug, live) {
+  const state = live === true ? "live" : live === false ? "offline" : "loading";
+  if (pinnedStateWritten.get(tabId) === state) return;
+  pinnedStateWritten.set(tabId, state);
+  const { pinnedLive } = await browser.storage.local.get("pinnedLive");
+  await browser.storage.local.set({ pinnedLive: { ...(pinnedLive || {}), [slug]: { tabId, state, at: Date.now() } } });
+}
+
 async function handlePinnedChannelStatus(msg, tab) {
   if (!tab) return;
   const game = await getPinnedGameForTab(tab.id);
   if (!game) return; // not (or no longer) a tracked pinned-channel tab
+  await recordPinnedLiveState(tab.id, game.slug, msg.live);
 
   const state = pinnedTabState.get(tab.id) || { offlineTicks: 0, lastHeartbeatAt: 0, offlineStep: 0 };
   state.lastHeartbeatAt = Date.now();

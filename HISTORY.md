@@ -2766,6 +2766,25 @@ warnings now include the reward, Last claimed is the reward name.
 
 `BUILD_MARKER` -> `2026-10-02-r6`, `manifest.json` -> 0.6.20.
 
+**Display bug found in 0.6.20 (unlisted), fixed after the signing - NOT in the signed
+.xpi:** offline pinned channels (@xChocoBars, @DisguisedToast, @Blooprint, none live) showed
+the "watching" badge and "no expiry date known (using list order)" in the popup although
+nothing is earned while they wait. The popup only knew "this entry has a tab", not what the
+tab's page says. Now the background records what each pinned page reports (live / offline /
+loading, `pinnedLive` in storage.local, written only when it changes, keyed with the tab it
+came from - a report from a replaced tab is ignored) and the popup shows: live ->
+"watching"; offline -> "offline - waiting to go live" with a detail line saying nothing is
+earned yet (and without the expiry line; the campaign progress stays); loading / no report
+yet -> "checking the channel..." - never "watching" until the page says it is live. Offline
+takes precedence over 0.6.18's "playing another game" (what it played last is stale); a
+finished/expired/needs-link state keeps its own badge. New strings `badge_pinned_offline`,
+`badge_pinned_checking`, `detail_pinned_offline` in 9 languages (key parity holds).
+Tests: new `pinned-offline-badge.test.js` (badge per page state, offline -> live, a stale
+tab's report, offline vs wrong game, done stays done, 9 languages, the background recording
+on change only); five of six fail on the previous popup/background (the sixth guards the
+done badge). The slot question (should an offline pinned channel hold a tab slot?) is NOT
+changed here - it waits for the user's decision.
+
 Signed to the UNLISTED channel on 2026-10-02 (`npm run submit`, no
 `--listed`) for testing in the user's real Firefox:
 `web-ext-artifacts/33d37586a96d443fa884-0.6.20.xpi`, built from `edc481c`
