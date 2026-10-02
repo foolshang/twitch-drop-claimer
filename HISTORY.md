@@ -2939,3 +2939,65 @@ Signed to the UNLISTED channel on 2026-10-03 (`npm run submit`, no
 (`BUILD_MARKER` `2026-10-03-r1`); the version is in the local, git-ignored
 `.amo-submitted-versions.json`. Not submitted to the listed channel; the listed
 release will be 0.6.23 (manifest + `BUILD_MARKER` bump only).
+
+## 0.6.23 - a pinned channel that goes live behind its offline page is caught (the "Live Now" card)
+
+**Root cause (found by the user, real HTML captured from GEEGA's page at 06:16 UTC+7, now in
+`test/fixtures`):** a pinned tab opened on a channel while it is OFFLINE does not switch to the
+player when the channel goes live. Twitch keeps the channel home and overlays a "Live Now" card -
+`.home-carousel-info--live` with `.channel-status-info--live`, an `h2` "<channel> is streaming
+<game>" (channel and game in their own spans) and `a[data-a-target="home-live-overlay-button"]`
+("Watch now with N viewers", href `/<channel>`) - and the channel avatar gets a red LIVE badge
+(`.tw-channel-status-text-indicator`). The offline banner (`.home-offline-hero`,
+`.home-offline-carousel`) is gone and no player (`animated-channel-viewers-count`) is there, so
+looksLive() and looksOffline() were both false: no verdict for hours (0.6.22's "no verdict" log),
+the stream never played. (A 0.6.22 test run on the real HTML shows exactly that: the live card
+records `loading`.)
+
+**Fix:**
+1. content.js `ownLiveHome(channel)`: this channel's OWN Live Now card (the card's "Watch now"
+   link must point at `/<channel>`) or the LIVE badge inside an `<a href="/<channel>">` - never
+   anything inside the sidebar (`.side-nav`, `nav`) and never another channel's badge/card -
+   is reported as live (`liveHome: { via: "card"|"badge", game }`). The game name is read from
+   the live card ONLY (the h2's second span, else "is streaming <game>"); a badge gives none. The
+   offline page's text ("Check out this Last Epoch stream from 5 hours ago", a VOD title with
+   "[DROPS+GIFT]") is never read as the game being played or as a drops signal. The game goes
+   through the existing `channelPlayingGame` message, so the 0.6.18 wrong-game check works
+   ("pinned channel geega resolved to game grand-theft-auto-v").
+2. `looksOffline()` also takes the explicit markers `.channel-status-info--offline` and
+   `.home-offline-hero` (the older selectors stay), in case they drift.
+3. Getting into the player (`handlePinnedLiveHome`): the tab is RELOADED. Why: a channel page that
+   loads while the stream is live shows the player directly - that is how every pinned tab opened
+   on a live channel has always worked, so it needs nothing about the card's behaviour. The
+   alternative, clicking the card's "Watch now" link, is an SPA navigation to the very same URL
+   whose effect was not verified (and a click in a background tab). So: reload first (one per 10
+   minutes per tab, never a loop); if the FRESH page still shows the card, background.js answers
+   the next report with `clickWatchNow` and content.js clicks "Watch now" - once - as the fallback.
+4. **Flash once per live session** (the rule from the earlier report: a live channel was flashed
+   to the foreground every 2 minutes for as long as it stayed live): flashed once per unbroken
+   run of live reports (`liveSince`), when the PLAYER is there - not while only the card shows,
+   not on every report. Offline ends a session; live again flashes once more. A reloading page
+   (no verdict) does not end it.
+5. The 0.6.22 safety net is reduced, not removed (the cause of the hours-long null was this card,
+   but other causes may exist, and the page description it logs is the way to find them): reload
+   once after 10 minutes without a verdict (was 3), "live unknown" + flash 10 minutes after that
+   (was 3). The `diag` data stays.
+
+**Not verified live** (README rule): that a reload of a tab whose channel is live always lands
+in the player, and that clicking "Watch now" works as the fallback - both follow from how
+Twitch's pages behaved before, not from a capture. The language of the page: the card is
+found by its class names and the h2's spans, not by English text ("is streaming" is only a
+fallback for the game name).
+
+**Tests:** new `pinned-live-card.test.js` (7 cases, built from the real fixtures - the files
+are `card-live-now.html`, `avatar-live-badge.html`, `card-offlive-now.html`,
+`avatar-offlive-badge.html`): live card -> live + "Grand Theft Auto V"; own LIVE badge alone ->
+live, no game; the offline page -> offline, no game read, nothing of its text reaches the
+background; explicit offline markers alone; a LIVE badge in the sidebar, this channel's own
+sidebar entry, another channel's badge and another channel's card -> not counted; card ->
+one reload -> player -> ONE flash for the whole session (8 more minutes live: none), offline ->
+live again flashes once more; the card still there after the reload -> "Watch now" clicked once,
+no second reload. Against 0.6.22 the live-card, badge, explicit-marker, reload/flash and click
+cases fail (the offline-page and sidebar cases are guards that pass there too).
+`pinned-verdict-recovery.test.js` adapted to the 10-minute safety net. `BUILD_MARKER` ->
+`2026-10-03-r2`, `manifest.json` -> 0.6.23 (the listed release will be 0.6.24).

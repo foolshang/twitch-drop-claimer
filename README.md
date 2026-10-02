@@ -49,6 +49,11 @@ is offline its page is reloaded on a growing interval (3, 6, 10, then every 15
 minutes; back to 3 once it has been seen live); a channel the Twitch sidebar shows
 as live while the page still says offline is reloaded at once.
 
+A pinned channel that goes live while its tab sits on the offline page (Twitch shows a
+"Live Now" card and a LIVE badge there instead of the player) is recognised by that card / the
+channel's own badge, its tab is reloaded into the player (once per 10 minutes at most), and
+the tab is flashed once per live session to start playback.
+
 An offline pinned channel's tab stays open (that is how it notices the channel going
 live) but holds **no tab-quota slot**, so games that can earn drops use the slots
 meanwhile; at most 5 such tabs stay open, further offline entries wait without a tab

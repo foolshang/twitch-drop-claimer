@@ -543,9 +543,44 @@
   }
 
 
+  // A channel that opened while it was offline and went live later is NOT switched to
+  // the player by Twitch: the channel home keeps its banner and gets a "Live Now" card
+  // ("<channel> is streaming <game>", a "Watch now with N viewers" link) and the avatar
+  // a red LIVE badge (real HTML captured 2026-10-03, test/fixtures). Neither the player's
+  // viewer count nor an offline marker is there, so the page used to have no verdict for
+  // hours. Returns { game, via, watchNow } for THIS channel's own card / avatar badge,
+  // else null - never the sidebar and never another channel's badge. The game is read from
+  // the live card only (the offline page's text - "Check out this <game> stream from 5
+  // hours ago", a VOD title - is never read as what is being played).
+  function ownLiveHome(channel) {
+    if (!channel) return null;
+    const want = "/" + channel.toLowerCase();
+    const hrefPath = (a) => ((a && a.getAttribute("href")) || "").split(/[?#]/)[0].toLowerCase();
+    const card = document.querySelector(".home-carousel-info--live");
+    if (card) {
+      const watchNow = card.parentElement && card.parentElement.querySelector('a[data-a-target="home-live-overlay-button"]')
+        || document.querySelector('a[data-a-target="home-live-overlay-button"]');
+      const h2 = card.querySelector("h2");
+      const spans = h2 ? [...h2.querySelectorAll("span")] : [];
+      const own = watchNow ? hrefPath(watchNow) === want : (spans[0] && spans[0].textContent.trim().toLowerCase() === channel.toLowerCase());
+      if (own) {
+        let game = spans.length >= 2 ? spans[1].textContent.trim() : null;
+        if (!game && h2) { const m = (h2.textContent || "").match(/is streaming\s+(.+)$/i); game = m ? m[1].trim() : null; }
+        return { game: game || null, via: "card", watchNow: watchNow || null };
+      }
+    }
+    for (const badge of document.querySelectorAll(".tw-channel-status-text-indicator")) {
+      if (badge.closest('.side-nav, [class*="side-nav"], [data-a-target="side-nav"], nav')) continue; // sidebar: never
+      if (hrefPath(badge.closest("a")) === want) return { game: null, via: "badge", watchNow: null };
+    }
+    return null;
+  }
+
   function looksOffline() {
     // content gate (subscriber-only / mature / rerun) is NOT "offline"
     if (document.querySelector('[data-a-target="player-overlay-content-gate"]')) return false;
+    // explicit offline markers of the channel home (real HTML 2026-10-03): the status line and the hero
+    if (document.querySelector('.channel-status-info--offline, .home-offline-hero')) return true;
     // channel-page root reflecting an offline broadcast directly (scoped to
     // the viewed channel, verified against real DOM - see comment above)
     if (document.querySelector('.channel-root__player--offline, .channel-root__info--offline')) return true;
@@ -1264,19 +1299,26 @@
         // Just keep reporting whatever game it's actually playing so
         // background.js can bind this entry's tracking to it.
         if (pinned) {
-          if (looksLive()) {
+          // a channel that went live while this page sat on its offline home: the "Live Now" card /
+          // the avatar's LIVE badge (see ownLiveHome) - live, but the player is not there yet
+          const home = looksLive() ? null : ownLiveHome(initialChannel);
+          if (looksLive() || home) {
             if (!pinnedSawLive) {
-              // first live sighting on this page load (or first since it last
-              // went offline): a tab that was created/reloaded while the
-              // channel was offline never got its player started, so ask
-              // background.js to bring it to the foreground briefly, same as
-              // for a freshly-picked channel
+              // first live sighting on this page load (or first since it last went offline)
               pinnedSawLive = true;
-              log("pinned channel", initialChannel, "is live");
+              log("pinned channel", initialChannel, home ? `is live (${home.via} on its offline page)` : "is live");
             }
-            browser.runtime.sendMessage({ type: "pinnedChannelStatus", channel: initialChannel, live: true }).catch(() => {});
-            const g = currentStreamGame();
-            if (g && g.slug !== lastReportedGameSlug) {
+            const res = await browser.runtime.sendMessage({
+              type: "pinnedChannelStatus", channel: initialChannel, live: true,
+              ...(home ? { liveHome: { via: home.via, game: home.game } } : {}),
+            }).catch(() => null);
+            // the page is still on the card after background.js reloaded it: take Twitch's own way into the player
+            if (home && home.watchNow && res && res.clickWatchNow) {
+              log("pinned channel", initialChannel, "still shows the Live Now card after a reload - clicking \"Watch now\"");
+              home.watchNow.click();
+            }
+            const g = home ? (home.game ? { name: home.game, slug: toSlug(home.game) } : null) : currentStreamGame();
+            if (g && g.slug && g.slug !== lastReportedGameSlug) {
               lastReportedGameSlug = g.slug;
               browser.runtime.sendMessage({
                 type: "channelPlayingGame", channel: initialChannel, slug: g.slug, gameName: g.name,

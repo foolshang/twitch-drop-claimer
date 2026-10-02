@@ -11,8 +11,8 @@
  *     (a lost record comes back with the next report).
  *  2. The whole path - real content.js on a channel page -> real background.js, with the real
  *     "channel:<name>" key - records live/offline for the right tab, flashes a live one.
- *  3. Safety net: a pinned tab with no live/offline verdict for 3 minutes is reloaded ONCE (logged,
- *     with what the page looked like); still none 3 minutes later -> "live unknown": treated as
+ *  3. Safety net: a pinned tab with no live/offline verdict for 10 minutes is reloaded ONCE (logged,
+ *     with what the page looked like); still none 10 minutes later -> "live unknown": treated as
  *     watched and flashed (again every 10 minutes while it stays unknown), the way pinned tabs
  *     worked before 0.6.20. A real verdict takes over at any time.
  */
@@ -135,17 +135,17 @@ async function testStuckWithoutAVerdictIsReloadedOnceThenTreatedAsLiveUnknown() 
 
   await beat(); // the first report: no verdict
   await w.tick();
+  await step(9 * MIN);
+  assert.strictEqual(w.reloads.length, 0, "9 minutes: not yet");
   await step(2 * MIN);
-  assert.strictEqual(w.reloads.length, 0, "2 minutes: not yet");
-  await step(1.5 * MIN);
-  assert.strictEqual(w.reloads.filter((r) => r[0] === 72).length, 1, "after 3 minutes without a verdict: its tab is reloaded once");
+  assert.strictEqual(w.reloads.filter((r) => r[0] === 72).length, 1, "after 10 minutes without a verdict: its tab is reloaded once");
   const line = w.bg.logLines().find((l) => /has had no live\/offline verdict for \d+ min/.test(l) && /reloading its tab once/.test(l));
   assert.ok(line && /"gate":false/.test(line) && /"textLen":/.test(line), "logged clearly, with what the page looked like: " + line);
   await step(2 * MIN);
   assert.strictEqual(w.reloads.length, 1, "never a second reload");
   assert.strictEqual(w.flashes.length, 0, "not flashed yet");
 
-  await step(1.5 * MIN); // 3 minutes after the reload, still nothing
+  await step(9 * MIN); // 10 minutes after the reload, still nothing
   assert.strictEqual(w.rec("DisguisedToast").state, "unknown", "declared live-unknown");
   assert.deepStrictEqual(w.flashes.map((f) => f[0]), [72], "and flashed so the stream gets a chance to play");
   assert.ok(w.bg.logLines().some((l) => /still has no verdict .*treating it as live \(unknown\) and flashing its tab/.test(l)));
@@ -155,14 +155,14 @@ async function testStuckWithoutAVerdictIsReloadedOnceThenTreatedAsLiveUnknown() 
   await step(8 * MIN);
   assert.strictEqual(w.flashes.length, 2, "flashed again after 10 minutes while still unknown");
   assert.strictEqual(w.reloads.length, 1, "still only the one reload");
-  console.log("  OK  no verdict for 3 min -> one logged reload; 3 min later -> live unknown + flash (again every 10 min); never a second reload");
+  console.log("  OK  no verdict for 10 min -> one logged reload; 10 min later -> live unknown + flash (again every 10 min); never a second reload");
 }
 
 async function testARealVerdictTakesOverFromUnknown() {
   const w = await world(["GEEGA"], tabOf);
   await w.report("GEEGA", null, { diag: { gate: false, ready: "complete", visible: "hidden", textLen: 10, player: false, path: "/geega" } });
-  w.clock.advanceTo(w.clock.now + 3.5 * MIN); await w.tick();
-  w.clock.advanceTo(w.clock.now + 3.5 * MIN); await w.tick();
+  w.clock.advanceTo(w.clock.now + 10.5 * MIN); await w.tick();
+  w.clock.advanceTo(w.clock.now + 10.5 * MIN); await w.tick();
   assert.strictEqual(w.rec("GEEGA").state, "unknown");
   await w.report("GEEGA", false);
   assert.strictEqual(w.rec("GEEGA").state, "offline", "the page finally says offline: that is the state");

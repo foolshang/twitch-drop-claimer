@@ -2192,11 +2192,40 @@ async function recordPinnedLiveState(tabId, slug, live, diag) {
   if (changed) serialized(autoWatchTick).catch(() => {});
 }
 
+// The channel went live while its tab sat on the offline home (content.js: a "Live Now"
+// card / the avatar's LIVE badge): Twitch does not start the player there. Getting the tab
+// into the player: RELOAD it - a channel page that loads while the stream is live shows the
+// player directly (that is how every pinned tab opened on a live channel has always worked);
+// clicking the card's "Watch now" link is an SPA navigation to the very same URL whose effect
+// was not verified. So: reload first; if the fresh page still shows the card (answered with
+// clickWatchNow, once), content.js clicks "Watch now" as the fallback. At most one reload per
+// 10 minutes per tab, never a loop. The flash follows when the player page reports live.
+const PINNED_CARD_RELOAD_GAP_MS = 10 * 60 * 1000;
+const pinnedCardState = new Map(); // tabId -> { at, clicked }
+const pinnedFlashedRun = new Map(); // tabId -> the live run (liveSince) that was already flashed
+async function handlePinnedLiveHome(tabId, msg) {
+  const now = Date.now();
+  const st = pinnedCardState.get(tabId);
+  if (!st || now - st.at >= PINNED_CARD_RELOAD_GAP_MS) {
+    pinnedCardState.set(tabId, { at: now, clicked: false });
+    lastPinnedReloadAt.delete(tabId); // this is not a routine reload: the 2-minute gap does not apply
+    await reloadPinnedTab(tabId, msg.channel, `is live${msg.liveHome.game ? ` (${msg.liveHome.game})` : ""} but its page only shows the offline home with a Live Now card / LIVE badge`, "live-card");
+    return { clickWatchNow: false };
+  }
+  if (!st.clicked) {
+    st.clicked = true;
+    log("pinned channel", msg.channel, "still shows the Live Now card after the reload - asking its page to click Watch now");
+    return { clickWatchNow: true };
+  }
+  return { clickWatchNow: false };
+}
+
 async function handlePinnedChannelStatus(msg, tab) {
   if (!tab) return;
   const game = await getPinnedGameForTab(tab.id);
   if (!game) return; // not (or no longer) a tracked pinned-channel tab
   await recordPinnedLiveState(tab.id, game.slug, msg.live, msg.diag);
+  if (msg.live === false) { pinnedCardState.delete(tab.id); pinnedFlashedRun.delete(tab.id); } // offline: the next live spell is a new session (a reloading page, live === null, is not the end of one)
 
   const state = pinnedTabState.get(tab.id) || { offlineTicks: 0, lastHeartbeatAt: 0, offlineStep: 0 };
   state.lastHeartbeatAt = Date.now();
@@ -2205,6 +2234,15 @@ async function handlePinnedChannelStatus(msg, tab) {
     state.offlineTicks = 0;
     state.offlineStep = 0; // live again: the next offline spell starts at the short interval
     pinnedTabState.set(tab.id, state);
+    if (msg.liveHome) return handlePinnedLiveHome(tab.id, msg);
+    // Flash ONCE per live session (an unbroken run of live reports - `liveSince`), when the
+    // player is really there: not on every report (it was every 2 minutes for as long as a
+    // channel stayed live) and not while only the Live Now card shows.
+    const { pinnedLive } = await browser.storage.local.get("pinnedLive");
+    const rec = pinnedLive && pinnedLive[game.slug];
+    const run = (rec && rec.tabId === tab.id && rec.liveSince) || null;
+    if (run != null && pinnedFlashedRun.get(tab.id) === run) return;
+    if (run != null) pinnedFlashedRun.set(tab.id, run);
     await flashPinnedTabOnceLive(tab.id, msg.channel);
     return;
   }
@@ -2255,16 +2293,18 @@ async function sweepStalePinnedHeartbeats() {
 
 // A pinned tab whose page gives no verdict - neither live nor offline: still
 // loading, content-gated, or its markers not recognised - is neither idle nor
-// watching and would sit in "checking" for ever (seen in a real report: three
-// channels for hours, one of them live). Safety net, once per tab:
+// watching and would sit in "checking" for ever. The known cause (the Live Now card
+// on an offline page, 0.6.22 report) is handled by handlePinnedLiveHome; this stays as
+// a slow safety net for causes not known yet (the page description is logged), 10 min
+// instead of the 3 it started with. Once per tab:
 //   after PINNED_STUCK_RELOAD_MS without a verdict -> reload its tab ONCE (logged);
 //   still none PINNED_STUCK_UNKNOWN_MS after that -> "live unknown": treated as
 //   being watched (the popup says so), and its tab is flashed to start the
 //   player (again every PINNED_UNKNOWN_FLASH_GAP_MS while still unknown) - the
 //   way pinned tabs behaved before 0.6.20. A real verdict from the page (live /
 //   offline) always takes over.
-const PINNED_STUCK_RELOAD_MS = 3 * 60 * 1000;
-const PINNED_STUCK_UNKNOWN_MS = 3 * 60 * 1000;
+const PINNED_STUCK_RELOAD_MS = 10 * 60 * 1000;
+const PINNED_STUCK_UNKNOWN_MS = 10 * 60 * 1000;
 const PINNED_UNKNOWN_FLASH_GAP_MS = 10 * 60 * 1000;
 const pinnedStuck = new Map(); // tabId -> { since, reloadedAt, flashedAt }
 
