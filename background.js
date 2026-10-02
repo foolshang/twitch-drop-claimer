@@ -205,14 +205,65 @@ function pushDebugLog(line) {
   if (debugLogBuffer.length > DEBUG_LOG_MAX_LINES) debugLogBuffer.shift();
 }
 
+const renderLogArgs = (args) => args.map((a) => {
+  if (typeof a === "string") return a;
+  try { return JSON.stringify(a); } catch { return String(a); }
+}).join(" ");
+
 const log = (...args) => {
-  const rendered = args.map((a) => {
-    if (typeof a === "string") return a;
-    try { return JSON.stringify(a); } catch { return String(a); }
-  }).join(" ");
-  pushDebugLog(`[${new Date().toISOString()}] [bg] ${rendered}`);
+  pushDebugLog(`[${new Date().toISOString()}] [bg] ${renderLogArgs(args)}`);
   console.log("[DropClaimer]", ...args);
 };
+
+// Window / session lifecycle lines (window created / adopted / tagged / closed /
+// could not create, a new browser session, the master switch on/off) also go to
+// this small buffer of their own: a busy hour of ordinary lines pushes them out
+// of the 1000-line ring, and they are exactly what is needed to tell how a tab
+// ended up in which window. Never pushed out by ordinary lines, attached to
+// every bug report and to the exported file.
+const LIFECYCLE_LOG_MAX_LINES = 200;
+const lifecycleLogBuffer = [];
+const logLifecycle = (...args) => {
+  const line = `[${new Date().toISOString()}] [bg] ${renderLogArgs(args)}`;
+  lifecycleLogBuffer.push(line);
+  if (lifecycleLogBuffer.length > LIFECYCLE_LOG_MAX_LINES) lifecycleLogBuffer.shift();
+  pushDebugLog(line);
+  console.log("[DropClaimer]", ...args);
+};
+
+// What a report / the exported file contains: the lifecycle lines first, then the ordinary ring
+const LIFECYCLE_LOG_HEADER = "=== window / session lifecycle (kept separately, never pushed out) ===";
+const ORDINARY_LOG_HEADER = "=== log ===";
+function allLogLines() {
+  return [
+    LIFECYCLE_LOG_HEADER,
+    ...(lifecycleLogBuffer.length ? lifecycleLogBuffer : ["(none yet)"]),
+    ORDINARY_LOG_HEADER,
+    ...(debugLogBuffer.length ? debugLogBuffer : ["(no log lines yet)"]),
+  ];
+}
+
+// A line that repeats every tick (the [verify] progress checks, the pinned-channel
+// live/flash decisions) is logged only when its state CHANGES, plus one short
+// summary per LOG_SUMMARY_MS while the state stays the same. `state` is the
+// category of the line, not its numbers (which change every time).
+const LOG_SUMMARY_MS = 15 * 60 * 1000;
+const onChangeLog = new Map();
+function logOnChange(key, state, ...args) {
+  const now = Date.now();
+  const e = onChangeLog.get(key);
+  if (!e || e.state !== state) {
+    onChangeLog.set(key, { state, since: now, lastSummaryAt: now, suppressed: 0 });
+    log(...args);
+    return;
+  }
+  e.suppressed++;
+  if (now - e.lastSummaryAt >= LOG_SUMMARY_MS) {
+    log("[summary]", key, `- still "${state}" for ${Math.round((now - e.since) / 60000)} min,`, `${e.suppressed} identical lines not logged; latest:`, ...args);
+    e.lastSummaryAt = now;
+    e.suppressed = 0;
+  }
+}
 
 // Firefox's downloads API resolves a bare relative filename against whatever
 // folder the browser is actually configured to save downloads to
@@ -225,7 +276,7 @@ const log = (...args) => {
 // the file actually landed instead of guessing wrong.
 const DEBUG_LOG_FILENAME = "twitch-drop-claimer-debug.log";
 async function exportDebugLogToFile() {
-  const text = debugLogBuffer.length ? debugLogBuffer.join("\n") + "\n" : "(no log lines yet)\n";
+  const text = allLogLines().join("\n") + "\n";
   const url = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
   try {
     const id = await browser.downloads.download({
@@ -321,7 +372,7 @@ async function postBugReportPart(text, meta) {
 }
 
 async function reportBugToGitHub() {
-  const lines = debugLogBuffer.length ? debugLogBuffer : ["(no log lines yet)"];
+  const lines = allLogLines();
   const cfg = await browser.storage.local.get("uiLang");
   const meta = { version: browser.runtime.getManifest().version, lang: cfg.uiLang || "?" };
   const chunks = splitLogForReport(lines);
@@ -473,7 +524,7 @@ async function resetStateForNewBrowserSession() {
   claimBackoff = new Map(); // and every reward's claim backoff (see getClaimBackoff)
   integrityFlag = null; // and Twitch's verdict on the session (see getIntegrityFlag)
   try { await browser.storage.session.set({ claimBackoff: {}, integrityFlag: null }); } catch { /* best effort */ }
-  log("new browser session (or the extension was just loaded): forgot remembered watch tab/window ids");
+  logLifecycle("new browser session (or the extension was just loaded): forgot remembered watch tab/window ids");
   return true;
 }
 
@@ -482,7 +533,7 @@ async function windowIsTagged(id) {
 }
 async function tagWindow(id) {
   try { await browser.sessions.setWindowValue(id, WINDOW_TAG, true); return true; }
-  catch (e) { log("could not tag the watch window (it will not be recognised after a restore):", e); return false; }
+  catch (e) { logLifecycle("could not tag the watch window (it will not be recognised after a restore):", e); return false; }
 }
 const windowIsOurs = async (id) => ownWindowIds.has(id) || windowIsTagged(id);
 
@@ -493,6 +544,7 @@ async function recordUserWindows() {
   const next = new Set();
   for (const w of wins || []) if (!(await windowIsOurs(w.id))) next.add(w.id);
   userWindowIds = next;
+  logLifecycle("recorded the user's windows (never used, adopted or closed):", JSON.stringify([...next]));
 }
 
 // windows carrying our tag, with their tabs (a restore, or an extension reload inside one session)
@@ -515,7 +567,7 @@ async function adoptTaggedWindow(w) {
     if (isInventoryTab(t) && !keptInventory) { keptInventory = true; continue; } // the one the extension refreshes
     if (looksLikeOurTab(t)) { try { await browser.tabs.remove(t.id); } catch { /* already gone */ } }
   }
-  log("adopted the tagged watch window", w.id, "(still open or restored) instead of opening another");
+  logLifecycle("adopted the tagged watch window", w.id, "(still open or restored) instead of opening another");
   return w.id;
 }
 
@@ -523,10 +575,10 @@ async function adoptTaggedWindow(w) {
 // leftover of ours - closed only when nothing but our own tabs is in it.
 async function closeLeftoverTaggedWindow(w) {
   if (!Array.isArray(w.tabs) || !w.tabs.every(looksLikeOurTab)) { // unknown tabs count as "not ours" too
-    log("a second tagged window", w.id, "has tabs that are not ours - leaving it alone");
+    logLifecycle("a second tagged window", w.id, "has tabs that are not ours - leaving it alone");
     return false;
   }
-  log("closing a leftover tagged watch window", w.id);
+  logLifecycle("closing a leftover tagged watch window", w.id);
   try { await browser.windows.remove(w.id); ownWindowIds.delete(w.id); return true; } catch { return false; }
 }
 
@@ -537,9 +589,9 @@ async function resolveWatchWindow() {
     try {
       await browser.windows.get(watchWindowId);
       if (await windowIsOurs(watchWindowId)) return { id: watchWindowId, freshlyCreated: false };
-      log("the remembered watch window id", watchWindowId, "is not tagged - it is the user's now, forgetting it");
+      logLifecycle("the remembered watch window id", watchWindowId, "is not tagged - it is the user's now, forgetting it");
     } catch {
-      log("the watch window", watchWindowId, "is gone - starting over");
+      logLifecycle("the watch window", watchWindowId, "is gone - starting over");
     }
     await browser.storage.local.set({ watchWindowId: null });
   }
@@ -548,7 +600,7 @@ async function resolveWatchWindow() {
   if (tagged.length > 0) return { id: await adoptTaggedWindow(tagged[0]), freshlyCreated: false };
   // 3. make one - not while Firefox may still be restoring last session's windows
   if (Date.now() < windowCreateNotBefore) {
-    log("waiting for Firefox's session restore before opening a watch window");
+    logLifecycle("waiting for Firefox's session restore before opening a watch window");
     if (!graceFollowUpScheduled) {
       graceFollowUpScheduled = true;
       setTimeout(async () => {
@@ -563,15 +615,16 @@ async function resolveWatchWindow() {
     const win = await browser.windows.create({ type: "normal" }); // blank - navigated below
     ownWindowIds.add(win.id);
     userWindowIds.delete(win.id);
-    await tagWindow(win.id);
+    const tagged = await tagWindow(win.id);
     await browser.storage.local.set({ watchWindowId: win.id });
+    logLifecycle("created the watch window", win.id, tagged ? "(tagged)" : "(NOT tagged)");
     const initialTab = win.tabs && win.tabs[0];
     if (initialTab) {
       try { await browser.tabs.update(initialTab.id, { url: INVENTORY_URL, active: false }); } catch { /* best-effort */ }
     }
     return { id: win.id, freshlyCreated: true };
   } catch (e) {
-    log("could not create the watch window - nothing is opened until the next tick (never in your window):", e);
+    logLifecycle("could not create the watch window - nothing is opened until the next tick (never in your window):", e);
     return { id: null, freshlyCreated: false };
   }
 }
@@ -601,14 +654,14 @@ async function createWatchTab(props) {
     return null;
   }
   if (userWindowIds.has(win.id)) {
-    log("refusing to open", props.url, "in window", win.id, "- it is recorded as the user's");
+    logLifecycle("refusing to open", props.url, "in window", win.id, "- it is recorded as the user's");
     return null;
   }
   try {
     await browser.windows.get(win.id);
   } catch {
     await browser.storage.local.set({ watchWindowId: null });
-    log("the watch window", win.id, "vanished just before opening", props.url, "- not opening it anywhere else");
+    logLifecycle("the watch window", win.id, "vanished just before opening", props.url, "- not opening it anywhere else");
     return null;
   }
   return browser.tabs.create({ ...props, windowId: win.id });
@@ -632,7 +685,7 @@ async function reviewNewWindow(id) {
   let current = null;
   if (cfg.watchWindowId != null) { try { current = await browser.windows.get(cfg.watchWindowId); } catch { /* gone */ } }
   if (!current) {
-    log("a tagged watch window came back late:", id);
+    logLifecycle("a tagged watch window came back late:", id);
     await getOrCreateWatchWindow(); // finds it by its tag
     await openInventoryIfMissing();
     await autoWatchTick();
@@ -658,7 +711,7 @@ browser.windows?.onRemoved?.addListener((id) => {
     const { watchWindowId } = await browser.storage.local.get("watchWindowId");
     if (watchWindowId === id) {
       await browser.storage.local.set({ watchWindowId: null });
-      log("the watch window", id, "was closed - starting over at the next tick");
+      logLifecycle("the watch window", id, "was closed - starting over at the next tick");
     }
   }).catch(() => {});
 });
@@ -700,7 +753,7 @@ async function openInventoryIfMissing() {
   }
   if (freshlyCreated) {
     // its initial tab was already navigated to INVENTORY_URL
-    log("dedicated watch window created with the inventory tab already open");
+    logLifecycle("dedicated watch window created with the inventory tab already open");
   } else if (await createWatchTab({ url: INVENTORY_URL, active: false, pinned: true })) {
     log("opened inventory tab");
   }
@@ -1665,7 +1718,7 @@ async function verifyDropStatus(slug) {
   // closed (can't judge on nothing), whether that's because the inventory
   // tab hasn't scanned yet or this game isn't showing on that page at all.
   if (!progress || !progress.updatedAt || progress.updatedAt < meta.watchStartedAt) {
-    log("[verify]", slug, "channel", meta.channel, "- no fresh inventory reading yet since this channel started, waiting");
+    logOnChange(`verify:${slug}`, "no-reading", "[verify]", slug, "channel", meta.channel, "- no fresh inventory reading yet since this channel started, waiting");
     return;
   }
 
@@ -1681,7 +1734,8 @@ async function verifyDropStatus(slug) {
       baselineTimeRemainingMin: progress.timeRemainingMin,
     };
     await browser.storage.local.set({ watchMeta });
-    log(
+    logOnChange(
+      `verify:${slug}`, "healthy",
       "[verify]", slug, "channel", meta.channel, "- baseline captured:",
       `claimed=${progress.claimed}`, `timeRemainingMin=${progress.timeRemainingMin}`
     );
@@ -1696,14 +1750,15 @@ async function verifyDropStatus(slug) {
   // re-checked again just because it passed once.
   const elapsedSinceBaseline = Date.now() - meta.baselineCapturedAt;
   if (elapsedSinceBaseline < VERIFY_DELAY_MS) {
-    log(
+    logOnChange(
+      `verify:${slug}`, "healthy",
       "[verify]", slug, "channel", meta.channel, "- waiting,",
       Math.round(elapsedSinceBaseline / 1000), "/", Math.round(VERIFY_DELAY_MS / 1000), "s since baseline"
     );
     return;
   }
   if (progress.updatedAt <= meta.baselineCapturedAt) {
-    log("[verify]", slug, "channel", meta.channel, "- verify window elapsed but no reading newer than the baseline yet, waiting");
+    logOnChange(`verify:${slug}`, "no-newer-reading", "[verify]", slug, "channel", meta.channel, "- verify window elapsed but no reading newer than the baseline yet, waiting");
     return;
   }
 
@@ -1722,7 +1777,8 @@ async function verifyDropStatus(slug) {
     // offline) - this bug is exactly why a real offline channel sat
     // un-rotated for an entire overnight run instead of being caught
     // within one VERIFY_DELAY_MS window. See HISTORY.md.
-    log(
+    logOnChange(
+      `verify:${slug}`, "healthy",
       "[verify]", slug, "channel", meta.channel, "- progressing, re-baselining:",
       `claimed ${meta.baselineClaimed} -> ${progress.claimed},`,
       `timeRemainingMin ${meta.baselineTimeRemainingMin} -> ${progress.timeRemainingMin}`
@@ -1744,7 +1800,7 @@ async function verifyDropStatus(slug) {
     // see extractRemainingMinutes in content.js) and reward-tier completion
     // is too coarse a signal to trust alone this early - can't tell, so
     // fail closed rather than risk rejecting a channel that's actually fine
-    log("[verify]", slug, "channel", meta.channel, "- no usable timeRemainingMin signal at all, can't tell, keeping watching (fail closed)");
+    logOnChange(`verify:${slug}`, "no-signal", "[verify]", slug, "channel", meta.channel, "- no usable timeRemainingMin signal at all, can't tell, keeping watching (fail closed)");
     return;
   }
 
@@ -1788,7 +1844,7 @@ async function verifySweep() {
   // which is about deciding whether to rotate at all.
   for (const v of verdicts) {
     if (v.stalled && pinnedSlugs.has(v.slug)) {
-      log("[verify]", v.slug, "channel", v.channelName, "- stalled, but it's a pinned channel, not rotating away");
+      logOnChange(`verify-pinned:${v.slug}`, "stalled-pinned", "[verify]", v.slug, "channel", v.channelName, "- stalled, but it's a pinned channel, not rotating away");
     }
   }
   const rotatable = verdicts.filter((v) => !pinnedSlugs.has(v.slug));
@@ -1850,7 +1906,7 @@ async function flashTabToStartPlayback(tabId, holdMs = PLAYBACK_FLASH_HOLD_MS) {
 // window, and not twice within PINNED_LIVE_FLASH_MIN_GAP_MS.
 async function flashPinnedTabOnceLive(tabId, channel) {
   if (Date.now() - (lastPlaybackFlashAt.get(tabId) || 0) < PINNED_LIVE_FLASH_MIN_GAP_MS) {
-    log("pinned channel", channel, "is live - tab was flashed moments ago, not again");
+    logOnChange(`pinned-live:${channel}`, "flash-skipped", "pinned channel", channel, "is live - tab was flashed moments ago, not again");
     return;
   }
   const { id: watchWindowId } = await getOrCreateWatchWindow();
@@ -1861,7 +1917,7 @@ async function flashPinnedTabOnceLive(tabId, channel) {
   } catch {
     return; // tab already gone
   }
-  log("pinned channel", channel, "went live - flashing its tab to start playback");
+  logOnChange(`pinned-live:${channel}`, "flashed", "pinned channel", channel, "went live - flashing its tab to start playback");
   await flashTabToStartPlayback(tabId);
 }
 
@@ -2324,6 +2380,7 @@ browser.storage.onChanged.addListener(async (changes, area) => {
 
   if (changes.enabled) {
     const enabled = changes.enabled.newValue ?? true;
+    logLifecycle("master switch", enabled ? "ON" : "OFF");
     if (enabled && !changes.enabled.oldValue) {
       // turned back on - drop the "auto-off: all collected" marker and the
       // stale all-done phase so the scheduler starts fresh

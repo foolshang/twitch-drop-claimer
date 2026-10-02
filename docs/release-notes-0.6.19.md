@@ -9,6 +9,10 @@ FIXED
 - After Firefox was shut down uncleanly (Windows restarting after an update, a power cut, shutting Windows down with Firefox still open) and restored its windows, the extension could mistake one of YOUR windows for its own, or open a second watch window next to the restored one. It now recognises its own window reliably and leaves every other window alone. See "New permission" below.
 - A campaign you had fully claimed could show "done" with the count 4/5. The count now reads 5/5, and a campaign is only marked done once the Claimed list confirms its rewards. If the last reward is not listed yet it shows "probably done - not confirmed" and keeps its tab open; after 30 minutes without the card coming back it is accepted as done and the debug log says so.
 
+- Claims: every reward on the inventory now has its own claim key (campaign + reward name), so one reward Twitch refuses no longer holds up the others.
+- The channel-points "Claim Bonus" chest in the chat is no longer clicked at all - this extension is for drops only. It only clicks drop claim buttons: the drop notification, the chat callout, and claim buttons inside a campaign card on the inventory page.
+- The debug log no longer fills with the same line every minute: repeated progress/pinned lines are written when they change, plus a short summary every 15 minutes, and window/session events are kept in a small separate section that is attached to every bug report.
+
 ALSO IN THE 0.6.16 - 0.6.18 LINE (if you are updating from an older version)
 - A "@channel" entry can sit next to a game entry for the same game (for example "Rust" and "@streamer"), each with its own tab and its own progress; progress is tracked per campaign.
 - A pinned channel that streams a different game than its campaign's shows "playing another game - not earning drops" and does not take up a tab slot.

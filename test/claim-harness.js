@@ -81,23 +81,42 @@ async function makeBackground({ clock, session = {}, local = {} }) {
 }
 
 // ---- a fake tab: fake DOM + the real content.js, wired to the background ----
-function claimButton(tab, reward, { onClick, gameId } = {}) {
+// The key background.js sees for the button claimButton(tab, reward) makes: the campaign id from
+// the card's title link + the tier's reward name (content.js claimKey)
+const K = (reward, campaignId = "cmp") => `${campaignId}:${reward}`;
+
+function claimButton(tab, reward, { onClick, gameId, campaignId = "cmp", name } = {}) {
   const btn = {
     textContent: "Claim Now",
     disabled: false,
     clicks: 0,
     getAttribute: () => null,
+    closest: () => null,
     click() { this.clicks++; tab.clickLog.push({ tab: tab.id, at: tab.clock.now, reward }); if (onClick) onClick(this); },
   };
-  btn.parentElement = { // the reward's card: this one button + the reward image
+  const rewardName = name === undefined ? reward : name; // name: null = a tier whose name cannot be read
+  const p = { textContent: rewardName || "", querySelector: () => null };
+  const link = { getAttribute: (n) => (n === "href" ? `/drops/campaigns?dropID=${campaignId}` : null), textContent: reward };
+  const isButtons = (sel) => /button/.test(sel);
+  // the tier: this one button and the reward's name (its icon's alt is the same generic text on every tier, as in the real DOM)
+  const tier = {
+    textContent: "100% of 1 hour",
     parentElement: null,
-    querySelectorAll: () => [btn],
+    querySelectorAll: (sel) => (isButtons(sel) ? [btn] : sel === "p" && rewardName ? [p] : []),
+    querySelector: () => null,
+  };
+  // the card: the title link, the boxart, the tier
+  const card = {
+    parentElement: null,
+    querySelectorAll: (sel) => (/dropID/.test(sel) ? [link] : isButtons(sel) ? [btn] : sel === "p" && rewardName ? [p] : []),
     querySelector: (sel) => {
-      if (sel === "img[alt]") return { getAttribute: () => reward };
+      if (/dropID/.test(sel)) return link;
       if (gameId && sel === 'img[src*="_IGDB-"]') return { src: `https://static-cdn.jtvnw.net/ttv-boxart/${gameId}_IGDB-285x380.jpg` };
       return null;
     },
   };
+  tier.parentElement = card;
+  btn.parentElement = tier;
   tab.dom.buttons.push(btn);
   return btn;
 }
@@ -179,4 +198,4 @@ async function run(tabs, ms, everyMs = SEC) {
 }
 
 
-module.exports = { SEC, MIN, HOUR, flush, read, makeClock, makeBackground, claimButton, removeButton, openTab, run };
+module.exports = { SEC, MIN, HOUR, flush, read, makeClock, makeBackground, claimButton, removeButton, openTab, run, K };

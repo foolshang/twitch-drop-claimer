@@ -26,22 +26,29 @@ const assert = require("assert");
 const ROOT = path.join(__dirname, "..");
 const read = (f) => fs.readFileSync(path.join(ROOT, f), "utf8");
 
-function fakeButton({ text = "", aria = null, reward = null }) {
+function fakeButton({ text = "", aria = null, reward = "a reward", notification = false, inCard = true, pointsArea = false }) {
   const btn = {
     textContent: text,
     disabled: false,
     clicks: 0,
+    notification,
     getAttribute(name) { return name === "aria-label" ? aria : null; },
+    closest(sel) { return pointsArea && /community-points/.test(sel) ? {} : null; },
     click() { this.clicks++; },
   };
-  // a card holding this one button and the reward's image (see claimKey in content.js);
-  // buttons without one share the label-based key of every other anonymous button
-  if (reward) {
-    btn.parentElement = {
+  // a card (title link /drops/campaigns?dropID=...) holding this one button and its reward name;
+  // inCard:false = a claim-labelled button that sits outside any campaign card
+  if (inCard) {
+    const p = { textContent: reward, querySelector: () => null };
+    const link = { getAttribute: (n) => (n === "href" ? `/drops/campaigns?dropID=${reward.replace(/\W+/g, "-")}` : null) };
+    const tier = { textContent: "100% of 1 hour", parentElement: null, querySelectorAll: (sel) => (/button/.test(sel) ? [btn] : sel === "p" ? [p] : []), querySelector: () => null };
+    const card = {
       parentElement: null,
-      querySelectorAll: () => [btn],
-      querySelector: (sel) => (sel === "img[alt]" ? { getAttribute: () => reward } : null),
+      querySelectorAll: (sel) => (/dropID/.test(sel) ? [link] : /button/.test(sel) ? [btn] : sel === "p" ? [p] : []),
+      querySelector: (sel) => (/dropID/.test(sel) ? link : null),
     };
+    tier.parentElement = card;
+    btn.parentElement = tier;
   }
   return btn;
 }
@@ -57,7 +64,9 @@ async function makeWorld({ pathname, buttons }) {
       body: {},
       // only the generic fallback selector returns anything; the specific
       // claim-button selectors match nothing in these fixtures
-      querySelectorAll: (sel) => (sel === 'button, [role="button"]' ? buttons : []),
+      // the generic scan sees every button; Twitch's drop-notification selector only the buttons flagged as one
+      querySelectorAll: (sel) => (sel === 'button, [role="button"]' ? buttons
+        : sel === 'button[data-a-target="drops-claim-button"]' ? buttons.filter((b) => b.notification) : []),
       querySelector: () => null,
     },
     MutationObserver: class {
@@ -109,7 +118,7 @@ async function testNothingIsClickedOutsideInventoryAndChannelPages() {
 
 async function testClaimsAreStillClickedOnInventoryAndChannelPages() {
   for (const pathname of ["/drops/inventory", "/drops/inventory/", "/ironmouse", "/Some_Channel"]) {
-    const buttons = [fakeButton(CLAIM)];
+    const buttons = [fakeButton({ ...CLAIM, notification: !/inventory/.test(pathname) })]; // on a channel page: the drop notification's claim button
     const w = await makeWorld({ pathname, buttons });
     await w.scan();
     assert.strictEqual(buttons[0].clicks, 1, `${pathname}: a "Claim Now" button must still be auto-claimed`);
@@ -118,7 +127,7 @@ async function testClaimsAreStillClickedOnInventoryAndChannelPages() {
 }
 
 async function testSinglePageNavigationIsHonouredAtClickTime() {
-  const buttons = [fakeButton(CLAIM)];
+  const buttons = [fakeButton({ ...CLAIM, notification: true })];
   const w = await makeWorld({ pathname: "/ironmouse", buttons }); // content script started on a channel page...
   w.location.pathname = "/drops/campaigns"; //                        ...then Twitch navigated in-page
   await w.scan();
@@ -127,7 +136,7 @@ async function testSinglePageNavigationIsHonouredAtClickTime() {
   await w.scan();
   assert.strictEqual(buttons[0].clicks, 1, "and scanning resumes when the user navigates to the inventory");
 
-  const other = [fakeButton(CLAIM)];
+  const other = [fakeButton({ ...CLAIM, notification: true })];
   const w2 = await makeWorld({ pathname: "/drops/campaigns", buttons: other }); // started on campaigns, e.g. a fresh tab
   await w2.scan();
   assert.strictEqual(other[0].clicks, 0);

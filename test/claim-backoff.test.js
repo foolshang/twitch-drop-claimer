@@ -25,7 +25,7 @@
 const vm = require("vm");
 const assert = require("assert");
 const {
-  SEC, MIN, HOUR, flush, read, makeClock, makeBackground, claimButton, removeButton, openTab, run,
+  SEC, MIN, HOUR, flush, read, makeClock, makeBackground, claimButton, removeButton, openTab, run, K,
 } = require("./claim-harness");
 
 const within = (gap, min) => gap >= min && gap <= min + 5; // + up to 5 s of scan throttle
@@ -51,7 +51,7 @@ async function testUnclaimableButtonFollowsTheSchedule() {
   assert.deepStrictEqual(tab.results().map((m) => m.ok), [false, false, false, false]);
   assert.ok(!tab.sent.some((m) => m.type === "dropClaimed"), "a rejected claim never asks for an inventory reload");
   assert.ok(!tab.localSets.some((o) => o.lastClaimAt), "and is never recorded as the last claim");
-  assert.deepStrictEqual({ ...bg.entry("Rust Isles Boots") }, { f: 4, next: 0, stop: true }, "background gave up on the reward");
+  assert.deepStrictEqual({ ...bg.entry(K("Rust Isles Boots")) }, { f: 4, next: 0, stop: true }, "background gave up on the reward");
   console.log(`  OK  unclaimable button: clicks at ${times.join(", ")} s (1 -> 5 -> 15 min), given up after 4 failures`);
 }
 
@@ -77,7 +77,7 @@ async function testThreeTabsOnlyOneClicksPerRound() {
   assert.ok(within(gaps[0], 12 + 60) && within(gaps[1], 12 + 300) && within(gaps[2], 12 + 900), `the same schedule as with one tab: gaps ${gaps.join(", ")}`);
   const verdicts = tabs.reduce((n, t) => n + t.results().length, 0);
   assert.strictEqual(verdicts, 4, "and one verdict per round, from whichever tab clicked");
-  assert.strictEqual(bg.entry("Rust Isles Boots").f, 4);
+  assert.strictEqual(bg.entry(K("Rust Isles Boots")).f, 4);
   console.log(`  OK  3 tabs, one button: one click per round (clicks at ${times.join(", ")} s, from tabs ${clickLog.map((c) => c.tab).join(",")})`);
 }
 
@@ -92,7 +92,7 @@ async function testClosingAndReopeningTheInventoryKeepsTheCount() {
   await first.scan();
   await flush();
   await run([first], 100 * SEC); // clicks at 0 and ~75 s, both rejected (second verdict at ~87 s)
-  assert.strictEqual(bg.entry("Boots").f, 2, "two rejections recorded");
+  assert.strictEqual(bg.entry(K("Boots")).f, 2, "two rejections recorded");
   assert.strictEqual(clickLog.length, 2);
 
   first.close(); // the user closes the inventory tab
@@ -107,7 +107,7 @@ async function testClosingAndReopeningTheInventoryKeepsTheCount() {
   assert.deepStrictEqual(clickLog.map((c) => c.tab), [1, 1, 7, 7]);
   assert.ok(within(times[2] - times[1], 12 + 300), `3rd attempt after the 5 min step: ${times[2] - times[1]} s`);
   assert.ok(within(times[3] - times[2], 12 + 900), `4th after the 15 min step: ${times[3] - times[2]} s`);
-  assert.strictEqual(bg.entry("Boots").stop, true);
+  assert.strictEqual(bg.entry(K("Boots")).stop, true);
   console.log(`  OK  closing/reopening the inventory tab keeps the count (clicks at ${times.join(", ")} s)`);
 }
 
@@ -120,10 +120,10 @@ async function testASuccessfulClaimIsRecordedAndForgotten() {
   await flush();
   await run([tab], 20 * SEC);
   assert.strictEqual(btn.clicks, 1);
-  assert.deepStrictEqual(tab.results().map((m) => [m.key, m.ok]), [["Boots", true]]);
+  assert.deepStrictEqual(tab.results().map((m) => [m.key, m.ok]), [[K("Boots"), true]]);
   assert.ok(tab.localSets.some((o) => o.lastClaimAt && o.lastClaimText === "Claim Now"), "recorded as the last claim only now, after the verdict");
   assert.ok(tab.sent.some((m) => m.type === "dropClaimed"), "and only now is the inventory refresh requested");
-  assert.strictEqual(bg.entry("Boots"), undefined, "background keeps nothing for a reward that went through");
+  assert.strictEqual(bg.entry(K("Boots")), undefined, "background keeps nothing for a reward that went through");
 
   const again = claimButton(tab, "Boots"); // the same reward showing up again (next campaign)
   await run([tab], 6 * SEC);
@@ -140,7 +140,7 @@ async function testRewardsBackOffIndependently() {
   await tab.scan();
   await flush();
   await run([tab], 20 * SEC);
-  assert.deepStrictEqual(tab.results().map((m) => [m.key, m.ok]).sort(), [["Fine reward", true], ["Rejected reward", false]]);
+  assert.deepStrictEqual(tab.results().map((m) => [m.key, m.ok]).sort(), [[K("Fine reward"), true], [K("Rejected reward"), false]]);
   const before = stuck.clicks;
   const fresh = claimButton(tab, "Third reward");
   await run([tab], 10 * SEC);
@@ -168,7 +168,7 @@ async function testATabThatDiesHoldsTheRewardOnlyBriefly() {
   await run([other], 30 * SEC);
   const t = rel(clickLog, t0)[1];
   assert.ok(t >= 60 && t <= 66, `after CLAIM_INFLIGHT_TTL_MS (60 s) the reward is free again: second click at ${t} s`);
-  assert.strictEqual((bg.entry("Boots") || {}).f || 0, other.results().length, "the dead tab cost no failure: only verdicts that were reported count");
+  assert.strictEqual((bg.entry(K("Boots")) || {}).f || 0, other.results().length, "the dead tab cost no failure: only verdicts that were reported count");
   assert.strictEqual(dying.results().length, 0);
   console.log("  OK  a tab that dies before its verdict holds the reward for at most 60 s and costs no failure");
 }
@@ -188,7 +188,7 @@ async function testSwitchingOffReleasesTheReward() {
   await run([b], 8 * SEC);
   assert.strictEqual(a.results().length, 0, "no verdict (and no failure) from the tab that was switched off");
   assert.strictEqual(clickLog.length, 2, "another tab can claim it at once");
-  assert.ok(!bg.entry("Boots") || !bg.entry("Boots").f, "and switching off cost no failure");
+  assert.ok(!bg.entry(K("Boots")) || !bg.entry(K("Boots")).f, "and switching off cost no failure");
   console.log("  OK  switching a tab off cancels its verdict and releases the reward to other tabs");
 }
 
@@ -201,14 +201,14 @@ async function testBackgroundStateOutlivesTheBackgroundPageAndDiesWithTheSession
   await tab1.scan();
   await flush();
   await run([tab1], 20 * SEC);
-  assert.strictEqual(bg1.entry("Boots").f, 1);
-  assert.deepStrictEqual(JSON.parse(JSON.stringify(session.claimBackoff)), { Boots: { f: 1, next: bg1.entry("Boots").next, stop: false } }, "mirrored into storage.session (without the in-memory hold)");
+  assert.strictEqual(bg1.entry(K("Boots")).f, 1);
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(session.claimBackoff)), { [K("Boots")]: { f: 1, next: bg1.entry(K("Boots")).next, stop: false } }, "mirrored into storage.session (without the in-memory hold)");
 
   // extension reloaded inside the same browser session: a new background page reads it back
   const bg2 = await makeBackground({ clock, session });
-  assert.strictEqual((await bg2.send({ type: "claimAsk", key: "Boots" })).allowed, false, "still backing off after a background reload");
-  clock.advanceTo(bg2.entry("Boots").next);
-  assert.strictEqual((await bg2.send({ type: "claimAsk", key: "Boots" })).allowed, true, "and free when the wait is over");
+  assert.strictEqual((await bg2.send({ type: "claimAsk", key: K("Boots") })).allowed, false, "still backing off after a background reload");
+  clock.advanceTo(bg2.entry(K("Boots")).next);
+  assert.strictEqual((await bg2.send({ type: "claimAsk", key: K("Boots") })).allowed, true, "and free when the wait is over");
 
   // Firefox starts a new browser session: no session marker -> everything is forgotten
   const stale = { claimBackoff: { Boots: { f: 3, next: clock.now + HOUR, stop: false } } };

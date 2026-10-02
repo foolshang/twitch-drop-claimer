@@ -72,6 +72,9 @@ const fillBuffer = (ctx, lines) => {
   buf.push(...lines);
 };
 
+// what a report carries ahead of the ordinary ring: the lifecycle section (empty here) and the ring's header
+const REPORT_HEAD = "=== window / session lifecycle (kept separately, never pushed out) ===\n(none yet)\n=== log ===\n";
+
 const realisticLines = (n, extra = "") =>
   Array.from({ length: n }, (_, i) =>
     `[2026-09-28T14:${String(i % 60).padStart(2, "0")}:00.000Z] [bg] "verify" slug=path-of-exile-2 ch=streamer${i} ` +
@@ -84,7 +87,7 @@ async function testSmallLogIsOneRequestUnchanged() {
 
   assert.strictEqual(res.ok, true);
   assert.strictEqual(posts.length, 1);
-  assert.strictEqual(posts[0].body.log, "line one\nline two", "single part carries no part header");
+  assert.strictEqual(posts[0].body.log, REPORT_HEAD + "line one\nline two", "single part carries no part header");
   assert.strictEqual(res.parts, 1);
   assert.strictEqual(res.url, "https://gh/issues/101");
   console.log("  OK  a small log is still exactly one plain request");
@@ -115,9 +118,39 @@ async function testFullBufferSplitsIntoBoundedPartsLosslessly() {
   });
   const ids = new Set(posts.map((p) => p.body.log.split(" ")[3]));
   assert.strictEqual(ids.size, 1, "all parts share one report id");
-  assert.strictEqual(stripped.join("\n"), lines.join("\n"), "no line lost, duplicated, or reordered");
+  assert.strictEqual(stripped.join("\n"), REPORT_HEAD + lines.join("\n"), "no line lost, duplicated, or reordered");
 
   console.log(`  OK  1000 lines (${raw} B) -> ${posts.length} parts, max body ${Math.max(...posts.map((p) => p.bytes))} B, lossless`);
+}
+
+// The window lifecycle lines live in a buffer of their own: 1000+ ordinary lines push them out of the
+// ordinary ring, but every report (and the exported file) still starts with them.
+async function testLifecycleLinesSurviveAFloodOfOrdinaryLines() {
+  const { ctx, posts } = makeSandbox();
+  vm.runInContext(`logLifecycle("created the watch window", 7, "(tagged)"); logLifecycle("master switch", "ON");`, ctx);
+  vm.runInContext(`for (let i = 0; i < 1500; i++) log("ordinary line", i);`, ctx);
+  const ring = vm.runInContext("debugLogBuffer", ctx);
+  assert.strictEqual(ring.length, 1000, "the ordinary ring is full");
+  assert.ok(!ring.some((l) => /created the watch window/.test(l)), "the ordinary ring has lost the window line (this is the bug)");
+
+  const res = await vm.runInContext("reportBugToGitHub", ctx)();
+  assert.strictEqual(res.ok, true);
+  const text = posts.map((p) => p.body.log).join("\n");
+  assert.ok(/created the watch window 7 \(tagged\)/.test(text), "the report still carries the window line");
+  assert.ok(/master switch ON/.test(text), "and the switch line");
+  assert.ok(text.indexOf("created the watch window") < text.indexOf("=== log ==="), "in its own section, ahead of the ordinary lines");
+
+  const exported = vm.runInContext("allLogLines()", ctx).join("\n"); // what exportDebugLogToFile writes
+  assert.ok(/created the watch window 7/.test(exported));
+  console.log("  OK  window lifecycle lines survive 1500 ordinary lines and are in every report / export");
+}
+
+async function testLifecycleBufferIsBoundedButIndependent() {
+  const { ctx } = makeSandbox();
+  vm.runInContext(`for (let i = 0; i < 500; i++) logLifecycle("lifecycle", i);`, ctx);
+  const n = vm.runInContext("lifecycleLogBuffer.length", ctx);
+  assert.strictEqual(n, 200, "small and bounded");
+  console.log("  OK  the lifecycle buffer is small (200) and bounded");
 }
 
 async function testEscapeHeavyLogStillFitsOnTheWire() {
@@ -138,7 +171,7 @@ async function testSingleGiantLineIsSlicedNotDropped() {
   const res = await vm.runInContext("reportBugToGitHub", ctx)();
   assert.strictEqual(res.ok, true);
   for (const p of posts) assert.ok(p.bytes <= WIRE_LIMIT, `giant-line body ${p.bytes} B over ${WIRE_LIMIT}`);
-  const joined = posts.map((p) => p.body.log.replace(/^=== .* ===\n/, "")).join("");
+  const joined = posts.map((p) => p.body.log.replace(/^=== bug report .* ===\n/, "")).join("\n").replace(REPORT_HEAD, "");
   assert.ok(joined.includes("before") && joined.includes("after"));
   assert.strictEqual(joined.replace(/[\n]|before|after/g, ""), giant, "giant line content fully preserved (surrogates intact)");
   console.log(`  OK  one ${giant.length}-char line is sliced across ${posts.length} parts without corruption`);
@@ -160,6 +193,8 @@ async function testStopsAtFirstFailureAndSaysWhere() {
   try {
     await testSmallLogIsOneRequestUnchanged();
     await testFullBufferSplitsIntoBoundedPartsLosslessly();
+    await testLifecycleLinesSurviveAFloodOfOrdinaryLines();
+    await testLifecycleBufferIsBoundedButIndependent();
     await testEscapeHeavyLogStillFitsOnTheWire();
     await testSingleGiantLineIsSlicedNotDropped();
     await testStopsAtFirstFailureAndSaysWhere();

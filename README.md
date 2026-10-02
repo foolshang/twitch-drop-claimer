@@ -8,11 +8,18 @@ watch-time drops accrue without you having to sit and watch.
 
 ## What it does
 
-**Claiming.** A content script scans every twitch.tv page every 15 seconds
-for known claim-button selectors (inventory page, stream-corner drop
-notification, chat callout) plus a generic text-match fallback ("Claim",
-"Claim Reward", Thai equivalents, etc.), and clicks whatever it finds
-(debounced to one click per 5s). Every claim is recorded to
+**Claiming.** A content script checks twitch.tv every 15 seconds and clicks
+**drop claim buttons only**: Twitch's own selectors for the drop-notification
+button and the chat callout (on any twitch.tv page), and, on the Drops
+inventory page, a claim-labelled button that sits inside a campaign card
+(a card whose title links to `/drops/campaigns?dropID=...` and whose reward
+tier shows its progress). Nothing else is ever clicked: there is no longer a
+scan of every button on every page, and the channel-points chest in the chat
+("Claim Bonus", in any UI language) is excluded by where it sits (the
+community-points area) with its English label as a second net - this extension
+is for drops only. Clicks are debounced to one per 5s. Each reward has its own
+key (the campaign id + the reward's name), so one reward Twitch rejects backs
+off on its own without holding up the others. Every claim is recorded to
 `browser.storage.local` so the popup can show the most recent one.
 
 **Inventory upkeep.** Twitch's inventory page doesn't always reflect newly
@@ -259,7 +266,14 @@ to close.
 
 ## Debug log — what it stores, and where it goes
 
-A ring buffer (last 1000 lines) of this extension's own internal log lines:
+A ring buffer (last 1000 lines) of this extension's own internal log lines
+(a line that would repeat every tick - the `[verify]` progress checks, a pinned
+channel's live/flash decision - is written when its state changes, plus one
+short summary every 15 minutes; the window and session lifecycle lines - a
+watch window created / adopted / tagged / closed, a new browser session, the
+master switch on/off - are also kept in a separate buffer of 200 lines that
+ordinary lines never push out, and it is the first section of every export and
+bug report):
 Twitch channel/streamer names and game slugs it watched or rejected,
 timestamps, drop-campaign progress numbers (claimed/total, minutes
 remaining), and its own decisions (e.g. `channel X unusable (offline)`,

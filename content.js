@@ -73,6 +73,40 @@
       CLAIM_ARIA_PREFIXES.some((re) => re.test(aria));
   }
 
+  // The community-points area of the chat (the "Claim Bonus" chest) is channel
+  // points, never a drop: identified by where it sits - class/test-selector
+  // fragments of Twitch's community-points markup, so it works in every UI
+  // language - and, as a second net, by its English label.
+  const CHANNEL_POINTS_AREA = '[data-test-selector*="community-points"], [data-a-target*="community-points"], [class*="community-points"], [class*="claimable-bonus"]';
+  function isChannelPointsButton(el) {
+    if (el.closest && el.closest(CHANNEL_POINTS_AREA)) return true;
+    return /\bbonus\b/i.test(el.getAttribute("aria-label") || "") || /^claim bonus$/i.test((el.textContent || "").trim());
+  }
+
+  // A drop's claim button on the inventory sits in a campaign card, whose title
+  // links to /drops/campaigns?dropID=<campaign id>
+  const DROP_LINK = 'a[href*="dropID="]';
+  function dropIdOf(a) {
+    const m = ((a && a.getAttribute && a.getAttribute("href")) || "").match(/[?&]dropID=([0-9A-Za-z-]+)/);
+    return m ? m[1] : null;
+  }
+  // the card around a button: the nearest ancestor that holds a campaign title
+  // link - and exactly one (a container of several cards is no card)
+  function cardOf(btn) {
+    for (let el = btn.parentElement, i = 0; el && i < 16; i++, el = el.parentElement) {
+      if (!el.querySelectorAll) continue;
+      const links = el.querySelectorAll(DROP_LINK);
+      if (links.length > 0) return links.length === 1 ? el : null;
+    }
+    return null;
+  }
+
+  // Which buttons are drop claim buttons - nothing else may ever be clicked:
+  //   - the specific Twitch selectors (inventory reward claim button, drop
+  //     notification, chat callouts) anywhere;
+  //   - on the inventory page only, a claim-labelled button INSIDE a campaign card
+  //     (the old scan of every button on every page is gone);
+  //   - never anything in the community-points area.
   function findClaimButtons() {
     const found = new Set();
 
@@ -83,12 +117,13 @@
       });
     }
 
-    // Generic fallback: scan every button and role=button element
-    document.querySelectorAll('button, [role="button"]').forEach((b) => {
-      if (textMatches(b)) found.add(b);
-    });
+    if (isInventoryPage()) {
+      document.querySelectorAll('button, [role="button"]').forEach((b) => {
+        if (textMatches(b) && isDropClaimButton(b)) found.add(b);
+      });
+    }
 
-    return [...found].filter((b) => !b.disabled && b.getAttribute("aria-disabled") !== "true");
+    return [...found].filter((b) => !isChannelPointsButton(b) && !b.disabled && b.getAttribute("aria-disabled") !== "true");
   }
 
   async function recordClaim(text) {
@@ -132,22 +167,60 @@
     .catch(() => false);
   const releaseClaim = (key) => { sendClaimMessage({ type: "claimRelease", key }).catch(() => {}); };
 
-  // Which reward a claim button belongs to: the alt text of the reward image in
-  // the nearest ancestor that holds this one claim button (best effort - the
-  // markup was never directly inspectable). Falls back to the button's own
-  // label, which is shared by every anonymous button: conservative, they back
-  // off together.
+  // Which reward a claim button belongs to. On the inventory: the campaign id
+  // (from the card's title link) + the tier's reward name (the first <p> of the
+  // tier that is not a progress/date line) - NOT the reward image's alt, which
+  // is the same generic "Reward Image Icon" on every tier (seen in a real bug
+  // report: every inventory reward then shared one key, one backoff). No name
+  // found: the campaign id + the button's order in the card; two tiers with the
+  // same name: name + order. A button outside any card (a notification toast, a
+  // chat callout): its label + its position among the claim buttons on the page.
+  // Never one key shared by every reward.
+  const claimButtonsIn = (root) => [...root.querySelectorAll('button, [role="button"]')].filter((b) => textMatches(b) && !isChannelPointsButton(b));
+
+  // the biggest ancestor below the card that holds only this claim button
+  function tierOf(btn, card) {
+    let tier = btn.parentElement;
+    for (let el = btn.parentElement; el && el !== card && el.querySelectorAll; el = el.parentElement) {
+      if (claimButtonsIn(el).length === 1) tier = el; else break;
+    }
+    return tier && tier.querySelectorAll ? tier : null;
+  }
+  // a tier shows its progress (a progress bar or "N% of ..."): a claim-labelled
+  // button elsewhere on the page (a header, a lone card on an otherwise empty
+  // page makes the whole page "the card") is not a reward tier
+  function tierShowsProgress(tier) {
+    return !!(tier.querySelector && tier.querySelector('[role="progressbar"]')) || /%\s*of\s/i.test(tier.textContent || "");
+  }
+  function isDropClaimButton(btn) {
+    const card = cardOf(btn);
+    if (!card) return false;
+    const tier = tierOf(btn, card);
+    return !!tier && tierShowsProgress(tier);
+  }
+
+  function tierRewardName(btn, card) {
+    const tier = tierOf(btn, card);
+    if (!tier) return null;
+    const ps = [...tier.querySelectorAll("p")].filter((p) =>
+      !(p.querySelector && p.querySelector(DROP_LINK)) && !/%\s*of\s|end date|to continue the progress/i.test(p.textContent || ""));
+    const text = ps.length ? (ps[0].textContent || "").trim() : "";
+    return text || null;
+  }
+
   function claimKey(btn) {
-    let el = btn;
-    for (let i = 0; el && i < 6; i++, el = el.parentElement) {
-      if (el.querySelectorAll &&
-          [...el.querySelectorAll('button, [role="button"]')].filter(textMatches).length > 1) break; // several rewards in here
-      const img = el.querySelector && el.querySelector("img[alt]");
-      const alt = img && (img.getAttribute("alt") || "").trim();
-      if (alt) return alt;
+    const card = cardOf(btn);
+    const id = card && dropIdOf(card.querySelector(DROP_LINK));
+    if (id) {
+      const btns = claimButtonsIn(card);
+      const order = btns.indexOf(btn);
+      const name = tierRewardName(btn, card);
+      if (!name) return `${id}:#${order}`;
+      const sameName = btns.some((other) => other !== btn && tierRewardName(other, card) === name);
+      return sameName ? `${id}:${name}#${order}` : `${id}:${name}`;
     }
     const label = (btn.getAttribute("aria-label") || btn.textContent || "").trim();
-    return `claim:${label}`;
+    return `claim:${label}#${Math.max(0, findClaimButtons().indexOf(btn))}`;
   }
 
   // ---- a claim refused because the game account is not connected -----------

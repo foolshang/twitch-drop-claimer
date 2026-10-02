@@ -2562,5 +2562,57 @@ API", which only guards a regression, and the concurrent-switch-on case fails on
 at "it is tagged". All 17 test files pass; `web-ext lint` clean (0/0/0); i18n key
 parity holds (86/language).
 
-`BUILD_MARKER` -> `2026-10-02-r3`, `manifest.json` -> 0.6.19 (new permission:
+**Problem 3 - one reward key for every inventory reward (found in a real
+0.6.17 bug report: `claim went through: "Reward Image Icon"`):** the key of a
+reward was the alt text of its nearest image, which on the inventory is the same
+generic "Reward Image Icon" on every tier, so every reward there shared one key:
+one rejected claim would have put all of them into one backoff (and one in-flight
+lock). **Fix:** the key is now the campaign id (the `dropID` of the card's title
+link) + the tier's reward name (the first line of the tier that is not a progress
+or date line); no readable name = campaign id + the button's order in the card;
+the same name on two tiers = name + order; a button outside any card (a toast, a
+callout) = its label + its position. Never one key for all.
+
+**Problem 4 - the channel-points "Claim Bonus" was clicked as a drop (46 times in
+one report, `claim went through: "claim:Claim Bonus"`):** each click recorded a
+last claim, reloaded the inventory and fed the claim backoff/streak machinery.
+**Fix (this extension is for drops only):** a channel-points button is never
+clicked - found by where it sits (the community-points area of the chat: class /
+test-selector fragments, so any UI language) with its English label as a second
+net; and the claim scan itself is narrowed: the old "every button on every page
+whose text says claim" fallback is gone. On the inventory a claim-labelled button
+counts only inside a campaign card and only if its tier shows progress (a lone
+card on an otherwise empty page makes the whole page "the card"; the progress
+check keeps a header or loose "Claim" button out); elsewhere only Twitch's own
+drop-notification / callout selectors are used.
+
+**Problem 5 - the log was 1000 lines of the same message:** the `[verify] ...
+waiting` ticks and the pinned live/flash line pushed everything else - the window
+lines that say where a tab was opened - out of the 1000-line ring. **Fix:**
+`logOnChange` writes a per-tick line when its state changes (healthy / no reading /
+no newer reading / no signal; pinned: flashed / flash skipped) and one short
+`[summary]` per 15 minutes while it stays; the stalled verdict is still logged
+every time. The window / session lifecycle lines (created, adopted, tagged,
+leftover closed, could not create, session restore wait, a window that came back
+late or was closed, the user's windows recorded, a new browser session, master
+switch ON/OFF) also go to a lifecycle buffer of 200 lines that ordinary lines never
+push out; every export and bug report starts with it, under its own header.
+
+**Not verified live:** the DOM selectors for the community-points area and the
+progress bar in a claimable tier follow the captured card structure and Twitch's
+usual markup, not a live run (README rule: no live tests with a real session);
+if the Claim Bonus chest were ever not recognised by place, its label is the
+second net. **Tests:** new `claim-keys-and-scope.test.js` (jsdom + real
+background; two rewards in one inventory get their own keys and one rejected does
+not block the other; fallback keys; a channel page with Claim Bonus - English and
+Thai - clicks nothing and feeds no lastClaim/reload/backoff/streak; only claim
+buttons inside campaign cards on the inventory; no loose scan on channel pages),
+new `log-throttle.test.js` (state-change-only logging, a summary every 15 minutes
+on a fake clock, window lines go to the lifecycle buffer) and
+`bug-report-chunking.test.js` (window lines survive 1500 ordinary lines and are in
+every report/export). The claim tests' fake DOM now has real card/tier structure
+so the real key code runs. Against 0.6.19 as first committed (07d7124) the new
+cases fail.
+
+`BUILD_MARKER` -> `2026-10-02-r4`, `manifest.json` -> 0.6.19 (new permission:
 `sessions`).

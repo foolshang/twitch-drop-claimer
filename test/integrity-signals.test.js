@@ -27,7 +27,7 @@
 const vm = require("vm");
 const assert = require("assert");
 const {
-  SEC, MIN, flush, read, makeClock, makeBackground, claimButton, removeButton, openTab, run,
+  SEC, MIN, flush, read, makeClock, makeBackground, claimButton, removeButton, openTab, run, K,
 } = require("./claim-harness");
 
 // ---- inject.js against fake GQL responses ------------------------------------
@@ -169,7 +169,7 @@ async function testIntegrityFailureStopsClaimingEverywhereAtOnce() {
   }
   // Twitch refuses the campaign list; nothing has been claimed or failed yet (no backoff has started)
   await bg.send(integrityFailed(), 9);
-  assert.strictEqual(bg.entry("Rust Isles Boots"), undefined, "no per-reward state involved");
+  assert.strictEqual(bg.entry(K("Rust Isles Boots")), undefined, "no per-reward state involved");
   await run(tabs, 90 * SEC);
   assert.strictEqual(clickLog.length, 0, "three tabs, 90 s: not one click");
   assert.strictEqual((await bg.send({ type: "claimAsk", key: "anything else" })).reason, "integrity", "any reward is refused, not just the ones seen");
@@ -280,14 +280,14 @@ async function testAccountNotLinkedStopsOnlyThatReward() {
   await flush();
   await flush();
 
-  assert.deepStrictEqual({ ...bg.entry("Rust Isles Boots") }, { f: 0, next: 0, stop: true, notLinked: true }, "that reward stops for the session");
-  assert.deepStrictEqual(JSON.parse(JSON.stringify(bg.local.claimNotLinked)), [{ key: "Rust Isles Boots", game: "Rust" }], "with its game, for the popup");
+  assert.deepStrictEqual({ ...bg.entry(K("Rust Isles Boots")) }, { f: 0, next: 0, stop: true, notLinked: true }, "that reward stops for the session");
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(bg.local.claimNotLinked)), [{ key: K("Rust Isles Boots"), game: "Rust" }], "with its game, for the popup");
   assert.ok(bg.logLines().some((l) => /claim needs a linked game account/.test(l) && /Rust Isles Boots/.test(l) && /campaigns page/.test(l)));
   assert.strictEqual((bg.local.claimHealth || {}).streak || 0, 0, "right away: not a claim failure, the streak is untouched");
   assert.ok(!bg.session.integrityFlag, "and not an integrity failure");
 
   await run([tab], 30 * SEC); // verdicts arrive
-  assert.deepStrictEqual(tab.results().map((m) => [m.key, m.ok]), [["Fine reward", true]], "the refused reward is not reported as a failed attempt; the other one was claimed");
+  assert.deepStrictEqual(tab.results().map((m) => [m.key, m.ok]), [[K("Fine reward"), true]], "the refused reward is not reported as a failed attempt; the other one was claimed");
   assert.strictEqual((bg.local.claimHealth || {}).streak || 0, 0, "it does not count toward the claim-failure warning");
   assert.ok(!bg.session.integrityFlag, "nor toward the integrity warning");
 
@@ -296,7 +296,7 @@ async function testAccountNotLinkedStopsOnlyThatReward() {
   await run([tab], 20 * SEC);
   assert.strictEqual(boots.clicks, 1, "never clicked again");
   assert.strictEqual(other.clicks, 1, "another reward is claimed at once");
-  assert.strictEqual((await bg.send({ type: "claimAsk", key: "Rust Isles Boots" }, 4)).reason, "stopped", "in every tab");
+  assert.strictEqual((await bg.send({ type: "claimAsk", key: K("Rust Isles Boots") }, 4)).reason, "stopped", "in every tab");
 
   // a signal for a number that pairs with no click of ours is ignored
   tab.postSignal("DropsPage_ClaimDropRewards", { kind: "claimNotLinked", seq: 5 });
@@ -316,12 +316,12 @@ async function testConnectingTheAccountResumesTheReward() {
   tab.postSignal("DropsPage_ClaimDropRewards", { kind: "claimNotLinked", seq: 0 });
   await flush();
   await flush();
-  assert.strictEqual((await bg.send({ type: "claimAsk", key: "Rust Isles Boots" })).allowed, false);
+  assert.strictEqual((await bg.send({ type: "claimAsk", key: K("Rust Isles Boots") })).allowed, false);
 
   // the user connects the account; the campaigns page's own data says so
   await bg.send(gqlSignal("ViewerDropsDashboard", "openCampaigns", { snapshot: true, games: [{ id: "123", name: "Rust", active: true, endAt: null, accountConnected: true }] }), 1);
   assert.deepStrictEqual(JSON.parse(JSON.stringify(bg.local.claimNotLinked)), [], "warning gone");
-  assert.strictEqual((await bg.send({ type: "claimAsk", key: "Rust Isles Boots" })).allowed, true, "and the reward may be claimed again");
+  assert.strictEqual((await bg.send({ type: "claimAsk", key: K("Rust Isles Boots") })).allowed, true, "and the reward may be claimed again");
   assert.ok(boots.clicks === 1);
   console.log("  OK  once the campaigns data says the account is connected the reward is claimed again");
 }
