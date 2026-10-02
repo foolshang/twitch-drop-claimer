@@ -96,6 +96,18 @@ async function testOfflineBeatsPlayingAnotherGame() {
   console.log("  OK  popup: wrong game while live; offline once it is offline");
 }
 
+async function testLiveButWaitingForASlotIsNotWatching() {
+  const base = listOf("xChocoBars", "DisguisedToast");
+  const rows = await renderRows({
+    ...base,
+    pinnedLive: { ...live("xChocoBars", 0, "live"), ...live("DisguisedToast", 1, "live") },
+    idlePinned: { "channel:xchocobars": true }, // live, but every quota slot is taken by higher-ranked entries
+  });
+  assert.strictEqual(rows[0].badge, en.badge_pinned_waiting_slot, "live without a slot: " + rows[0].badge);
+  assert.strictEqual(rows[1].badge, en.badge_watching, "the one that holds a slot is watching");
+  console.log("  OK  popup: a live pinned channel waiting for a quota slot says so");
+}
+
 async function testFinishedAndOtherStatesAreNotOverridden() {
   const base = { ...listOf("xChocoBars"), campaignProgress: { "channel:xchocobars": { label: "Rust", claimed: 1, total: 1, allComplete: true, expired: false, timeRemainingMin: 0, campaignNames: ["Tac"], updatedAt: 1 } } };
   const rows = await renderRows({ ...base, pinnedLive: live("xChocoBars", 0, "offline") });
@@ -105,7 +117,7 @@ async function testFinishedAndOtherStatesAreNotOverridden() {
 
 async function testAllLanguagesHaveTheTexts() {
   for (const { code } of I18N_LANGS) {
-    for (const k of ["badge_pinned_offline", "badge_pinned_checking", "detail_pinned_offline"]) {
+    for (const k of ["badge_pinned_offline", "badge_pinned_checking", "detail_pinned_offline", "badge_pinned_waiting_slot"]) {
       assert.ok(I18N[code][k] && I18N[code][k].length > 3, `${code}.${k}`);
     }
     if (code !== "en") assert.notStrictEqual(I18N[code].badge_pinned_offline, en.badge_pinned_offline, `${code} is translated`);
@@ -150,6 +162,7 @@ async function testBackgroundRecordsWhatThePageReports() {
     await testPopupBadgePerPageState();
     await testOnlineAfterOfflineAndStaleTabReports();
     await testOfflineBeatsPlayingAnotherGame();
+    await testLiveButWaitingForASlotIsNotWatching();
     await testFinishedAndOtherStatesAreNotOverridden();
     await testAllLanguagesHaveTheTexts();
     await testBackgroundRecordsWhatThePageReports();

@@ -409,7 +409,7 @@ async function renderGameStatus() {
   const cfg = await browser.storage.local.get([
     "watchList", "autoWatchEnabled", "watchPhase", "watchTabs",
     "invalidSlugs", "campaignProgress", "priorityMode", "emptyUntil",
-    "openCampaigns", "gameWaitUntil", "claimHealth", "claimNotLinked", "claimLinkReminders", "pinnedLive",
+    "openCampaigns", "gameWaitUntil", "claimHealth", "claimNotLinked", "claimLinkReminders", "pinnedLive", "idlePinned",
   ]);
   const watchList = cfg.watchList || [];
   const openCampaigns = cfg.openCampaigns || null;
@@ -575,6 +575,9 @@ async function renderGameStatus() {
         // waiting for the channel to go live: nothing is being earned, whatever the list says about expiry
         badge = badgeEl(t("badge_pinned_offline"), "warn");
         detail = t("detail_pinned_offline") + (progress && progress.total > 0 ? " · " + t("detail_pieces", { claimed: progress.claimed, total: progress.total }) : "");
+      } else if (isWatching && game.pinnedChannel && pinnedState === "live" && cfg.idlePinned && cfg.idlePinned[game.slug]) {
+        // live, but every quota slot is taken by entries that rank higher: its tab waits, not watching yet
+        badge = badgeEl(t("badge_pinned_waiting_slot"), "warn");
       } else if (isWatching && game.pinnedChannel && pinnedState !== "live") {
         // no report from its page yet / still loading or gated: not "watching" until it says it is live
         badge = badgeEl(t("badge_pinned_checking"), "warn");
@@ -674,7 +677,7 @@ browser.storage.onChanged.addListener((changes, area) => {
     changes.watchList || changes.watchTabs || changes.autoWatchEnabled ||
     changes.watchPhase || changes.invalidSlugs || changes.campaignProgress ||
     changes.priorityMode || changes.emptyUntil ||
-    changes.openCampaigns || changes.gameWaitUntil || changes.claimHealth || changes.claimNotLinked || changes.claimLinkReminders || changes.pinnedLive
+    changes.openCampaigns || changes.gameWaitUntil || changes.claimHealth || changes.claimNotLinked || changes.claimLinkReminders || changes.pinnedLive || changes.idlePinned
   ) {
     renderGameStatus();
   }

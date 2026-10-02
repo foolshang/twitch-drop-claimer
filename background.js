@@ -514,7 +514,7 @@ async function resetStateForNewBrowserSession() {
   const { tdcSessionStarted } = await browser.storage.session.get("tdcSessionStarted");
   if (tdcSessionStarted) return false;
   await browser.storage.session.set({ tdcSessionStarted: Date.now() });
-  await browser.storage.local.set({ watchTabs: {}, watchMeta: {}, dropSignals: {}, watchWindowId: null, claimHealth: null, claimNotLinked: null });
+  await browser.storage.local.set({ watchTabs: {}, watchMeta: {}, dropSignals: {}, watchWindowId: null, claimHealth: null, claimNotLinked: null, idlePinned: {}, pinnedLive: {} });
   ownWindowIds.clear(); // window ids start from 1 again: nothing remembered about windows means anything now
   userWindowIds = new Set();
   try {
@@ -1239,7 +1239,7 @@ async function teardownAllWatch(reason) {
     try { await browser.tabs.remove(tabId); } catch { /* already closed */ }
   }
   if (cfg.watchPhase !== "idle") {
-    await browser.storage.local.set({ watchTabs: {}, watchPhase: "idle", watchMeta: {}, dropSignals: {} });
+    await browser.storage.local.set({ watchTabs: {}, watchPhase: "idle", watchMeta: {}, dropSignals: {}, idlePinned: {} });
   }
   log("auto-watch idle:", reason);
   await refreshBadge();
@@ -1253,7 +1253,7 @@ async function finishAllDone() {
   for (const tabId of Object.values(watchTabs)) {
     try { await browser.tabs.remove(tabId); } catch { /* already closed */ }
   }
-  await browser.storage.local.set({ watchTabs: {}, watchPhase: "all-done", watchMeta: {}, dropSignals: {} });
+  await browser.storage.local.set({ watchTabs: {}, watchPhase: "all-done", watchMeta: {}, dropSignals: {}, idlePinned: {} });
   await refreshBadge();
   // if the user asked for it, switch the whole extension off now that every
   // tracked game is collected - nothing more for it to do until they change
@@ -1261,13 +1261,17 @@ async function finishAllDone() {
   await checkAutoOff();
 }
 
+// At most this many pinned tabs that hold no quota slot (offline, or live but
+// waiting for a slot) stay open; offline entries beyond it wait without a tab
+const OFFLINE_PINNED_TAB_CAP = 5;
+
 // the core scheduler - not self-serializing, callers must go through
 // serialized(autoWatchTick)
 async function autoWatchTick() {
   const cfg = await browser.storage.local.get([
     "enabled", "autoWatchEnabled", "watchList", "invalidSlugs", "campaignProgress",
     "watchTabs", "tabQuota", "priorityMode", "emptyUntil", "watchMeta", "dropSignals",
-    "gameWaitUntil", "openCampaigns",
+    "gameWaitUntil", "openCampaigns", "pinnedLive", "idlePinned",
   ]);
   if (!cfg.enabled || !cfg.autoWatchEnabled) return;
 
@@ -1337,21 +1341,86 @@ async function autoWatchTick() {
   // moment are not closed to make room, so the total may briefly exceed the quota.
   const parked = new Set(eligible.filter((g) => entryPlaysWrongGame(g, campaignProgress[g.slug])).map((g) => g.slug));
 
-  // fill remaining quota with the next-priority eligible games not already watched
   const ordered = orderByPriority(eligible, priorityMode, campaignProgress, emptyUntil);
-  let openCount = Object.keys(watchTabs).filter((k) => !parked.has(k)).length;
+  const rank = new Map(ordered.map((g, i) => [g.slug, i]));
+
+  // An OFFLINE pinned channel is not earning either: the same - its tab stays,
+  // it holds no quota slot (`idlePinned`: slug -> true), at most
+  // OFFLINE_PINNED_TAB_CAP such tabs; the rest of the offline entries wait without
+  // a tab (no checking at all) until a place in the cap frees up. What the page
+  // says comes from pinnedLive (written by handlePinnedChannelStatus; trusted only
+  // for the tab it came from - a closed tab's "offline" record still marks an
+  // entry as known offline).
+  const pinnedLive = cfg.pinnedLive || {};
+  const idlePinned = { ...(cfg.idlePinned || {}) };
+  const pinnedStateOf = (g) => {
+    const rec = g.pinnedChannel && pinnedLive[g.slug];
+    if (!rec) return null;
+    if (watchTabs[g.slug] != null) return rec.tabId === watchTabs[g.slug] ? rec.state : null;
+    return rec.state === "offline" ? "offline" : null;
+  };
+  for (const slug of Object.keys(idlePinned)) {
+    if (watchTabs[slug] == null || !eligibleSlugs.has(slug)) delete idlePinned[slug];
+  }
+  // 3. a pinned channel that went offline stops holding its slot (the slot goes to the next queued entry below)
+  for (const g of ordered) {
+    if (!g.pinnedChannel || watchTabs[g.slug] == null || idlePinned[g.slug] || pinnedStateOf(g) !== "offline") continue;
+    idlePinned[g.slug] = true;
+    logOnChange(`pinned-slot:${g.slug}`, "idle-offline", "pinned channel", g.channel, "is offline - its tab stays open but no longer holds a quota slot");
+  }
+  const countedTabs = () => Object.keys(watchTabs).filter((k) => !parked.has(k) && !idlePinned[k]);
+  // 2. a live pinned channel waiting without a slot: a free slot, else a swap with the lowest-ranked
+  // entry being watched - but only if the pinned one outranks it (the current priority mode decides)
+  for (const g of ordered) {
+    if (!idlePinned[g.slug] || watchTabs[g.slug] == null || pinnedStateOf(g) !== "live") continue;
+    const counted = countedTabs();
+    if (counted.length < quota) {
+      delete idlePinned[g.slug];
+      log("pinned channel", g.channel, "went live - takes a free quota slot", `(${counted.length + 1}/${quota})`);
+      continue;
+    }
+    const lowest = counted.reduce((x, y) => ((rank.get(x) ?? Infinity) >= (rank.get(y) ?? Infinity) ? x : y));
+    if ((rank.get(g.slug) ?? Infinity) < (rank.get(lowest) ?? Infinity)) {
+      await closeWatchTab(watchTabs, lowest);
+      delete watchMeta[lowest];
+      delete dropSignals[lowest];
+      delete idlePinned[g.slug];
+      log(`slot swap (${priorityMode}): pinned channel ${g.channel} went live and ranks above ${lowest} (#${rank.get(g.slug) + 1} vs #${rank.get(lowest) + 1} of ${ordered.length}) - closed the tab of ${lowest}, ${g.channel} takes its slot`);
+    } else {
+      logOnChange(`pinned-slot:${g.slug}`, "waiting-slot", "pinned channel", g.channel, `went live but ranks below every entry being watched (${priorityMode}) - its tab stays open without a slot until one frees up`);
+    }
+  }
+  // the cap: only the highest-ranked idle tabs stay; the others close and wait without a tab
+  const idleTabs = ordered.filter((g) => idlePinned[g.slug] && watchTabs[g.slug] != null);
+  for (const g of idleTabs.slice(OFFLINE_PINNED_TAB_CAP)) {
+    await closeWatchTab(watchTabs, g.slug);
+    delete watchMeta[g.slug];
+    delete dropSignals[g.slug];
+    delete idlePinned[g.slug];
+    logOnChange(`pinned-slot:${g.slug}`, "over-cap", "pinned channel", g.channel, `: more than ${OFFLINE_PINNED_TAB_CAP} pinned tabs are waiting without a slot - closed its tab, it waits without one (not checked) until a place frees up`);
+  }
+
+  // fill remaining quota with the next-priority eligible games not already watched
+  let openCount = countedTabs().length;
+  let idleCount = Object.keys(idlePinned).filter((k) => watchTabs[k] != null).length;
   for (const game of ordered) {
-    const isParked = parked.has(game.slug);
-    if (!isParked && openCount >= quota) continue;
     if (watchTabs[game.slug]) continue; // already has a tab
+    const knownOffline = game.pinnedChannel && pinnedStateOf(game) === "offline"; // no tab, last seen offline
+    const isParked = parked.has(game.slug);
+    if (knownOffline) {
+      if (idleCount >= OFFLINE_PINNED_TAB_CAP) continue; // waits without a tab: no extra checking
+    } else if (!isParked && openCount >= quota) continue;
 
     const url = game.pinnedChannel ? channelUrl(game.channel) : directoryUrl(game.slug);
     const tab = await createWatchTab({ url, active: false, pinned: true });
     if (!tab) break; // no verified watch window right now: the rest waits for the next tick
     await browser.tabs.update(tab.id, { active: false, muted: true });
     watchTabs[game.slug] = tab.id;
-    if (!isParked) openCount++;
-    log("opened watch tab for", game.slug, `tab=${tab.id}`, isParked ? "(on another game than its campaign - not counted)" : `(${openCount}/${quota})`);
+    if (knownOffline) {
+      idlePinned[game.slug] = true;
+      idleCount++;
+    } else if (!isParked) openCount++;
+    log("opened watch tab for", game.slug, `tab=${tab.id}`, knownOffline ? `(last seen offline - not counted, ${idleCount}/${OFFLINE_PINNED_TAB_CAP} waiting)` : isParked ? "(on another game than its campaign - not counted)" : `(${openCount}/${quota})`);
 
     if (game.pinnedChannel) {
       // the destination channel is already known (no directory pick to wait
@@ -1373,7 +1442,7 @@ async function autoWatchTick() {
     }
   }
 
-  await browser.storage.local.set({ watchTabs, watchPhase: "watching", watchMeta, dropSignals });
+  await browser.storage.local.set({ watchTabs, watchPhase: "watching", watchMeta, dropSignals, idlePinned });
   await refreshBadge();
 }
 
@@ -2071,6 +2140,8 @@ async function recordPinnedLiveState(tabId, slug, live) {
   pinnedStateWritten.set(tabId, state);
   const { pinnedLive } = await browser.storage.local.get("pinnedLive");
   await browser.storage.local.set({ pinnedLive: { ...(pinnedLive || {}), [slug]: { tabId, state, at: Date.now() } } });
+  // offline <-> live changes who holds a quota slot (autoWatchTick): no waiting for the next minute
+  serialized(autoWatchTick).catch(() => {});
 }
 
 async function handlePinnedChannelStatus(msg, tab) {

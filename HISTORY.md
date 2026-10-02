@@ -2782,8 +2782,7 @@ finished/expired/needs-link state keeps its own badge. New strings `badge_pinned
 Tests: new `pinned-offline-badge.test.js` (badge per page state, offline -> live, a stale
 tab's report, offline vs wrong game, done stays done, 9 languages, the background recording
 on change only); five of six fail on the previous popup/background (the sixth guards the
-done badge). The slot question (should an offline pinned channel hold a tab slot?) is NOT
-changed here - it waits for the user's decision.
+done badge). The slot question was decided afterwards (option D, below).
 
 Signed to the UNLISTED channel on 2026-10-02 (`npm run submit`, no
 `--listed`) for testing in the user's real Firefox:
@@ -2792,3 +2791,39 @@ Signed to the UNLISTED channel on 2026-10-02 (`npm run submit`, no
 `.amo-submitted-versions.json`. Not submitted to the listed channel. AMO does
 not allow reusing a version number, so if the test goes well the same code
 ships to listed as 0.6.21 (manifest + `BUILD_MARKER` bump only).
+
+**Offline pinned tabs no longer hold a quota slot (option D, chosen by the user; with the
+display bug above these are the 0.6.21 candidate - the signed 0.6.20 .xpi has neither):**
+offline pinned channels (3 of 5 tabs in the report) waited on a quota slot while games that
+could earn were queued. Now, like a pinned channel on the wrong game (0.6.18), an offline
+pinned tab STAYS open - that is how it notices the channel going live, as fast as before and
+with no extra checking - but is not counted toward the quota (`idlePinned` in storage.local;
+the page's verdict comes from `pinnedLive`, trusted only for the tab it came from).
+- **Cap:** at most `OFFLINE_PINNED_TAB_CAP` = 5 such tabs (offline, or live but waiting for a
+  slot). Offline entries beyond it wait WITHOUT a tab - their tab is closed, and they are not
+  reopened to check (only when a place in the cap frees up, as a non-quota tab); the five
+  highest-ranked (current priority mode) keep theirs. The wrong-game tabs of 0.6.18 are not
+  part of this cap (unchanged).
+- **Goes live, quota full:** the current priority mode decides. It outranks the lowest-ranked
+  entry being watched: that tab is closed and the pinned one takes the slot - one log line
+  `slot swap (<mode>): pinned channel X went live and ranks above Y (#i vs #j of n) - closed
+  the tab of Y, X takes its slot`. It ranks lowest: nothing is swapped; its tab stays open as
+  a non-quota tab (counting toward the cap) and is promoted by a later tick as soon as a slot is
+  free (log: "takes a free quota slot"); the popup says "live - waiting for a free tab slot".
+- **Live -> offline:** it becomes a non-quota tab again at once (a state change re-runs the
+  scheduler, no waiting for the next minute) and the freed slot opens the next queued entry.
+- A page that is reloading (no verdict yet) changes nothing: whoever was idle stays idle.
+- Resets with the watch tabs (teardown, all done, a new browser session).
+Trade-offs accepted: the total number of tabs can exceed the quota (offline pages stream
+nothing; memory was not measured); a game swapped out for a pinned channel comes back
+when a slot frees up (e.g. the pinned channel goes offline again - then the two may
+alternate with the stream's state, each swap logged).
+**Tests:** new `pinned-slots.test.js` (8 cases, real background.js with an in-memory tabs
+registry): offline pinned entries take no slot and games get them; the cap of 5 and no
+reopening to check the rest; a live pinned entry that outranks the lowest swaps it - in
+list order AND expiry-first; one that ranks lowest swaps nothing and takes the slot later;
+live -> offline frees the slot and live again takes it back; a reloading page changes
+nothing. All eight fail on the previous background.js. `pinned-offline-badge.test.js`
+covers the new "live - waiting for a free tab slot" badge (`badge_pinned_waiting_slot`, 9
+languages). `BUILD_MARKER` -> `2026-10-02-r8`; the manifest version is raised to 0.6.21
+when it is signed (the listed release then 0.6.22).

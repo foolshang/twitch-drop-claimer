@@ -49,6 +49,17 @@ is offline its page is reloaded on a growing interval (3, 6, 10, then every 15
 minutes; back to 3 once it has been seen live); a channel the Twitch sidebar shows
 as live while the page still says offline is reloaded at once.
 
+An offline pinned channel's tab stays open (that is how it notices the channel going
+live) but holds **no tab-quota slot**, so games that can earn drops use the slots
+meanwhile; at most 5 such tabs stay open, further offline entries wait without a tab
+and are not checked at all. When a pinned channel goes live and every slot is taken,
+the priority mode (list order or expiry-first) decides: if it ranks above the
+lowest-ranked entry being watched, that entry's tab is closed and the pinned channel
+takes the slot (logged as a "slot swap"); if it ranks lowest, nothing is swapped and
+its tab waits, without a slot, until one frees up. A pinned channel that goes offline
+again gives its slot back. The popup says "offline - waiting to go live", "live -
+waiting for a free tab slot" or "checking the channel..." instead of "watching" for these.
+
 Progress is tracked per campaign, not per game. A game can have a general
 campaign for everybody and many that only count on named channels (their
 inventory cards share the game's boxart). A game entry ("Rust") tracks its
