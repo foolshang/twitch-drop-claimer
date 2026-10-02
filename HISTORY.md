@@ -2827,3 +2827,28 @@ nothing. All eight fail on the previous background.js. `pinned-offline-badge.tes
 covers the new "live - waiting for a free tab slot" badge (`badge_pinned_waiting_slot`, 9
 languages). `BUILD_MARKER` -> `2026-10-02-r8`; the manifest version is raised to 0.6.21
 when it is signed (the listed release then 0.6.22).
+
+**Flapping protection for slot swaps (also in 0.6.21):** a channel that goes live and
+offline repeatedly could make entries swap in and out. Now:
+- A pinned channel must have been live for `SWAP_MIN_LIVE_MS` = 2 minutes in an UNBROKEN
+  run of live reports before it may swap another entry out (`liveSince` in `pinnedLive`:
+  set by the first live report, kept through a reloading page, cleared by an offline report).
+  Live for 30 s then offline = no swap; a later live run counts from its own start. Taking a
+  FREE slot needs no such wait.
+- An entry that was just swapped out, or a pinned entry that just took a slot (by swap or
+  free slot), is left alone by swaps for `SWAP_COOLDOWN_MS` = 10 minutes (`slotChangeAt`,
+  pruned each tick, reset with the watch tabs): it cannot be chosen as the entry to swap
+  out, and cannot swap anything itself. So "a swaps b out, a goes offline, b comes back, a
+  live again" does not swap back inside 10 minutes. A channel going offline still frees its
+  slot at once (not subject to the cooldown).
+- The log says why a live channel waits (one line per reason on change): live for only N s of
+  the 120 s needed / changed slots less than 10 minutes ago / every entry being watched
+  changed slots less than 10 minutes ago / ranks below every entry that may be swapped.
+Tests (`pinned-slots.test.js`, now with a fake clock, 11 cases): live 30 s then offline = no swap
+and the 2 minutes must be one run; swapped in, the other side live again within 10 minutes =
+no swap back, allowed once the cooldown has passed; an entry that just took a slot is not
+swapped out by a higher-ranked channel until 10 minutes have passed. The three new cases
+fail on the previous background.js; the swap cases now advance the clock by 2 minutes.
+Cost: a channel that really went live can wait up to ~2 minutes (plus the next scheduler
+tick, at most a minute) for a slot it outranks.
+`BUILD_MARKER` -> `2026-10-02-r9`, `manifest.json` -> 0.6.21 (the listed release will be 0.6.22).

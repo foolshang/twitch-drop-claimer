@@ -12,8 +12,12 @@
  *     swapped, its tab waits without a slot until one frees up;
  *   - live -> offline again: back to a non-quota tab, the slot goes to the next queued entry.
  *
- * Real background.js with an in-memory tabs registry; the pages' reports are sent as the
- * content script sends them (`pinnedChannelStatus`).
+ * Flapping protection: a pinned channel must have been live for 2 minutes in an unbroken run of
+ * live reports before it may swap anything; an entry that was just swapped out, or that just took
+ * a slot, is left alone by swaps for 10 minutes (going offline still frees the slot at once).
+ *
+ * Real background.js with an in-memory tabs registry and a fake clock; the pages' reports are
+ * sent as the content script sends them (`pinnedChannelStatus`).
  */
 
 const vm = require("vm");
@@ -24,6 +28,7 @@ const assert = require("assert");
 const ROOT = path.join(__dirname, "..");
 const read = (f) => fs.readFileSync(path.join(ROOT, f), "utf8");
 const HOUR = 3_600_000;
+const MIN = 60_000;
 
 function makeWorld(storage) {
   const storageData = {
@@ -35,8 +40,12 @@ function makeWorld(storage) {
   const tabsById = new Map();
   let nextTabId = 1;
   let created = 0;
+  let nowMs = Date.now();
+  const FakeDate = function (...a) { return a.length ? new Date(...a) : new Date(nowMs); };
+  FakeDate.now = () => nowMs;
   const sandbox = {
     console: { log: () => {}, error: () => {}, warn: () => {} },
+    Date: FakeDate,
     setTimeout, clearTimeout, setInterval, clearInterval,
     browser: {
       storage: {
@@ -74,6 +83,7 @@ function makeWorld(storage) {
   return {
     ctx, storageData, tabsById, flush, listeners,
     get created() { return created; },
+    advance(ms) { nowMs += ms; },
     tabs: () => Object.keys(storageData.watchTabs || {}),
     idle: () => Object.keys(storageData.idlePinned || {}).filter((k) => storageData.idlePinned[k]).sort(),
     logs: () => vm.runInContext("debugLogBuffer.slice()", ctx),
@@ -143,6 +153,9 @@ async function testLiveOutranksLowestWatchedEntryAndSwaps(mode) {
   await w.report("channel:a", false);
   assert.deepStrictEqual(w.tabs().sort(), ["channel:a", "x", "y"], "x and y hold the two slots, a waits offline");
   await w.report("channel:a", true);
+  assert.deepStrictEqual(w.tabs().sort(), ["channel:a", "x", "y"], "not at once: it has to stay live for 2 minutes first");
+  w.advance(2 * MIN + 1000);
+  await w.tick();
   assert.deepStrictEqual(w.tabs().sort(), ["channel:a", "x"], `${mode}: the lowest-ranked watched entry (y) is closed: ` + w.tabs());
   assert.deepStrictEqual(w.idle(), [], "a holds a slot now");
   const swap = w.logs().filter((l) => /slot swap/.test(l));
@@ -169,10 +182,12 @@ async function testLiveButLowestRankTakesNothing(mode) {
   const before = w.tabs().sort();
   assert.deepStrictEqual(before, ["channel:a", "x", "y"]);
   await w.report("channel:a", true);
+  w.advance(2 * MIN + 1000); // live long enough to be allowed to swap - it just does not outrank anything
+  await w.tick();
   assert.deepStrictEqual(w.tabs().sort(), before, `${mode}: nothing is closed for it`);
   assert.deepStrictEqual(w.idle(), ["channel:a"], "its tab stays open as a non-quota tab");
   assert.ok(!w.logs().some((l) => /slot swap/.test(l)), "no swap");
-  assert.ok(w.logs().some((l) => /went live but ranks below every entry being watched/.test(l)), "logged why it waits");
+  assert.ok(w.logs().some((l) => /it ranks below every entry that may be swapped/.test(l)), "logged why it waits");
 
   // until a slot frees up: x is finished -> a is promoted
   w.storageData.campaignProgress = { ...w.storageData.campaignProgress, x: { allComplete: true, expired: false, claimed: 1, total: 1, updatedAt: 2 } };
@@ -194,7 +209,9 @@ async function testLiveToOfflineFreesTheSlot() {
   assert.deepStrictEqual(w.idle(), ["channel:a"]);
   // and back: a outranks x (list order), so x makes room
   await w.report("channel:a", true);
-  assert.deepStrictEqual(w.tabs(), ["channel:a"], "offline -> live: it outranks x and swaps it out again");
+  w.advance(2 * MIN + 1000);
+  await w.tick();
+  assert.deepStrictEqual(w.tabs(), ["channel:a"], "offline -> live (and live for 2 minutes): it outranks x and swaps it out again");
   console.log("  OK  live -> offline frees the slot for the next entry; live again takes it back");
 }
 
@@ -208,6 +225,92 @@ async function testLoadingBlipDoesNotChangeWhoHoldsASlot() {
   console.log("  OK  a reloading page (no verdict yet) changes nothing");
 }
 
+
+// ---- flapping protection ---------------------------------------------------------------------------------------
+async function testLiveForAShortWhileThenOfflineSwapsNothing() {
+  const w = makeWorld({ tabQuota: 2, watchList: [pin("a"), game("x"), game("y")] });
+  await w.boot();
+  await w.report("channel:a", false);
+  const before = w.tabs().sort();
+  assert.deepStrictEqual(before, ["channel:a", "x", "y"]);
+
+  await w.report("channel:a", true);
+  w.advance(30_000);
+  await w.tick();
+  assert.deepStrictEqual(w.tabs().sort(), before, "live for 30 s: no swap");
+  assert.ok(w.logs().some((l) => /live for only \d+ s of the 120 s needed/.test(l)), "and the log says it is waiting");
+  await w.report("channel:a", false); // gone again
+  w.advance(5 * MIN);
+  await w.tick();
+  assert.deepStrictEqual(w.tabs().sort(), before, "offline again: still nothing swapped");
+  assert.ok(!w.logs().some((l) => /slot swap/.test(l)), "no swap was made");
+
+  // a new live run starts its 2 minutes from the beginning
+  await w.report("channel:a", true);
+  w.advance(MIN);
+  await w.tick();
+  assert.deepStrictEqual(w.tabs().sort(), before, "the earlier short run does not count");
+  w.advance(MIN + 1000);
+  await w.tick();
+  assert.deepStrictEqual(w.tabs().sort(), ["channel:a", "x"], "after 2 minutes live in a row it swaps");
+  console.log("  OK  live for 30 s then offline: no swap; the 2 minutes must be one unbroken run");
+}
+
+async function testNoSwapBackWithinTenMinutes() {
+  // quota 1: a outranks b. b holds the slot (a offline); a goes live and swaps b out; a goes offline (b comes back);
+  // a is live again within 10 minutes of the swap: no swap back
+  const w = makeWorld({ tabQuota: 1, watchList: [pin("a"), pin("b")] });
+  await w.boot();
+  await w.report("channel:a", false); // a idle, b opens
+  await w.report("channel:b", true);
+  await w.report("channel:a", true);
+  w.advance(2 * MIN + 1000);
+  await w.tick();
+  assert.deepStrictEqual(w.tabs(), ["channel:a"], "first swap: a takes the slot from b");
+  assert.strictEqual(w.logs().filter((l) => /slot swap/.test(l)).length, 1);
+
+  await w.report("channel:a", false); // a goes offline: the slot is freed, b is back
+  assert.deepStrictEqual(w.tabs().sort(), ["channel:a", "channel:b"], "offline frees the slot at once, as before");
+  await w.report("channel:b", true);
+  await w.report("channel:a", true); // a is live again, ~2 minutes after the swap
+  w.advance(2 * MIN + 1000);
+  await w.tick();
+  assert.deepStrictEqual(w.tabs().sort(), ["channel:a", "channel:b"], "within 10 minutes: no swap back");
+  assert.strictEqual(w.logs().filter((l) => /slot swap/.test(l)).length, 1, "no second swap");
+  assert.ok(w.logs().some((l) => /changed slots less than 10 minutes ago/.test(l)));
+
+  w.advance(8 * MIN); // ~10 minutes and a bit since the first swap
+  await w.tick();
+  assert.deepStrictEqual(w.tabs(), ["channel:a"], "after the cooldown the higher-ranked channel may swap again");
+  assert.strictEqual(w.logs().filter((l) => /slot swap/.test(l)).length, 2);
+  console.log("  OK  swapped in, the other side live again within 10 minutes: no swap back; allowed afterwards");
+}
+
+async function testAnEntryThatJustTookASlotIsNotSwappedOut() {
+  // quota 1, ranking c > a > b. b watched; a swaps b out; then c (outranks a) goes live: a just took a slot -> left alone
+  const w = makeWorld({ tabQuota: 1, watchList: [pin("c"), pin("a"), pin("b")] });
+  await w.boot();
+  await w.report("channel:c", false); // c idle, a opens
+  await w.report("channel:a", false); // a idle, b opens
+  await w.report("channel:b", true);
+  await w.report("channel:a", true);
+  w.advance(2 * MIN + 1000);
+  await w.tick();
+  assert.deepStrictEqual(w.tabs().sort(), ["channel:a", "channel:c"], "a swapped b out");
+
+  await w.report("channel:c", true);
+  w.advance(2 * MIN + 1000);
+  await w.tick();
+  assert.deepStrictEqual(w.tabs().sort(), ["channel:a", "channel:c"], "c outranks a, but a took its slot minutes ago: not swapped out");
+  assert.deepStrictEqual(w.idle(), ["channel:c"]);
+  assert.ok(w.logs().some((l) => /every entry being watched changed slots less than 10 minutes ago/.test(l)));
+
+  w.advance(10 * MIN);
+  await w.tick();
+  assert.deepStrictEqual(w.tabs(), ["channel:c"], "after the cooldown c swaps a");
+  console.log("  OK  an entry that just took a slot is not swapped out for 10 minutes");
+}
+
 (async () => {
   console.log("Running pinned slot tests (real background.js, in-memory tabs)...\n");
   try {
@@ -219,6 +322,9 @@ async function testLoadingBlipDoesNotChangeWhoHoldsASlot() {
     await testLiveButLowestRankTakesNothing("expiry");
     await testLiveToOfflineFreesTheSlot();
     await testLoadingBlipDoesNotChangeWhoHoldsASlot();
+    await testLiveForAShortWhileThenOfflineSwapsNothing();
+    await testNoSwapBackWithinTenMinutes();
+    await testAnEntryThatJustTookASlotIsNotSwappedOut();
     console.log("\nALL PASSED");
     process.exit(0);
   } catch (e) {

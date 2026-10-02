@@ -55,7 +55,9 @@ meanwhile; at most 5 such tabs stay open, further offline entries wait without a
 and are not checked at all. When a pinned channel goes live and every slot is taken,
 the priority mode (list order or expiry-first) decides: if it ranks above the
 lowest-ranked entry being watched, that entry's tab is closed and the pinned channel
-takes the slot (logged as a "slot swap"); if it ranks lowest, nothing is swapped and
+takes the slot (logged as a "slot swap") - but only after it has been live for 2 minutes
+in a row, and an entry that was just swapped out or just took a slot is left alone for 10
+minutes, so a channel that flaps live/offline cannot make tabs swap back and forth; if it ranks lowest, nothing is swapped and
 its tab waits, without a slot, until one frees up. A pinned channel that goes offline
 again gives its slot back. The popup says "offline - waiting to go live", "live -
 waiting for a free tab slot" or "checking the channel..." instead of "watching" for these.
