@@ -798,9 +798,23 @@
     // at face value (the campaign really did end then) rather than rolled
     // forward a year. Trailing time/timezone ignored; day granularity is
     // enough for "soonest expiry first" ordering.
-    m = cardText.match(/End Date:\s*(?:[A-Za-z]{3,9},?\s*)?([A-Za-z]{3,9}\s+\d{1,2})/i);
+    m = cardText.match(/End Date:\s*(?:([A-Za-z]{3,9}),?\s*)?([A-Za-z]{3,9}\s+\d{1,2})/i);
     if (m) {
-      const ts = new Date(`${m[1]} ${new Date().getFullYear()}`).getTime();
+      const WEEKDAYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+      const weekday = m[1] ? m[1].slice(0, 3).toLowerCase() : null;
+      const year = new Date().getFullYear();
+      // The card has no year, but it names the weekday: of last / this / next year take
+      // the one whose calendar puts that date on that weekday (and, of those, the
+      // nearest to now) - "End Date: Fri, Jan 1" read in October is next January, not
+      // the one that is already over. Without a usable weekday: this year, as before.
+      if (weekday && WEEKDAYS.includes(weekday)) {
+        const matches = [year - 1, year, year + 1]
+          .map((y) => new Date(`${m[2]} ${y}`).getTime())
+          .filter((t) => !Number.isNaN(t) && WEEKDAYS[new Date(t).getDay()] === weekday)
+          .sort((a, b) => Math.abs(a - Date.now()) - Math.abs(b - Date.now()));
+        if (matches.length && Math.abs(matches[0] - Date.now()) < 2 * 365 * 24 * 60 * 60 * 1000) return matches[0];
+      }
+      const ts = new Date(`${m[2]} ${year}`).getTime();
       if (!Number.isNaN(ts) && Math.abs(ts - Date.now()) < 2 * 365 * 24 * 60 * 60 * 1000) return ts;
     }
 
@@ -1284,7 +1298,17 @@
             // loading / content-gated: not live, not offline - still a
             // heartbeat (background.js's dead-tab safety net must not
             // mistake "still loading" for "the tab died")
-            browser.runtime.sendMessage({ type: "pinnedChannelStatus", channel: initialChannel, live: null }).catch(() => {});
+            // `diag`: what the page looked like, so a page that stays here for hours can be
+            // told apart in a bug report (no personal data: flags and counts only)
+            const diag = {
+              gate: !!document.querySelector('[data-a-target="player-overlay-content-gate"]'),
+              ready: document.readyState,
+              visible: document.visibilityState,
+              textLen: (document.body.innerText || "").length,
+              player: !!document.querySelector("video"),
+              path: location.pathname.slice(0, 40),
+            };
+            browser.runtime.sendMessage({ type: "pinnedChannelStatus", channel: initialChannel, live: null, diag }).catch(() => {});
           }
           return;
         }

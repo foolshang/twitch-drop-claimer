@@ -1289,6 +1289,7 @@ async function autoWatchTick() {
 
   await sweepStaleWatchLeftovers();
   await sweepStalePinnedHeartbeats();
+  await sweepStuckPinnedTabs();
 
   const invalidSlugs = cfg.invalidSlugs || [];
   const campaignProgress = cfg.campaignProgress || {};
@@ -1383,7 +1384,7 @@ async function autoWatchTick() {
   for (const [slug, at] of Object.entries(cfg.slotChangeAt || {})) if (now - at < SWAP_COOLDOWN_MS) slotChangeAt[slug] = at;
   const recentlyChanged = (slug) => slotChangeAt[slug] != null;
   for (const g of ordered) {
-    if (!idlePinned[g.slug] || watchTabs[g.slug] == null || pinnedStateOf(g) !== "live") continue;
+    if (!idlePinned[g.slug] || watchTabs[g.slug] == null || !["live", "unknown"].includes(pinnedStateOf(g))) continue;
     const counted = countedTabs();
     if (counted.length < quota) {
       delete idlePinned[g.slug];
@@ -2078,7 +2079,7 @@ async function flashTabToStartPlayback(tabId, holdMs = PLAYBACK_FLASH_HOLD_MS) {
 // flash the tab then, exactly as for a freshly-picked channel. Only for a
 // tab this file tracks as a pinned entry, only inside the dedicated watch
 // window, and not twice within PINNED_LIVE_FLASH_MIN_GAP_MS.
-async function flashPinnedTabOnceLive(tabId, channel) {
+async function flashPinnedTabOnceLive(tabId, channel, why = "went live") {
   if (Date.now() - (lastPlaybackFlashAt.get(tabId) || 0) < PINNED_LIVE_FLASH_MIN_GAP_MS) {
     logOnChange(`pinned-live:${channel}`, "flash-skipped", "pinned channel", channel, "is live - tab was flashed moments ago, not again");
     return;
@@ -2091,7 +2092,7 @@ async function flashPinnedTabOnceLive(tabId, channel) {
   } catch {
     return; // tab already gone
   }
-  logOnChange(`pinned-live:${channel}`, "flashed", "pinned channel", channel, "went live - flashing its tab to start playback");
+  logOnChange(`pinned-live:${channel}`, "flashed", "pinned channel", channel, why + " - flashing its tab to start playback");
   await flashTabToStartPlayback(tabId);
 }
 
@@ -2153,28 +2154,49 @@ async function reloadPinnedTab(tabId, channel, reason, logState = "reload") {
 // offline / loading). Written only when it changes, keyed with the tab it came from
 // (the popup ignores it once the entry has another tab) - an offline channel is not
 // "watching", a page that has not reported yet is "checking".
-const pinnedStateWritten = new Map(); // tabId -> last state written
-async function recordPinnedLiveState(tabId, slug, live) {
+// Writes go through ONE chain: two pages reporting in the same instant (four tabs on the
+// same 60 s beat - seen in a real report, reloads 43 ms apart) each read the whole
+// `pinnedLive` object and wrote it back, the last write dropping the other's record - and
+// the in-memory "already written" guard then never wrote it again, so that entry sat in
+// "checking" for good. The stored record itself now decides whether a write is needed.
+let pinnedWriteChain = Promise.resolve();
+const pinnedLastDiag = new Map(); // tabId -> what a page without a verdict last looked like (see content.js)
+
+function writePinnedRecord(tabId, slug, state, { onlyIf } = {}) {
+  const run = async () => {
+    const { pinnedLive } = await browser.storage.local.get("pinnedLive");
+    const all = pinnedLive || {};
+    const prev = all[slug];
+    const same = !!prev && prev.tabId === tabId;
+    if (onlyIf && !onlyIf(same ? prev : null)) return false;
+    if (same && prev.state === state) return false; // already stored
+    const now = Date.now();
+    // `liveSince`: when the current unbroken run of live reports began. A reloading page
+    // (no verdict) neither starts nor breaks it; an offline report ends it.
+    const prevSince = same ? prev.liveSince || null : null;
+    const liveSince = state === "live" ? prevSince || now : state === "loading" || state === "unknown" ? prevSince : null;
+    await browser.storage.local.set({ pinnedLive: { ...all, [slug]: { tabId, state, at: now, liveSince } } });
+    return true;
+  };
+  const p = pinnedWriteChain.then(run, run);
+  pinnedWriteChain = p.catch(() => {});
+  return p;
+}
+
+async function recordPinnedLiveState(tabId, slug, live, diag) {
   const state = live === true ? "live" : live === false ? "offline" : "loading";
-  if (pinnedStateWritten.get(tabId) === state) return;
-  pinnedStateWritten.set(tabId, state);
-  const { pinnedLive } = await browser.storage.local.get("pinnedLive");
-  const now = Date.now();
-  // `liveSince`: when the current unbroken run of live reports began. A reloading page
-  // (no verdict) neither starts nor breaks it; an offline report ends it.
-  const prev = pinnedLive && pinnedLive[slug];
-  const prevSince = prev && prev.tabId === tabId ? prev.liveSince || null : null;
-  const liveSince = state === "live" ? prevSince || now : state === "loading" ? prevSince : null;
-  await browser.storage.local.set({ pinnedLive: { ...(pinnedLive || {}), [slug]: { tabId, state, at: now, liveSince } } });
+  if (state === "loading" && diag) pinnedLastDiag.set(tabId, diag);
+  // a page that keeps having no verdict after we declared it "unknown" stays unknown
+  const changed = await writePinnedRecord(tabId, slug, state, state === "loading" ? { onlyIf: (prev) => !prev || prev.state !== "unknown" } : {});
   // offline <-> live changes who holds a quota slot (autoWatchTick): no waiting for the next minute
-  serialized(autoWatchTick).catch(() => {});
+  if (changed) serialized(autoWatchTick).catch(() => {});
 }
 
 async function handlePinnedChannelStatus(msg, tab) {
   if (!tab) return;
   const game = await getPinnedGameForTab(tab.id);
   if (!game) return; // not (or no longer) a tracked pinned-channel tab
-  await recordPinnedLiveState(tab.id, game.slug, msg.live);
+  await recordPinnedLiveState(tab.id, game.slug, msg.live, msg.diag);
 
   const state = pinnedTabState.get(tab.id) || { offlineTicks: 0, lastHeartbeatAt: 0, offlineStep: 0 };
   state.lastHeartbeatAt = Date.now();
@@ -2229,6 +2251,65 @@ async function sweepStalePinnedHeartbeats() {
       await reloadPinnedTab(tabId, game.channel, `stopped reporting entirely (tab likely discarded) for ${idleMin} min`, "no-heartbeat");
     }
   }
+}
+
+// A pinned tab whose page gives no verdict - neither live nor offline: still
+// loading, content-gated, or its markers not recognised - is neither idle nor
+// watching and would sit in "checking" for ever (seen in a real report: three
+// channels for hours, one of them live). Safety net, once per tab:
+//   after PINNED_STUCK_RELOAD_MS without a verdict -> reload its tab ONCE (logged);
+//   still none PINNED_STUCK_UNKNOWN_MS after that -> "live unknown": treated as
+//   being watched (the popup says so), and its tab is flashed to start the
+//   player (again every PINNED_UNKNOWN_FLASH_GAP_MS while still unknown) - the
+//   way pinned tabs behaved before 0.6.20. A real verdict from the page (live /
+//   offline) always takes over.
+const PINNED_STUCK_RELOAD_MS = 3 * 60 * 1000;
+const PINNED_STUCK_UNKNOWN_MS = 3 * 60 * 1000;
+const PINNED_UNKNOWN_FLASH_GAP_MS = 10 * 60 * 1000;
+const pinnedStuck = new Map(); // tabId -> { since, reloadedAt, flashedAt }
+
+async function sweepStuckPinnedTabs() {
+  const cfg = await browser.storage.local.get(["watchTabs", "watchList", "pinnedLive", "watchMeta"]);
+  const watchTabs = cfg.watchTabs || {};
+  const pinnedLive = cfg.pinnedLive || {};
+  const now = Date.now();
+  const present = new Set();
+  for (const game of cfg.watchList || []) {
+    if (!game.pinnedChannel) continue;
+    const tabId = watchTabs[game.slug];
+    if (tabId == null) continue;
+    present.add(tabId);
+    const rec = pinnedLive[game.slug];
+    const state = rec && rec.tabId === tabId ? rec.state : null;
+    if (state === "live" || state === "offline") { pinnedStuck.delete(tabId); continue; }
+    let st = pinnedStuck.get(tabId);
+    if (state === "unknown") {
+      if (st && now - (st.flashedAt || 0) >= PINNED_UNKNOWN_FLASH_GAP_MS) {
+        st.flashedAt = now;
+        await flashPinnedTabOnceLive(tabId, game.channel, "still has no verdict (live unknown)");
+      }
+      continue;
+    }
+    if (!st) {
+      const since = state === "loading" ? rec.at : ((cfg.watchMeta || {})[game.slug] || {}).watchStartedAt || now;
+      st = { since, reloadedAt: null, flashedAt: 0 };
+      pinnedStuck.set(tabId, st);
+    }
+    const diag = pinnedLastDiag.get(tabId);
+    const diagText = diag ? ` (page: ${JSON.stringify(diag)})` : " (the page has not reported at all)";
+    if (!st.reloadedAt) {
+      if (now - st.since < PINNED_STUCK_RELOAD_MS) continue;
+      st.reloadedAt = now;
+      log("pinned channel", game.channel, `has had no live/offline verdict for ${Math.round((now - st.since) / 60000)} min${diagText} - reloading its tab once`);
+      await reloadPinnedTab(tabId, game.channel, "stuck without a verdict", "stuck-reload");
+    } else if (now - st.reloadedAt >= PINNED_STUCK_UNKNOWN_MS) {
+      st.flashedAt = now;
+      log("pinned channel", game.channel, `still has no verdict ${Math.round((now - st.reloadedAt) / 60000)} min after the reload${diagText} - treating it as live (unknown) and flashing its tab so the stream gets a chance to play`);
+      await writePinnedRecord(tabId, game.slug, "unknown");
+      await flashPinnedTabOnceLive(tabId, game.channel, "has no verdict (live unknown)");
+    }
+  }
+  for (const tabId of [...pinnedStuck.keys()]) if (!present.has(tabId)) pinnedStuck.delete(tabId);
 }
 
 async function handleDirectoryPicked(slug, channel, tab) {

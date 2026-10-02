@@ -2860,3 +2860,75 @@ Signed to the UNLISTED channel on 2026-10-02 (`npm run submit`, no
 `.amo-submitted-versions.json`. Not submitted to the listed channel. AMO does
 not allow reusing a version number, so if the test goes well the same code
 ships to listed as 0.6.22 (manifest + `BUILD_MARKER` bump only).
+
+## 0.6.22 - pinned channels no longer stick in "checking the channel..."
+
+**Report (0.6.21, issue #10):** DisguisedToast, Blooprint and GEEGA sat in "checking the
+channel..." for hours, Blooprint live and not watched, with free slots (Where Winds Meet
+done). The user opened Blooprint in their own window about 06:00 (UTC+7); that tab is not an
+extension tab (the code has ONE place that sets `watchTabs` - tab creation - there is no
+adoption of a tab the user opened, and a tab that is not in `watchTabs` gets
+`isWatchTab: false` and never reports; so it does not appear in the log as one).
+
+**Investigation (from the log and the code):**
+1. content.js DOES send `pinnedChannelStatus` and background DOES receive it: the log shows
+   live / offline verdicts for all of them from 17:16 UTC on, and the whole path (real
+   content.js on a channel page -> background, key `channel:<name>`) reproduces correctly in a
+   test - the message type, the `isWatchTab` check by tab id and the key all match; the tab ids
+   in "opened watch tab for channel:... tab=N" are the ones the reports come from.
+2. A real bug in the recording: `recordPinnedLiveState` read the whole `pinnedLive` object,
+   changed one slug and wrote it back. Four tabs report on the same 60 s beat (two reloads in
+   the log are 43 ms apart), so two handlers read the same old object and the later write
+   dropped the other's record - and an in-memory "already written for this tab" guard then
+   never wrote it again. An entry with no record is exactly the "limbo" the user described
+   (`pinnedStateOf` null: not idle, not counted as live, popup "checking"). Reproduced: three
+   concurrent reports lose records on 0.6.21.
+3. What the log also shows, and the code cannot explain: the "still offline - reloading" lines of
+   GEEGA (last 19:05), Blooprint (19:36) and DisguisedToast (20:37) stop, there is no
+   "stopped reporting entirely" line, so the pages kept sending heartbeats - with no verdict
+   (`live: null`: neither live nor offline markers) - until Blooprint reported live at 22:56.
+   WHY a reloaded channel page shows neither marker for hours is not known (no page capture;
+   the heartbeat can also come from a content-gated page). Nothing here claims it is solved:
+   content.js now sends `diag` (content gate, readyState, visibility, text length, player
+   present, path - no personal data) with every no-verdict report, and the safety net logs it.
+
+**Fix:**
+- Writes of `pinnedLive` go through one chain (`writePinnedRecord`), and the STORED record -
+  not a memory of having written - decides whether a write is needed: a lost or stale
+  (other tab id) record comes back with the next report. A page without a verdict never
+  overwrites a "live unknown" record.
+- **Safety net** (`sweepStuckPinnedTabs`, every scheduler tick): a pinned tab with no
+  live/offline verdict for `PINNED_STUCK_RELOAD_MS` = 3 min (no record at all counts from
+  when it was opened) is reloaded ONCE, with a clear log line that includes what the page
+  looked like; still none `PINNED_STUCK_UNKNOWN_MS` = 3 min after that -> "live unknown":
+  recorded as `unknown`, treated as being watched (the popup says "watching"; for slots it
+  is treated like live, a waiting one takes a free slot), its tab is flashed so the player
+  gets a chance to start (again every 10 minutes while still unknown) - the way pinned tabs
+  behaved before 0.6.20. A real live/offline verdict from the page always replaces it. Never
+  a second reload.
+- A content-gated page (no verdict by design) gets the same one reload and then "unknown"
+  - accepted: it is flashed at most every 10 minutes.
+
+**Seen in the same log, NOT changed:** a live pinned channel (xChocoBars, 17:18-17:48) is
+flashed to the foreground of the watch window every 2 minutes for as long as it is live
+(`flashPinnedTabOnceLive` runs on every live report, only throttled by a 2-minute gap).
+That looks unintended (it was meant for the first sighting) - to be decided.
+
+**Also fixed (found by the test run today):** `inventory-parse.test.js`
+"parsed expiry lands on the right calendar day" failed from 3 October 2026 on - a real latent
+bug: the inventory card's "End Date: Fri, Jan 1" (no year) was read as THIS year, so a
+campaign ending in January looked long over when read in autumn. The year is now the one (of
+last / this / next) whose calendar puts that date on the named weekday, nearest to now;
+without a usable weekday, as before. (Time zone of the machine vs. GMT+7 can shift a weekday
+by one; then it falls back to this year, as before.)
+
+**Tests:** new `pinned-verdict-recovery.test.js` (6 cases): three reports in the same instant
+keep all records; a lost/stale record is rewritten; the whole path content.js -> background.js
+with the real key (live recorded + flashed, offline idle, no verdict recorded as loading);
+no verdict for 3 min -> one reload with the page description, 3 min later -> live unknown +
+flash, again every 10 min, never a second reload; a real verdict replaces unknown; pages with
+a verdict are left alone. On 0.6.21's background.js the concurrency, lost-record, safety-net
+and takeover cases fail (the whole-path case passes there - that path was fine).
+`pinned-offline-badge.test.js`: live-unknown shows as watching. `inventory-parse.test.js`: the
+End Date year. `BUILD_MARKER` -> `2026-10-03-r1`, `manifest.json` -> 0.6.22 (the listed release
+will be 0.6.23).

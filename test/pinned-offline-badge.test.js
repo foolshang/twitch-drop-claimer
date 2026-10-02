@@ -108,6 +108,13 @@ async function testLiveButWaitingForASlotIsNotWatching() {
   console.log("  OK  popup: a live pinned channel waiting for a quota slot says so");
 }
 
+async function testLiveUnknownIsShownAsWatching() {
+  // a page with no verdict for ~6 minutes (reloaded once) is treated as live (unknown) - the way it worked before 0.6.20
+  const rows = await renderRows({ ...listOf("xChocoBars"), pinnedLive: live("xChocoBars", 0, "unknown") });
+  assert.strictEqual(rows[0].badge, en.badge_watching, "live unknown: watching, not 'checking' for ever: " + rows[0].badge);
+  console.log("  OK  popup: a live-unknown page is shown as watching");
+}
+
 async function testFinishedAndOtherStatesAreNotOverridden() {
   const base = { ...listOf("xChocoBars"), campaignProgress: { "channel:xchocobars": { label: "Rust", claimed: 1, total: 1, allComplete: true, expired: false, timeRemainingMin: 0, campaignNames: ["Tac"], updatedAt: 1 } } };
   const rows = await renderRows({ ...base, pinnedLive: live("xChocoBars", 0, "offline") });
@@ -163,6 +170,7 @@ async function testBackgroundRecordsWhatThePageReports() {
     await testOnlineAfterOfflineAndStaleTabReports();
     await testOfflineBeatsPlayingAnotherGame();
     await testLiveButWaitingForASlotIsNotWatching();
+    await testLiveUnknownIsShownAsWatching();
     await testFinishedAndOtherStatesAreNotOverridden();
     await testAllLanguagesHaveTheTexts();
     await testBackgroundRecordsWhatThePageReports();

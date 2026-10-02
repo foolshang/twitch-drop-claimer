@@ -302,6 +302,19 @@ async function testExpiredAndAccountNotConnectedTextDetection() {
   console.log("  OK  expired/accountNotConnected text detection still works against the current card structure");
 }
 
+// "End Date: Fri, Jan 1" read in October is next January - the weekday names the year (the one whose
+// calendar puts that date on that weekday, nearest to now), not "this year" (an already-over date)
+async function testEndDateYearFollowsTheWeekday() {
+  const { ctx } = makeSandbox("<div></div>");
+  // "now" inside the page's own realm: 3 October 2026
+  vm.runInContext(`globalThis.__RealDate = Date; globalThis.Date = class extends __RealDate { constructor(...a) { super(...(a.length ? a : ["2026-10-03T12:00:00Z"])); } static now() { return new __RealDate("2026-10-03T12:00:00Z").getTime(); } };`, ctx);
+  const year = (text) => vm.runInContext(`new Date(extractExpiresAt(${JSON.stringify(text)})).getFullYear()`, ctx);
+  assert.strictEqual(year("End Date: Fri, Jan 1, 7:59 AM GMT+7"), 2027, "read in October 2026 it is January 2027");
+  assert.strictEqual(year("End Date: Wed, Aug 26, 7:59 AM GMT+7"), 2026, "an already-ended card is still taken at face value");
+  assert.strictEqual(year("End Date: Oct 9"), 2026, "no weekday: this year, as before");
+  console.log("  OK  End Date year is chosen by its weekday (January seen in October is next year)");
+}
+
 async function testExpiresAtParsedFromEndDateFormat() {
   // real in-progress card text (2026-09-01 RDP capture) reads
   // "End Date: Wed, Aug 26, 7:59 AM GMT+7" - weekday + "<Month> <day>",
@@ -465,6 +478,7 @@ async function testClaimedSectionMissingIsUnknown() {
     await testEmptyReadingIsNotEmitted();
     await testMultipleCardsStayIndependent();
     await testExpiredAndAccountNotConnectedTextDetection();
+    await testEndDateYearFollowsTheWeekday();
     await testExpiresAtParsedFromEndDateFormat();
     await testSameSlugTwoCampaignsExpiredFirstStaysExpired();
     await testSameSlugTwoCampaignsActiveFirstStillWins();
