@@ -2765,3 +2765,11 @@ fail on the previous sources (the last is a guard). Existing expectations update
 warnings now include the reward, Last claimed is the reward name.
 
 `BUILD_MARKER` -> `2026-10-02-r6`, `manifest.json` -> 0.6.20.
+
+Signed to the UNLISTED channel on 2026-10-02 (`npm run submit`, no
+`--listed`) for testing in the user's real Firefox:
+`web-ext-artifacts/33d37586a96d443fa884-0.6.20.xpi`, built from `edc481c`
+(`BUILD_MARKER` `2026-10-02-r6`); the version is in the local, git-ignored
+`.amo-submitted-versions.json`. Not submitted to the listed channel. AMO does
+not allow reusing a version number, so if the test goes well the same code
+ships to listed as 0.6.21 (manifest + `BUILD_MARKER` bump only).
