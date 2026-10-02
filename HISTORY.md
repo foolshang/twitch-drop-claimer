@@ -2852,3 +2852,11 @@ fail on the previous background.js; the swap cases now advance the clock by 2 mi
 Cost: a channel that really went live can wait up to ~2 minutes (plus the next scheduler
 tick, at most a minute) for a slot it outranks.
 `BUILD_MARKER` -> `2026-10-02-r9`, `manifest.json` -> 0.6.21 (the listed release will be 0.6.22).
+
+Signed to the UNLISTED channel on 2026-10-02 (`npm run submit`, no
+`--listed`) for testing in the user's real Firefox:
+`web-ext-artifacts/33d37586a96d443fa884-0.6.21.xpi`, built from `fa171dc`
+(`BUILD_MARKER` `2026-10-02-r9`); the version is in the local, git-ignored
+`.amo-submitted-versions.json`. Not submitted to the listed channel. AMO does
+not allow reusing a version number, so if the test goes well the same code
+ships to listed as 0.6.22 (manifest + `BUILD_MARKER` bump only).
