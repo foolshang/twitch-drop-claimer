@@ -115,7 +115,8 @@ async function testAcceptedClaimInClaimedListIsASuccessWithAReminder() {
   assert.ok(tab.localSets.some((o) => o.lastClaimAt && o.lastClaimText), "last claimed is recorded");
   assert.ok(!bg.local.claimNotLinked || bg.local.claimNotLinked.length === 0, "not 'blocked': " + JSON.stringify(bg.local.claimNotLinked));
   assert.deepStrictEqual(JSON.parse(JSON.stringify(bg.local.claimLinkReminders)), [{ key: KEY, game: "Escape from Tarkov", reward: REWARD }], "a reminder instead, with game + reward");
-  assert.ok(bg.logLines().some((l) => /claimed "Ammo Selection Pack Lv\.4".*not linked/.test(l)), "and one log line");
+  assert.ok(bg.logLines().some((l) => /claimed "Escape from Tarkov - Ammo Selection Pack Lv\.4".*not linked/.test(l)), "and one log line, by game and reward - not the key");
+  assert.ok(!bg.logLines().some((l) => /camp-1:/.test(l)), "the internal key (campaign id) is in no log line");
   assert.strictEqual(bg.entry(KEY), undefined, "no backoff entry: its state is reset");
   assert.strictEqual((bg.local.claimHealth || {}).streak || 0, 0);
   assert.strictEqual((await bg.send({ type: "claimAsk", key: KEY }, 2)).allowed, true, "claiming this reward is not stopped");
@@ -163,7 +164,7 @@ async function testRealRefusalStillStopsTheReward() {
   await run([tab], 30 * SEC);
 
   assert.deepStrictEqual({ ...bg.entry(KEY) }, { f: 0, next: 0, stop: true, notLinked: true }, "stopped for the session");
-  assert.deepStrictEqual(JSON.parse(JSON.stringify(bg.local.claimNotLinked)), [{ key: KEY, game: "Escape from Tarkov" }], "with the popup warning");
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(bg.local.claimNotLinked)), [{ key: KEY, game: "Escape from Tarkov", reward: REWARD }], "with the popup warning");
   assert.ok(!bg.local.claimLinkReminders || bg.local.claimLinkReminders.length === 0, "and no 'claimed' reminder");
   assert.ok(!tab.localSets.some((o) => o.lastClaimAt), "no last claim recorded for a refusal");
   assert.ok(!tab.results().some((m) => m.key === KEY), "not reported as a failed attempt");

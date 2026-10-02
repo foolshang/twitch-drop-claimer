@@ -440,7 +440,7 @@ async function renderGameStatus() {
   for (const e of Array.isArray(cfg.claimNotLinked) ? cfg.claimNotLinked : []) {
     const box = document.createElement("div");
     box.className = "claim-warning";
-    box.append(t("claim_not_linked_warning", { game: e.game || e.key }));
+    box.append(t("claim_not_linked_warning", { game: claimEntryLabel(e) || "Twitch" })); // "<game> - <reward>", never the key
     const link = document.createElement("button");
     link.type = "button";
     link.className = "link";
@@ -454,7 +454,7 @@ async function renderGameStatus() {
   for (const e of Array.isArray(cfg.claimLinkReminders) ? cfg.claimLinkReminders : []) {
     const box = document.createElement("div");
     box.className = "claim-warning";
-    box.append(t("claim_link_reminder", { game: e.game || "Twitch", reward: e.reward || e.key }));
+    box.append(t("claim_link_reminder", { game: e.game || "Twitch", reward: e.reward || rewardNameOfKey(e.key) || "?" }));
     const link = document.createElement("button");
     link.type = "button";
     link.className = "link";

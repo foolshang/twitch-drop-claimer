@@ -121,7 +121,7 @@ async function testASuccessfulClaimIsRecordedAndForgotten() {
   await run([tab], 20 * SEC);
   assert.strictEqual(btn.clicks, 1);
   assert.deepStrictEqual(tab.results().map((m) => [m.key, m.ok]), [[K("Boots"), true]]);
-  assert.ok(tab.localSets.some((o) => o.lastClaimAt && o.lastClaimText === "Claim Now"), "recorded as the last claim only now, after the verdict");
+  assert.ok(tab.localSets.some((o) => o.lastClaimAt && o.lastClaimText === "Boots"), "recorded as the last claim only now, after the verdict - by the reward name, not the button text");
   assert.ok(tab.sent.some((m) => m.type === "dropClaimed"), "and only now is the inventory refresh requested");
   assert.strictEqual(bg.entry(K("Boots")), undefined, "background keeps nothing for a reward that went through");
 

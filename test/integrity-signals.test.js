@@ -291,7 +291,7 @@ async function testAccountNotLinkedStopsOnlyThatReward() {
   await run([tab], 30 * SEC); // verdicts arrive
 
   assert.deepStrictEqual({ ...bg.entry(K("Rust Isles Boots")) }, { f: 0, next: 0, stop: true, notLinked: true }, "that reward stops for the session");
-  assert.deepStrictEqual(JSON.parse(JSON.stringify(bg.local.claimNotLinked)), [{ key: K("Rust Isles Boots"), game: "Rust" }], "with its game, for the popup");
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(bg.local.claimNotLinked)), [{ key: K("Rust Isles Boots"), game: "Rust", reward: "Rust Isles Boots" }], "with its game and reward, for the popup");
   assert.ok(bg.logLines().some((l) => /claim needs a linked game account/.test(l) && /Rust Isles Boots/.test(l) && /campaigns page/.test(l)));
   assert.strictEqual((bg.local.claimHealth || {}).streak || 0, 0, "not a claim failure, the streak is untouched");
   assert.ok(!bg.session.integrityFlag, "and not an integrity failure");

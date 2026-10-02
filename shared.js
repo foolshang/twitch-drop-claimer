@@ -7,7 +7,7 @@
 // value out loud when asking for a fresh test - lets whoever's testing
 // confirm from the background console alone that Firefox is actually running
 // this exact source tree, not a stale reload/cached build/old .xpi.
-const BUILD_MARKER = "2026-10-02-r5";
+const BUILD_MARKER = "2026-10-02-r6";
 
 const ALIASES = {
   // Path of Exile
@@ -351,4 +351,23 @@ function claimedConfirmsEntry(progress, claimedMap) {
   const missing = [];
   for (const [name, count] of need) if ((claimedMap.get(name) || 0) < count) missing.push(name);
   return { confirmed: missing.length === 0, missing };
+}
+
+// The reward's own name out of a claim key: "<campaign id>:<name>",
+// "<id>:<name>#<n>", "<id>:#<n>" (no name), "claim:<label>#<n>". null when there
+// is none. The key is internal (it carries the campaign id): never shown to the user.
+function rewardNameOfKey(key) {
+  const k = String(key || "");
+  const i = k.indexOf(":");
+  if (i < 0) return /^[0-9a-f-]{20,}$/i.test(k) ? null : k.replace(/#\d+$/, "").trim() || null; // a bare id is not a name
+  return k.slice(i + 1).replace(/#\d+$/, "").trim() || null;
+}
+
+// "<game> - <reward>" for the popup and the log; the reward alone when the game is
+// unknown; "" when neither is - never the key.
+function claimEntryLabel(entry) {
+  const reward = (entry && entry.reward) || rewardNameOfKey(entry && entry.key);
+  const game = entry && entry.game;
+  if (game && reward) return `${game} - ${reward}`;
+  return reward || game || "";
 }

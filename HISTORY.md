@@ -2727,6 +2727,41 @@ failures past 60 s = flag as before; a second operation = flag at once; an old b
 not add to a new one. The existing flag tests now confirm with two operations. Against the
 previous background.js the new cases fail.
 
-`BUILD_MARKER` -> `2026-10-02-r5`, `manifest.json` -> 0.6.20. NOT covered: the "2 display
-bugs" the request mentions for this version were not described in it, so they are not
-in this change.
+**Two display bugs and a risk from the account-link round (also 0.6.20):**
+
+*The popup showed the internal key.* The account-link warning read
+"5fd08c9d-4a0e-...:Ammo Selection Pack Lv.4" (campaign id : reward). It now reads
+"<game> - <reward>" (`claimEntryLabel`, shared.js): the game comes from the Inventory
+GQL campaign (`inventoryCampaigns.byId[<campaign id>].gameName`), else from the card's
+boxart via gameIdMap; the reward from the tier (sent by content.js) or, failing that,
+parsed out of the key (`rewardNameOfKey`); the reward alone when the game is unknown;
+never the campaign id. The stored warnings/reminders now carry `{ key, game, reward }`
+(an entry stored by 0.6.19 without a reward is read from its key). The same names are
+used in every background log line about a claim (went through / rejected / backing off /
+not retrying / not linked / connected again), so a bug report no longer carries campaign
+ids there. content.js's own console lines still show the key (they are not in a report).
+
+*"Last claimed: Claim Now".* `lastClaimText` was the button's text. It is now the reward's
+name (the tier's name, else parsed from the key); the button text only when no name can
+be found at all.
+
+*A slow Claimed list no longer condemns a good claim for the session.* A claim judged
+refused at the 12 s verdict (button still there, reward not in Claimed - either the
+account-link answer or an ordinary rejection) is remembered for 30 minutes. Every later
+claim scan of the inventory page looks for its name in Claimed (more than before the
+click); when it shows up the claim is counted as a success after all
+(`claimRetroSuccess`): backoff, stop and the failure streak cleared, the "blocked"
+warning withdrawn, last claim recorded, and - when the cause was the unlinked account -
+the link reminder takes its place. Not covered: a reward with no readable name (nothing to
+look for), and a reward claimed on another page/tab after the inventory tab closed.
+
+**Tests (this part):** new `claim-display-and-retro.test.js` (popup text with game +
+reward / reward alone / a 0.6.19-style entry / nothing readable, no campaign id anywhere;
+the game resolved by campaign id from the Inventory and no campaign id in any claim log
+line; Last claimed by name, button text only without a name, also on the not-linked path;
+a refusal turned into a success + reminder by a Claimed entry at 20 s; the same for an
+ordinary rejection with no reminder; no Claimed entry = the refusal stands). Five of the six
+fail on the previous sources (the last is a guard). Existing expectations updated: stored
+warnings now include the reward, Last claimed is the reward name.
+
+`BUILD_MARKER` -> `2026-10-02-r6`, `manifest.json` -> 0.6.20.

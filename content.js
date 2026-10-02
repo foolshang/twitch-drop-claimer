@@ -155,6 +155,11 @@
   let claimScanBusy = false; // a scan is waiting for background.js's answers
   const awaitingClaimBtn = new Map(); // reward key -> the button clicked
   const claimBaseline = new Map(); // reward key -> { name, before, gameId }: what the page showed when we clicked
+  // Claims judged "refused" at the verdict: the Claimed list can be slower than
+  // CLAIM_VERIFY_MS. Later scans of the inventory look for the reward showing up in
+  // Claimed after all (more than before the click) and then count it as a success.
+  const refusedPending = new Map(); // reward key -> { name, before, game, text, notLinked, at }
+  const REFUSED_PENDING_TTL_MS = 30 * 60 * 1000;
   const unmatchedClicks = []; // { key, at }: our clicks whose claim request inject.js has not reported yet
   const claimKeyBySeq = new Map(); // inject.js's claim request number -> reward key
   const notLinkedSeen = new Map(); // reward key -> { claimed }: Twitch answered "game account not connected" (decided at the verdict)
@@ -277,12 +282,38 @@
     if (accepted) {
       const why = inClaimed ? "it is in the Claimed list" : note.claimed ? `the response status is "${note.status}"` : "its button is gone";
       log(`claim of "${key}" went through but the game account is not connected (${why}) - claimed on Twitch, link the account to get it in-game`);
-      recordClaim(text);
+      recordClaim(rewardLabel(key, base, text));
       sendClaimMessage({ type: "claimResult", key, ok: true }).catch(() => {});
-      sendClaimMessage({ type: "claimLinkReminder", key, game, reward: base.name || text }).catch(() => {});
+      sendClaimMessage({ type: "claimLinkReminder", key, game, reward: base.name || rewardNameOfKey(key) || null }).catch(() => {});
     } else {
       log(`claim of "${key}" refused: the game account is not connected (not in the Claimed list, the button is still there${note.status ? `, status "${note.status}"` : ""})`);
-      sendClaimMessage({ type: "claimNotLinked", key, game }).catch(() => {});
+      rememberRefusal(key, base, text, game, true);
+      sendClaimMessage({ type: "claimNotLinked", key, game, reward: base.name || rewardNameOfKey(key) || null }).catch(() => {});
+    }
+  }
+
+  // what "Last claimed" shows: the reward's name (from the tier, else from the key);
+  // the button's text only when no name can be found
+  const rewardLabel = (key, base, text) => (base && base.name) || rewardNameOfKey(key) || text;
+
+  function rememberRefusal(key, base, text, game, notLinked) {
+    if (!base || !base.name) return; // no name = nothing to look for in the Claimed list
+    refusedPending.set(key, { name: base.name, before: base.before, game: game || null, text, notLinked, at: Date.now() });
+  }
+
+  // Called on every claim scan of the inventory page: a reward judged refused whose
+  // name has since appeared in the Claimed list was claimed after all.
+  function checkRetroactiveSuccess() {
+    if (refusedPending.size === 0 || !isInventoryPage()) return;
+    const now = Date.now();
+    for (const [key, r] of refusedPending) {
+      if (now - r.at > REFUSED_PENDING_TTL_MS) { refusedPending.delete(key); continue; }
+      const after = claimedCountOf(r.name);
+      if (after == null || after <= r.before) continue;
+      refusedPending.delete(key);
+      log(`claim of "${key}" was judged refused but "${r.name}" is in the Claimed list now - counted as a success after all`);
+      recordClaim(r.name);
+      sendClaimMessage({ type: "claimRetroSuccess", key, notLinked: r.notLinked, game: r.game, reward: r.name }).catch(() => {});
     }
   }
 
@@ -314,8 +345,10 @@
     if (!enabled || !isClaimScanPage()) { releaseClaim(key); return; } // switched off / navigated away: no verdict
     const stillThere = findClaimButtons().some((b) => claimKey(b) === key);
     if (linkNote) { settleLinkAnswer(key, text, base, linkNote, stillThere); return; } // not a failed attempt either way
-    if (stillThere) log(`claim of "${key}" was rejected (the button is still there) - background.js decides when to retry`);
-    else recordClaim(text);
+    if (stillThere) {
+      log(`claim of "${key}" was rejected (the button is still there) - background.js decides when to retry`);
+      rememberRefusal(key, base, text, null, false);
+    } else recordClaim(rewardLabel(key, base, text));
     sendClaimMessage({ type: "claimResult", key, ok: !stillThere }).catch(() => {});
   }
 
@@ -326,6 +359,8 @@
     // the inventory and on channel pages; everywhere else (notably
     // /drops/campaigns, full of accordion buttons) nothing may be clicked.
     if (!isClaimScanPage()) return;
+
+    checkRetroactiveSuccess();
 
     const now = Date.now();
     if (now - lastClickAt < CLICK_COOLDOWN_MS) return;
@@ -1306,6 +1341,7 @@
     awaitingClaimVerify.clear();
     awaitingClaimBtn.clear();
     claimBaseline.clear();
+    refusedPending.clear();
     notLinkedSeen.clear();
     unmatchedClicks.length = 0;
 

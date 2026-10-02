@@ -899,17 +899,51 @@ async function handleClaimRelease(msg) {
 // and not a failed attempt: that reward stops for the session, everything else
 // keeps claiming, and the popup (storage.local `claimNotLinked`) tells the user
 // to connect the account on the campaigns page. Never touches `claimHealth`.
+// The game and reward a claim key stands for, for the popup and the log (never the
+// key itself: it carries the campaign id). The game comes from the Inventory GQL's
+// campaign (by the key's campaign id), else from what content.js read off the card.
+async function claimNames(key, game, reward) {
+  let gameName = null;
+  try {
+    const { inventoryCampaigns } = await browser.storage.local.get("inventoryCampaigns");
+    const campaign = inventoryCampaigns && inventoryCampaigns.byId && inventoryCampaigns.byId[String(key).split(":")[0]];
+    gameName = (campaign && campaign.gameName) || null;
+  } catch { /* the game name is only a nicety */ }
+  return { game: gameName || (game ? String(game) : null), reward: reward ? String(reward) : rewardNameOfKey(key) };
+}
+const claimLabelOf = async (key, game, reward) => {
+  const names = await claimNames(key, game, reward);
+  return claimEntryLabel({ key, ...names }) || "a reward";
+};
+
 async function handleClaimNotLinked(msg) {
   const map = await getClaimBackoff();
   const key = String(msg.key || "");
   if (!key) return;
   map.set(key, { f: 0, next: 0, stop: true, notLinked: true });
   saveClaimBackoff();
+  const names = await claimNames(key, msg.game, msg.reward);
   const { claimNotLinked } = await browser.storage.local.get("claimNotLinked");
   const list = Array.isArray(claimNotLinked) ? claimNotLinked.filter((e) => e && e.key !== key) : [];
-  list.push({ key, game: msg.game ? String(msg.game) : null });
+  list.push({ key, game: names.game, reward: names.reward });
   await browser.storage.local.set({ claimNotLinked: list });
-  log(`claim needs a linked game account - not retrying "${key}"${msg.game ? ` (${msg.game})` : ""} this session; connect it on the campaigns page`);
+  log(`claim needs a linked game account - not retrying "${claimEntryLabel({ key, ...names })}" this session; connect it on the campaigns page`);
+}
+
+// A claim judged refused (and stopped / backing off) turned out to have gone
+// through: the reward appeared in the Claimed list after the verdict. Counts as a
+// success (backoff, stop and the failure streak cleared, as claimResult ok), the
+// "blocked" warning is withdrawn, and when the cause was an unlinked game
+// account the reminder to link it takes its place.
+async function handleClaimRetroSuccess(msg) {
+  const key = String(msg.key || "");
+  if (!key) return;
+  await handleClaimResult({ key, ok: true });
+  const { claimNotLinked } = await browser.storage.local.get("claimNotLinked");
+  if (Array.isArray(claimNotLinked) && claimNotLinked.some((e) => e && e.key === key)) {
+    await browser.storage.local.set({ claimNotLinked: claimNotLinked.filter((e) => !(e && e.key === key)) });
+  }
+  if (msg.notLinked) await handleClaimLinkReminder({ key, game: msg.game, reward: msg.reward });
 }
 
 // Twitch accepted a claim but said the game account is not connected (content.js
@@ -922,9 +956,10 @@ async function handleClaimLinkReminder(msg) {
   if (!key) return;
   const { claimLinkReminders } = await browser.storage.local.get("claimLinkReminders");
   const list = Array.isArray(claimLinkReminders) ? claimLinkReminders.filter((e) => e && e.key !== key) : [];
-  list.push({ key, game: msg.game ? String(msg.game) : null, reward: msg.reward ? String(msg.reward) : null });
+  const names = await claimNames(key, msg.game, msg.reward);
+  list.push({ key, game: names.game, reward: names.reward });
   await browser.storage.local.set({ claimLinkReminders: list.slice(-20) });
-  log(`claimed ${msg.reward ? `"${msg.reward}"` : `"${key}"`}${msg.game ? ` (${msg.game})` : ""}, but the game account is not linked - it will not arrive in-game until it is linked on the campaigns page`);
+  log(`claimed "${claimEntryLabel({ key, ...names }) || "a reward"}", but the game account is not linked - it will not arrive in-game until it is linked on the campaigns page`);
 }
 
 // ViewerDropsDashboard says which games have a connected account: those
@@ -943,7 +978,7 @@ async function clearNotLinkedForConnectedGames(games) {
   for (const e of gone) {
     const st = map.get(e.key);
     if (st && st.notLinked) map.delete(e.key);
-    log(`game account of ${e.game} is connected now - claiming "${e.key}" resumes`);
+    log(`game account of ${e.game} is connected now - claiming "${claimEntryLabel(e) || e.game}" resumes`);
   }
   saveClaimBackoff();
   await browser.storage.local.set({ claimNotLinked: claimNotLinked.filter((e) => !gone.includes(e)) });
@@ -966,16 +1001,16 @@ async function handleClaimResult(msg) {
     streak = 0;
     stopped.delete(key);
     map.delete(key);
-    log(`claim went through: "${key}"`);
+    log(`claim went through: "${await claimLabelOf(key)}"`);
   } else {
     streak = (h.streak || 0) + 1;
     const next = claimBackoffAfterFailure(map.get(key), now); // no inflightAt: the round is over
     map.set(key, next);
     if (next.stop) {
       stopped.add(key);
-      log(`claim rejected ${next.f} times in a row, likely integrity - not retrying "${key}" this session`);
+      log(`claim rejected ${next.f} times in a row, likely integrity - not retrying "${await claimLabelOf(key)}" this session`);
     } else {
-      log(`claim rejected, likely integrity - backing off ${Math.round((next.next - now) / 60_000)} min for "${key}" (failure ${next.f}/${CLAIM_MAX_FAILURES})`);
+      log(`claim rejected, likely integrity - backing off ${Math.round((next.next - now) / 60_000)} min for "${await claimLabelOf(key)}" (failure ${next.f}/${CLAIM_MAX_FAILURES})`);
     }
   }
   saveClaimBackoff();
@@ -2430,6 +2465,9 @@ browser.runtime.onMessage.addListener((msg, sender) => {
 
     case "claimLinkReminder":
       return handleClaimLinkReminder(msg);
+
+    case "claimRetroSuccess":
+      return handleClaimRetroSuccess(msg);
 
     case "claimResult":
       return handleClaimResult(msg);
