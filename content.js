@@ -806,18 +806,24 @@
       let claimed = 0;
       let timeRemainingMin = 0;
       let foundDuration = false;
+      // every tier's reward name and whether it counted as claimed: when the card
+      // later leaves "In Progress" (the last tier claimed), background.js checks
+      // these names against the Claimed section to CONFIRM the campaign is done
+      const tiers = [];
       for (const bar of bars) {
         const percent = extractTierPercent(bar);
-        if (percent == null) continue; // can't confirm -> doesn't count toward claimed or remaining time
+        const tierName = extractTierName(bar) || null;
+        if (percent == null) { tiers.push({ name: tierName, claimed: false }); continue; } // can't confirm -> doesn't count toward claimed or remaining time
         if (percent >= 100) {
-          const tierName = extractTierName(bar);
           const left = tierName ? unclaimedLeft.get(tierName) || 0 : 0;
           if (left > 0) {
             unclaimedLeft.set(tierName, left - 1);
             claimed++;
           }
+          tiers.push({ name: tierName, claimed: left > 0 });
           continue; // 100% but not in Claimed yet (e.g. "Claim Now" pending): not claimed, no time left either
         }
+        tiers.push({ name: tierName, claimed: false });
         const tierEl = bar.closest(".tw-tower") || bar.parentElement || bar;
         const durationMin = extractTierDurationMin(tierEl);
         if (durationMin != null) {
@@ -840,6 +846,7 @@
         campaignId: ref.id,
         campaignName: ref.name,
         channels,
+        tiers,
         claimed,
         total: bars.length,
         accountNotConnected,
@@ -930,7 +937,9 @@
         // reconciliation) - gating on campaigns.length here would silently
         // swallow the case where every watched game's card is gone from "In
         // Progress" (the common end state once the last one is claimed).
-        browser.runtime.sendMessage({ type: "inventoryProgress", campaigns }).catch(() => {});
+        // the Claimed section rides along (name -> count): background.js confirms a campaign whose
+        // card left "In Progress" against it
+        browser.runtime.sendMessage({ type: "inventoryProgress", campaigns, claimed: [...claimedCounts] }).catch(() => {});
       };
       // React renders async - wait for campaign cards before the first read
       waitFor(

@@ -7,7 +7,7 @@
 // value out loud when asking for a fresh test - lets whoever's testing
 // confirm from the background console alone that Firefox is actually running
 // this exact source tree, not a stale reload/cached build/old .xpi.
-const BUILD_MARKER = "2026-10-02-r2";
+const BUILD_MARKER = "2026-10-02-r3";
 
 const ALIASES = {
   // Path of Exile
@@ -312,6 +312,9 @@ function aggregateEntryProgress(cards, expectedIds) {
     timeRemainingMin: known ? use.reduce((n, c) => n + (c.timeRemainingMin || 0), 0) : null,
     campaignNames: use.map((c) => c.campaignName || (c.campaignId ? c.campaignId : null)).filter(Boolean),
     campaignIds: cards.map((c) => c.campaignId).filter(Boolean),
+    // every tier's reward name (duplicates kept) - what the Claimed section must list once the cards are gone
+    tierNames: use.flatMap((c) => (c.tiers || []).map((t) => t.name).filter(Boolean)),
+    unnamedTiers: use.reduce((n, c) => n + (c.tiers || []).filter((t) => !t.name).length, 0),
     campaignGameSlugs: uniq(earn.flatMap((c) => c.gameSlugs || [])),
     campaignGameNames: uniq(earn.flatMap((c) => c.gameNames || [])),
   };
@@ -332,4 +335,20 @@ function entryPlaysWrongGame(g, progress) {
   const names = progress.campaignGameNames || [];
   if (g.pinnedGameName && names.includes(normalizeGameName(g.pinnedGameName))) return false;
   return true;
+}
+
+// Is a campaign whose card left "In Progress" really done? It is when the Claimed
+// section lists every reward of its tiers - one entry per tier, so a reward name
+// that appears on two tiers needs two entries (the same one-for-one matching
+// content.js applies to a visible card). `claimedMap`: name -> count from the
+// Claimed section. Unknown names or an unreadable section never confirm.
+function claimedConfirmsEntry(progress, claimedMap) {
+  if (!claimedMap || !progress || !Array.isArray(progress.tierNames) || progress.tierNames.length === 0 || progress.unnamedTiers > 0) {
+    return { confirmed: false, missing: [] };
+  }
+  const need = new Map();
+  for (const name of progress.tierNames) need.set(name, (need.get(name) || 0) + 1);
+  const missing = [];
+  for (const [name, count] of need) if ((claimedMap.get(name) || 0) < count) missing.push(name);
+  return { confirmed: missing.length === 0, missing };
 }

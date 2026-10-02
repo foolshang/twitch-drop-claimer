@@ -190,16 +190,72 @@ checked with the fake-DOM / fake-clock tests below.
 
 ## Permissions
 
-`alarms`, `tabs`, `storage`, `downloads`, and host access to
+`alarms`, `tabs`, `storage`, `downloads`, `sessions`, and host access to
 `*://*.twitch.tv/*` — used respectively for the periodic reload / auto-watch
 timers, opening and managing background tabs (watch tabs plus a transient
 `/search` tab it opens and closes on its own),
-persisting settings/state, writing the local debug log file below, and
-running the content script plus reading tab URLs on Twitch only.
+persisting settings/state, writing the local debug log file below, putting a
+tag on the extension's own watch window (see "The `sessions` permission"
+below), and running the content script plus reading tab URLs on Twitch only.
 
 There's also host access to the bug-report relay's address (see "Sending it
 to the developer" below) - used only for the explicit "Send bug report"
 button, never anything else.
+
+### The `sessions` permission
+
+When Firefox updates the extension to a version that has this permission it
+shows a prompt that sounds alarming: **"Access recently closed tabs"**. That is
+Firefox's standard wording for the whole `sessions` permission category - the
+extension uses one small part of it and nothing else. Exactly what it does and
+doesn't do:
+
+**What it is used for.** The extension keeps its tabs in a window of its own
+(the "watch window"), so its background tabs never end up among yours. It uses
+the `sessions` API for one thing: when it creates that window it calls
+`sessions.setWindowValue(windowId, "dropClaimerWatch", true)`, i.e. it puts a
+small tag on its own window; Firefox keeps that tag in its session store, next
+to the window. Later it calls `sessions.getWindowValue(windowId,
+"dropClaimerWatch")` to see whether a window carries the tag. These are the only
+two `sessions` calls in the code, and they only ever touch the single value
+named `dropClaimerWatch`.
+
+**Why it matters (and why it needs a permission).** After an unclean Firefox
+shutdown - Windows restarting after an update, a power cut, shutting Windows
+down with Firefox still open - Firefox restores every window it had, the
+extension's watch window included. Window and tab ids are numbered from 1 again
+on every Firefox start, so neither a remembered id nor anything else the
+extension stored can tell the restored watch window from your own windows. The
+tag, which comes back with the restored window, is the only reliable way: a
+tagged window is the extension's, every other window is yours - always, whatever
+it looks like and whenever it appeared. Before this permission the extension
+could only guess from how a window's tabs looked (versions 0.6.15 to 0.6.18),
+and a guess can be wrong: it could leave a duplicate window of its own behind or
+act on a window of yours.
+
+**What it never does.**
+- It never reads the list of recently closed tabs or windows
+  (`sessions.getRecentlyClosed` is not called anywhere) and never restores any
+  tab or window (`sessions.restore` is not called anywhere).
+- It never reads your browsing history or your tab history.
+- It never writes anything to your own windows, and never closes or changes
+  them: for a window that does not carry the tag all it does is *ask whether the
+  tag is there* - and a window without the tag is left completely alone.
+- Nothing leaves your computer because of it. The tag lives in Firefox's own
+  session store on your machine; it is not part of the debug log, which at most
+  mentions window numbers, and not part of the bug report.
+
+**If you decline the permission.** The permission is requested when you install
+or update. If you decline the update's prompt, Firefox keeps the previous
+version of the extension and leaves the update waiting (you can accept it later
+from the add-ons page); no version of the extension runs without the
+permission it declares. The previous version keeps working with the old
+tab-appearance guessing described above, including its occasional duplicate or
+misjudged window after an unclean shutdown. In the unlikely case that the tag
+cannot be written or read (for example a Firefox build without the `sessions`
+API), the extension still never touches your windows - it just cannot recognise
+its old window after a restore, opens a new one, and leaves the old one for you
+to close.
 
 ## Debug log — what it stores, and where it goes
 

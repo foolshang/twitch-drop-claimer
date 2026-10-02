@@ -93,6 +93,7 @@ function makeSandbox() {
     Blob: globalThis.Blob,
   };
 
+  require("./window-stubs").attachWindowApis(sandbox.browser, { createTab: (o) => sandbox.browser.tabs.create({ ...o, active: false }) }); // 0.6.19: tabs only open in a verified, tagged watch window
   const ctx = vm.createContext(sandbox);
 
   function fireStorageChange(changes) {
@@ -698,33 +699,36 @@ async function testCardVanishedFromInProgressMarksComplete() {
   assert.ok(storageData.watchTabs["path-of-exile-2"], "sanity: poe2 tab open");
 
   // both cards still show real, incomplete progress
+  const poeTiers = [{ name: "Tier A", claimed: true }, { name: "Tier B", claimed: true }, { name: "Tier C", claimed: false }];
   await vm.runInContext("mergeInventoryProgress", ctx)([
-    { slug: "path-of-exile-2", label: "PoE2", claimed: 2, total: 3, accountNotConnected: false, expired: false },
+    { slug: "path-of-exile-2", label: "PoE2", claimed: 2, total: 3, accountNotConnected: false, expired: false, tiers: poeTiers },
     { slug: "diablo-iv", label: "Diablo IV", claimed: 1, total: 2, accountNotConnected: false, expired: false },
-  ]);
+  ], [["Tier A", 1], ["Tier B", 1]]);
   await flush(20);
 
   // poe2's card is gone from this scan (1st miss) - must not act yet
+  const claimedAll = [["Tier A", 1], ["Tier B", 1], ["Tier C", 1]]; // the last reward is in the Claimed section now
   await vm.runInContext("mergeInventoryProgress", ctx)([
     { slug: "diablo-iv", label: "Diablo IV", claimed: 1, total: 2, accountNotConnected: false, expired: false },
-  ]);
+  ], claimedAll);
   await flush(20);
   assert.ok(storageData.watchTabs["path-of-exile-2"], "a single missed scan must not close the tab yet");
   assert.strictEqual(storageData.campaignProgress["path-of-exile-2"].allComplete, false);
 
-  // poe2's card still missing (2nd consecutive miss) - now infer complete
+  // poe2's card still missing (2nd consecutive miss) AND its rewards are in Claimed - confirmed complete
   await vm.runInContext("mergeInventoryProgress", ctx)([
     { slug: "diablo-iv", label: "Diablo IV", claimed: 1, total: 2, accountNotConnected: false, expired: false },
-  ]);
+  ], claimedAll);
   await flush(20);
 
   assert.strictEqual(storageData.campaignProgress["path-of-exile-2"].allComplete, true,
-    "two consecutive misses must mark the vanished card's campaign complete");
+    "two consecutive misses with the rewards in Claimed must mark the vanished card's campaign complete");
+  assert.strictEqual(storageData.campaignProgress["path-of-exile-2"].claimed, 3, "counted as 3/3, not the 2/3 of the last reading");
   assert.ok(!storageData.watchTabs["path-of-exile-2"], "poe2's tab must close once inferred complete");
   assert.ok(storageData.watchTabs["diablo-iv"], "diablo-iv, still reporting normally, must be untouched");
   assert.strictEqual(storageData.campaignProgress["diablo-iv"].allComplete, false);
 
-  console.log("  OK  a watched game's card vanishing from In Progress across 2 scans is inferred as fully claimed, closing its tab");
+  console.log("  OK  a watched game's card vanishing from In Progress across 2 scans with its rewards in Claimed is confirmed fully claimed, closing its tab");
 }
 
 (async () => {

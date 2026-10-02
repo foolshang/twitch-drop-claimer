@@ -132,7 +132,7 @@ async function world({ watchList, local = {} }) {
       type: "gqlDropSignal", operationName: "Inventory", at: 0,
       signal: { kind: "inventoryCampaigns", operationName: "Inventory", campaigns: campaigns.map(toSignal) },
     }, 1),
-    scan: (cards) => bg.send({ type: "inventoryProgress", campaigns: cards }, 1),
+    scan: (cards, claimed) => bg.send({ type: "inventoryProgress", campaigns: cards, claimed }, 1), // claimed: the Claimed section as [name, count] pairs
     done: (key) => vm.runInContext("isGameDone", bg.ctx)(key, bg.local.campaignProgress || {}, {}),
     progress: (key) => (bg.local.campaignProgress || {})[key],
   };
@@ -308,11 +308,13 @@ async function testMissingCardIsNotDoneWhileTheGqlStillListsTheCampaign() {
   for (let i = 0; i < 6; i++) await w.scan([]);
   assert.strictEqual(w.progress("channel:itsryanhiga").allComplete, false, "a vanished card is not 'claimed' while the GQL says the campaign is in progress");
 
-  // the campaign really left In Progress (everything claimed): after the usual corroboration it is done
+  // the campaign really left In Progress (everything claimed): after the usual corroboration - and
+  // with its reward listed in the Claimed section - it is done
   await w.gql([]);
   const REQUIRED = vm.runInContext("REQUIRED_MISSING_SCANS", w.bg.ctx);
-  for (let i = 0; i < REQUIRED; i++) await w.scan([]);
+  for (let i = 0; i < REQUIRED; i++) await w.scan([], [[TAC.name, 1]]);
   assert.strictEqual(w.progress("channel:itsryanhiga").allComplete, true);
+  assert.strictEqual(w.progress("channel:itsryanhiga").claimed, w.progress("channel:itsryanhiga").total, "and counted as all claimed");
   console.log("  OK  a vanished card means claimed only once the Inventory GQL no longer lists the campaign");
 }
 
@@ -547,7 +549,7 @@ async function testPopupSaysPlayingAnotherGame() {
   console.log("  OK  popup: 'playing another game - not earning drops' instead of 'watching' (9 languages); watching again on the right game");
 }
 
-module.exports = { realCard, claimedSection, gqlCampaign, inventoryResponse, parseCards, TAC, BOONIE, FACEMASK, GENERAL, RUST_ID };
+module.exports = { realCard, claimedSection, gqlCampaign, inventoryResponse, parseCards, world, pinnedEntry, renderPopupRows, RUST, TAC, BOONIE, FACEMASK, GENERAL, RUST_ID };
 
 if (require.main === module) (async () => {
   console.log("Running campaign matching tests (real content.js + background.js, no browser, no network)...\n");

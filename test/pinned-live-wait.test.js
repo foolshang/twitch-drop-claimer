@@ -192,6 +192,7 @@ function makeBg({ enabled = true, watchList, tabWindow = 77 } = {}) {
       },
       runtime: { onMessage: { addListener: () => {} }, getManifest: () => ({ version: "0.0.0-test" }) },
       windows: { get: (id) => Promise.resolve({ id }), create: () => Promise.reject(new Error("no")) },
+      sessions: { getWindowValue: () => Promise.resolve(true), setWindowValue: () => Promise.resolve() }, // the watch window carries its tag
       tabs: {
         get: (id) => Promise.resolve({ id, windowId: tabWindow }),
         update: (id, opts) => { if ("active" in opts) activeCalls.push({ id, active: opts.active }); return Promise.resolve(); },

@@ -1,23 +1,25 @@
 /**
  * session-windows.test.js
  *
- * Firefox numbers window and tab ids from 1 again on every start AND restores
- * last session's windows - including the watch window with its pinned tabs.
- * Live evidence (2026-09-28): the user's session file showed the old watch
- * window restored next to a freshly created one (3 windows on every start),
- * plus two pinned /drops/campaigns tabs left behind by the removed transient
- * campaigns tab. These tests model that against a fake windows/tabs registry:
- *   - a new browser session forgets remembered tab/window ids (they can equal
- *     the user's own window/tab ids);
- *   - a restored window that looks like ours is adopted, not duplicated, and
- *     its stale tabs are closed;
- *   - later-restored look-alike windows and leftover pinned campaigns tabs
- *     are swept, the user's own windows never are;
- *   - a tab the user just opened (still about:blank while its navigation
- *     commits) never makes their window look like ours: verified live
- *     2026-09-30 - the /drops/campaigns tab opened at Firefox start was
- *     replaced by the inventory because adoption saw a "blank" tab and closed
- *     everything else in the window.
+ * The watch window ("window 2") and the user's windows. Firefox numbers window
+ * and tab ids from 1 again on every start AND, after an unclean shutdown
+ * (Windows restarting after an update, a power cut, shutting Windows down with
+ * Firefox open), restores every window - the old watch window included. Reported
+ * in real use of 0.6.18: on switching the extension on, the user's own window
+ * ended up with the same tabs as the watch window. 0.6.19:
+ *   - window 2 is tagged "dropClaimerWatch" (sessions.setWindowValue) when it is
+ *     created; after a restore the TAG says which window is ours - tab
+ *     appearance is no longer used, so a user window that merely looks like a
+ *     watch window is never adopted or closed;
+ *   - every window that is not window 2 is the user's (recorded on switch-on);
+ *   - one serialized path finds/creates window 2; every tab is opened with an
+ *     explicit windowId = window 2, or not at all - no fallback to the current
+ *     window - and waits until window 2 is verified;
+ *   - back to square one on a new browser session or when window 2 closes;
+ *   - a restored window that arrives late (windows.onCreated) is adopted, not
+ *     duplicated; a second tagged window is a leftover, closed only when it
+ *     holds nothing but our own tabs.
+ * A fake windows/tabs/sessions registry; no browser, no network.
  */
 
 const vm = require("vm");
@@ -27,27 +29,36 @@ const assert = require("assert");
 
 const ROOT = path.join(__dirname, "..");
 const read = (f) => fs.readFileSync(path.join(ROOT, f), "utf8");
-// background.js with the adoption settle delay shortened so the race tests
-// stay fast (a no-op replace against a background.js that predates the constant)
-const SETTLE_MS = 60;
-const bgSrc = () => read("background.js").replace(/ADOPT_SETTLE_MS = [\d_]+/, `ADOPT_SETTLE_MS = ${SETTLE_MS}`);
+// short timers for the restore grace and the late-tag rechecks (a no-op against a background.js without them)
+const bgSrc = () => read("background.js")
+  .replace(/WINDOW_RECHECK_MS = \[[^\]]*\]/, "WINDOW_RECHECK_MS = [20, 60, 140]")
+  .replace(/WINDOW_RESTORE_GRACE_MS = [\d_]+/, "WINDOW_RESTORE_GRACE_MS = 150");
 
 const INV = "https://www.twitch.tv/drops/inventory";
 const CAMP = "https://www.twitch.tv/drops/campaigns";
+const TAG = "dropClaimerWatch";
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function makeWorld({ session = "none", local = {}, windows, tabs }) {
+function makeWorld({ session = "none", local = {}, windows, tabs, sessionsApi = true, createDelay = 0, createFailures = 0 }) {
   const storageLocal = {
     enabled: true, autoWatchEnabled: true, tabQuota: 3,
     watchList: [{ input: "warframe", slug: "warframe" }],
     ...local,
   };
   const storageSession = session === "none" ? null : { ...(session || {}) };
-  const winMap = new Map(windows.map((id) => [id, { id, type: "normal", focused: false }]));
-  const tabMap = new Map(tabs.map((t) => [t.id, { active: false, muted: false, ...t }]));
+  const winMap = new Map(windows.map((w) => [w.id, { id: w.id, type: "normal", focused: false }]));
+  const tags = new Map(windows.filter((w) => w.tagged).map((w) => [w.id, true]));
+  const tabMap = new Map(tabs.map((t) => [t.id, { active: false, muted: false, status: "complete", ...t }]));
   let nextWin = 100;
   let nextTab = 1000;
+  let createFailuresLeft = createFailures;
   const created = { windows: [], tabs: [] };
   const removed = { windows: [], tabs: [] };
+  const events = [];
+  const listeners = { windowsCreated: [], windowsRemoved: [], storage: [] };
+  const userWindowIds = new Set(windows.filter((w) => !w.tagged).map((w) => w.id)); // what the user owns, for the audit below
+  const violations = [];
+  const sessionsCalls = [];
 
   const pat = (p) => new RegExp("^" + p.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*") + "$");
   const store = (data) => ({
@@ -69,7 +80,7 @@ function makeWorld({ session = "none", local = {}, windows, tabs }) {
       storage: {
         local: store(storageLocal),
         ...(storageSession ? { session: store(storageSession) } : {}),
-        onChanged: { addListener: () => {} },
+        onChanged: { addListener: (fn) => listeners.storage.push(fn) },
       },
       runtime: { onMessage: { addListener: () => {} }, getManifest: () => ({ version: "0.0.0-test" }) },
       windows: {
@@ -78,27 +89,45 @@ function makeWorld({ session = "none", local = {}, windows, tabs }) {
           ...w,
           ...(opts.populate ? { tabs: [...tabMap.values()].filter((t) => t.windowId === w.id).map((t) => ({ ...t })) } : {}),
         }))),
-        create: () => {
+        create: async () => {
+          events.push("create-start");
+          if (createDelay) await sleep(createDelay);
+          if (createFailuresLeft > 0) { createFailuresLeft--; events.push("create-failed"); throw new Error("windows.create failed"); }
           const id = nextWin++;
           winMap.set(id, { id, type: "normal", focused: true });
           const tid = nextTab++;
-          tabMap.set(tid, { id: tid, windowId: id, url: "about:blank", pinned: false, active: true, muted: false });
+          tabMap.set(tid, { id: tid, windowId: id, url: "about:blank", pinned: false, active: true, muted: false, status: "complete" });
           created.windows.push(id);
-          return Promise.resolve({ id, tabs: [{ id: tid, windowId: id }] });
+          events.push(`create-end:${id}`);
+          return { id, type: "normal", tabs: [{ id: tid, windowId: id }] };
         },
         remove: (id) => {
           if (!winMap.has(id)) return Promise.reject(new Error("no such window"));
           winMap.delete(id);
+          tags.delete(id);
           for (const [tid, t] of [...tabMap]) if (t.windowId === id) tabMap.delete(tid);
           removed.windows.push(id);
+          listeners.windowsRemoved.forEach((fn) => fn(id));
           return Promise.resolve();
         },
+        onCreated: { addListener: (fn) => listeners.windowsCreated.push(fn) },
+        onRemoved: { addListener: (fn) => listeners.windowsRemoved.push(fn) },
       },
+      ...(sessionsApi ? {
+        sessions: {
+          setWindowValue: (id, key, value) => { sessionsCalls.push({ fn: "set", id, key, value }); if (key === TAG) tags.set(id, value); return Promise.resolve(); },
+          getWindowValue: (id, key) => { sessionsCalls.push({ fn: "get", id, key }); return Promise.resolve(key === TAG ? tags.get(id) : undefined); },
+        },
+      } : {}),
       tabs: {
         create: (opts) => {
           const id = nextTab++;
-          tabMap.set(id, { id, windowId: opts.windowId != null ? opts.windowId : 1, url: opts.url, pinned: !!opts.pinned, active: false, muted: false });
+          // the audit: a tab without an explicit window, or in a window that is the user's, is the bug
+          if (opts.windowId == null) violations.push(`tabs.create without windowId: ${opts.url}`);
+          else if (userWindowIds.has(opts.windowId)) violations.push(`tabs.create in the user's window ${opts.windowId}: ${opts.url}`);
+          tabMap.set(id, { id, windowId: opts.windowId != null ? opts.windowId : 1, url: opts.url, pinned: !!opts.pinned, active: false, muted: false, status: "complete" });
           created.tabs.push({ id, url: opts.url, windowId: opts.windowId });
+          events.push(`tab:${opts.windowId}:${opts.url}`);
           return Promise.resolve({ id, windowId: opts.windowId });
         },
         update: (id, opts) => { const t = tabMap.get(id); if (t) Object.assign(t, opts); return Promise.resolve(); },
@@ -122,283 +151,328 @@ function makeWorld({ session = "none", local = {}, windows, tabs }) {
   const ctx = vm.createContext(sandbox);
   vm.runInContext(read("shared.js"), ctx);
   vm.runInContext(read("i18n.js"), ctx);
-  const flush = (ms = 80) => new Promise((r) => setTimeout(r, ms));
+  const flush = (ms = 80) => sleep(ms);
   return {
-    ctx, storageLocal, storageSession, winMap, tabMap, created, removed, flush,
+    ctx, storageLocal, storageSession, winMap, tags, tabMap, created, removed, events, listeners, violations, userWindowIds, sessionsCalls, flush,
+    failNextCreates: (n) => { createFailuresLeft = n; },
     boot: async () => { vm.runInContext(bgSrc(), ctx); await flush(150); },
     tick: async () => { await vm.runInContext("serialized(autoWatchTick)", ctx); await flush(); },
+    run: (src) => vm.runInContext(src, ctx),
     tabsIn: (winId) => [...tabMap.values()].filter((t) => t.windowId === winId),
+    // a window Firefox brings back (late) after the extension started
+    restoreWindow: (id, { tagged, tabs: wtabs }) => {
+      winMap.set(id, { id, type: "normal", focused: false });
+      if (tagged) tags.set(id, true); else userWindowIds.add(id);
+      for (const t of wtabs) tabMap.set(t.id, { active: false, muted: false, status: "complete", windowId: id, ...t });
+      listeners.windowsCreated.forEach((fn) => fn({ id, type: "normal" }));
+    },
+    watchWindowId: () => storageLocal.watchWindowId,
   };
 }
 
-// last session's watch window (1) restored next to the user's own window (2)
-const restoredSession = () => ({
-  windows: [1, 2],
-  tabs: [
-    { id: 1, windowId: 1, url: INV, pinned: true },
-    { id: 2, windowId: 1, url: "https://www.twitch.tv/somechannel", pinned: true },
-    { id: 3, windowId: 1, url: CAMP, pinned: true },
-    { id: 7, windowId: 1, url: "about:home", pinned: false }, // windows.create()'s initial tab, as in the real session file
-    { id: 4, windowId: 2, url: "https://www.youtube.com/", pinned: false },
-    { id: 5, windowId: 2, url: "https://www.twitch.tv/ironmouse", pinned: true },
-    { id: 6, windowId: 2, url: CAMP, pinned: false }, // the user's own campaigns tab
-  ],
-});
+const youtubeTab = (id, windowId) => ({ id, windowId, url: "https://www.youtube.com/", pinned: false });
+const ourStaleTabs = (windowId, base) => [
+  { id: base, windowId, url: INV, pinned: true },
+  { id: base + 1, windowId, url: "https://www.twitch.tv/somechannel", pinned: true },
+  { id: base + 2, windowId, url: CAMP, pinned: true },
+];
+const WATCH_URL = "'https://www.twitch.tv/somechannel'";
 
-async function testRestartAdoptsRestoredWatchWindowAndForgetsStaleIds() {
+// ---- Part 1 ---------------------------------------------------------------------------------------
+async function testConcurrentSwitchOnMakesOneWindowAndEveryTabLandsInIt() {
   const w = makeWorld({
-    session: {}, // fresh browser session: nothing stored yet
-    local: { watchWindowId: 2, watchTabs: { warframe: 4 }, watchMeta: { warframe: { channel: "x", tabId: 4 } } }, // ids that now belong to the USER's window/tab
-    ...restoredSession(),
+    session: { tdcSessionStarted: 1 }, // same browser session: no restore grace
+    local: { enabled: false, watchList: [{ input: "warframe", slug: "warframe" }, { input: "poe2", slug: "path-of-exile-2" }, { input: "diablo 4", slug: "diablo-iv" }] },
+    windows: [{ id: 1 }], // the user's window, no Twitch tabs
+    tabs: [youtubeTab(1, 1)],
+    createDelay: 40, // the window takes a moment: every concurrent job meets it half-made
   });
   await w.boot();
+  w.storageLocal.enabled = true;
+  // the enabled handler, the inventory upkeep, the scheduler and bare window lookups, all at once
+  w.listeners.storage.forEach((fn) => fn({ enabled: { newValue: true, oldValue: false } }, "local"));
+  await Promise.all([
+    w.run("serialized(openInventoryIfMissing)"), w.run("serialized(autoWatchTick)"),
+    w.run("getOrCreateWatchWindow()"), w.run("getOrCreateWatchWindow()"),
+  ]);
+  await w.flush(250);
 
-  assert.deepStrictEqual(w.created.windows, [], "no second watch window is opened");
-  assert.strictEqual(w.winMap.size, 2, "still exactly the two windows Firefox restored");
-  assert.strictEqual(w.storageLocal.watchWindowId, 1, "the restored look-alike window was adopted (not the user's window 2)");
-
-  assert.ok(w.tabMap.has(4) && w.tabMap.has(5) && w.tabMap.has(6), "the user's own tabs are untouched");
-  assert.strictEqual(w.tabsIn(2).length, 3, "the user's window keeps all 3 tabs");
-  assert.notStrictEqual(w.storageLocal.watchTabs.warframe, 4, "stale watchTabs entry that pointed at the user's tab was dropped");
-
-  const inWatch = w.tabsIn(1);
-  assert.ok(!w.tabMap.has(2) && !w.tabMap.has(3) && !w.tabMap.has(7), "stale channel tab, leftover campaigns tab and the about:home tab in the restored window are closed");
-  assert.ok(inWatch.some((t) => t.id === 1 && t.url === INV), "the restored inventory tab is kept");
-  assert.ok(inWatch.some((t) => /directory\/category\/warframe/.test(t.url)), "the game's tab was opened inside the adopted window");
-  assert.strictEqual(w.tabMap.get(w.storageLocal.watchTabs.warframe).windowId, 1);
-  console.log("  OK  restart: restored watch window adopted (no 3rd window), stale ids forgotten, user's window/tabs untouched");
+  assert.deepStrictEqual(w.violations, [], "no tab in the user's window and none without a window: " + w.violations.join(" | "));
+  assert.strictEqual(w.created.windows.length, 1, "exactly one window 2 is created");
+  const win2 = w.created.windows[0];
+  assert.strictEqual(w.watchWindowId(), win2);
+  assert.strictEqual(w.tags.get(win2), true, "and it is tagged");
+  assert.ok(w.created.tabs.length > 0 && w.created.tabs.every((t) => t.windowId === win2), "every tab the extension opened is in window 2: " + JSON.stringify(w.created.tabs));
+  assert.deepStrictEqual(w.tabsIn(1).map((t) => t.url), ["https://www.youtube.com/"], "the user's window still has exactly its own tab");
+  assert.strictEqual(w.tabsIn(win2).filter((t) => /drops\/inventory/.test(t.url)).length, 1, "one inventory tab");
+  console.log("  OK  switch-on with concurrent jobs: one window 2 (tagged), every tab in it, the user's window untouched");
 }
 
-async function testSameSessionKeepsState() {
+async function testAJobBeforeWindow2IsReadyWaitsAndNeverFallsBackToTheCurrentWindow() {
+  const watchList = [{ input: "warframe", slug: "warframe" }];
+  // (a) the window is slow: the jobs wait for it (nothing opens before it exists)
+  const slow = makeWorld({ session: { tdcSessionStarted: 1 }, windows: [{ id: 1 }], tabs: [youtubeTab(1, 1)], createDelay: 60, local: { watchList, enabled: false } });
+  await slow.boot();
+  slow.storageLocal.enabled = true;
+  await Promise.all([slow.run("serialized(openInventoryIfMissing)"), slow.run("serialized(autoWatchTick)")]);
+  const iEnd = slow.events.findIndex((e) => e.startsWith("create-end"));
+  const firstTab = slow.events.findIndex((e) => e.startsWith("tab:"));
+  assert.ok(iEnd >= 0 && (firstTab === -1 || firstTab > iEnd), "no tab is opened before window 2 exists: " + slow.events.join(", "));
+  assert.deepStrictEqual(slow.violations, []);
+
+  // (b) the window cannot be made: nothing opens anywhere (0.6.18 fell back to the current window)
+  const broken = makeWorld({ session: { tdcSessionStarted: 1 }, windows: [{ id: 1 }], tabs: [youtubeTab(1, 1)], createFailures: 2, local: { watchList, enabled: false } });
+  await broken.boot();
+  broken.storageLocal.enabled = true;
+  await broken.run("serialized(openInventoryIfMissing)");
+  await broken.tick();
+  assert.deepStrictEqual(broken.created.tabs, [], "no tab was opened at all, in particular none in the user's window");
+  assert.deepStrictEqual(broken.violations, [], broken.violations.join(" | "));
+  assert.deepStrictEqual(broken.tabsIn(1).map((t) => t.url), ["https://www.youtube.com/"]);
+  // the next tick works and lands in window 2
+  await broken.tick();
+  await broken.flush(100);
+  assert.strictEqual(broken.created.windows.length, 1);
+  assert.ok(broken.created.tabs.length > 0 && broken.created.tabs.every((t) => t.windowId === broken.created.windows[0]), "retried at the next tick: in window 2");
+  assert.deepStrictEqual(broken.violations, []);
+  console.log("  OK  tab jobs wait for window 2; when there is none they are skipped - never opened in the current window");
+}
+
+async function testUncleanShutdownRestoreAdoptsTheTaggedWindowOnly() {
   const w = makeWorld({
-    session: { tdcSessionStarted: 1 }, // extension script reloaded within the same browser session... marker survived
+    session: {}, // Firefox restarted: new browser session, ids numbered afresh
+    local: { watchWindowId: 2 }, // stale: the id now belongs to somebody else's window
+    windows: [
+      { id: 1 }, // the user's own window
+      { id: 2 }, // a USER window that merely looks like a watch window: only pinned twitch tabs + the inventory, no tag
+      { id: 3, tagged: true }, // the restored old window 2
+    ],
+    tabs: [
+      youtubeTab(10, 1),
+      ...ourStaleTabs(2, 20),
+      { id: 30, windowId: 3, url: INV, pinned: true },
+      { id: 31, windowId: 3, url: "https://www.twitch.tv/oldchannel", pinned: true },
+      { id: 32, windowId: 3, url: "about:home", pinned: false },
+    ],
+  });
+  await w.boot();
+  await w.flush(300);
+
+  assert.deepStrictEqual(w.created.windows, [], "no second watch window is created");
+  assert.strictEqual(w.watchWindowId(), 3, "the TAGGED window was adopted");
+  assert.deepStrictEqual(w.removed.windows, [], "no window closed");
+  assert.deepStrictEqual(w.violations, [], w.violations.join(" | "));
+  assert.strictEqual(w.tabsIn(2).length, 3, "the look-alike user window keeps all its tabs");
+  assert.ok(w.tabMap.has(10), "the user's own tab is untouched");
+  assert.ok(w.tabMap.has(30) && !w.tabMap.has(31) && !w.tabMap.has(32), "the adopted window keeps one inventory tab; its stale watch/blank tabs are closed");
+  assert.ok(w.created.tabs.length > 0 && w.created.tabs.every((t) => t.windowId === 3), "new watch tabs are opened in the adopted window");
+  console.log("  OK  restore after an unclean shutdown: the tagged window is adopted, the user's windows (look-alike included) are not touched");
+}
+
+async function testALateRestoredTaggedWindowIsAdoptedNotDuplicated() {
+  const w = makeWorld({ session: {}, local: {}, windows: [{ id: 1 }], tabs: [youtubeTab(10, 1)] });
+  await w.boot(); // Firefox is still restoring: nothing is created yet
+  assert.deepStrictEqual(w.created.windows, [], "during the restore grace no new window is made");
+  assert.deepStrictEqual(w.created.tabs, []);
+
+  w.restoreWindow(5, { tagged: true, tabs: [{ id: 50, url: INV, pinned: true }, { id: 51, url: "https://www.twitch.tv/oldchannel", pinned: true }] });
+  await w.flush(400);
+
+  assert.deepStrictEqual(w.created.windows, [], "adopted, not duplicated: still no new window");
+  assert.strictEqual(w.watchWindowId(), 5);
+  assert.deepStrictEqual(w.violations, []);
+  assert.ok(w.created.tabs.length > 0 && w.created.tabs.every((t) => t.windowId === 5), "the watch tabs went to the late window");
+  assert.ok(w.tabMap.has(50) && !w.tabMap.has(51), "its stale watch tab was closed");
+  assert.ok(w.tabMap.has(10), "the user's tab is untouched");
+
+  // and when nothing is restored the grace ends and window 2 is created on its own
+  const quiet = makeWorld({ session: {}, local: {}, windows: [{ id: 1 }], tabs: [youtubeTab(10, 1)] });
+  await quiet.boot();
+  await quiet.flush(450);
+  assert.strictEqual(quiet.created.windows.length, 1, "no restore: window 2 appears once the grace is over");
+  assert.deepStrictEqual(quiet.violations, []);
+  console.log("  OK  a restored window that arrives late (onCreated) is adopted, not duplicated; with no restore window 2 is made after the grace");
+}
+
+async function testAnUntaggedWindowThatLooksLikeOursIsNeverAdoptedOrClosed() {
+  const w = makeWorld({
+    session: { tdcSessionStarted: 1 },
+    local: { watchWindowId: 1 }, // even a remembered id that now points at it
+    windows: [{ id: 1 }],
+    tabs: ourStaleTabs(1, 20), // only pinned twitch.tv tabs + the inventory + a campaigns tab, NO tag
+  });
+  await w.boot();
+  await w.tick();
+  await w.tick();
+  assert.deepStrictEqual(w.removed.windows, [], "never closed");
+  assert.deepStrictEqual(w.removed.tabs, [], "none of its tabs closed");
+  assert.notStrictEqual(w.watchWindowId(), 1, "never adopted (not even through a remembered id)");
+  assert.strictEqual(w.created.windows.length, 1, "window 2 is a new, tagged window");
+  assert.strictEqual(w.tags.get(w.created.windows[0]), true);
+  assert.deepStrictEqual(w.violations, []);
+  assert.strictEqual(w.tabsIn(1).length, 3);
+  console.log("  OK  an untagged window with only pinned twitch tabs + inventory is the user's: never adopted, never closed");
+}
+
+async function testWindow2ClosedMidRunStartsOverWithoutTouchingTheUsersWindow() {
+  const w = makeWorld({ session: { tdcSessionStarted: 1 }, windows: [{ id: 1 }], tabs: [youtubeTab(10, 1)], local: { enabled: false } });
+  await w.boot();
+  w.storageLocal.enabled = true;
+  await w.run("applyEnabledState(true)");
+  await w.flush(150);
+  const first = w.created.windows[0];
+  assert.ok(first && w.created.tabs.every((t) => t.windowId === first), "sanity: running in window 2");
+
+  // the user closes window 2, and Firefox cannot make a new one just now
+  await w.run(`browser.windows.remove(${first})`);
+  await w.flush(60);
+  assert.strictEqual(w.watchWindowId(), null, "forgotten");
+  const before = w.created.tabs.length;
+  w.failNextCreates(1);
+  await w.tick();
+  assert.strictEqual(w.created.tabs.length, before, "nothing is opened while there is no window 2");
+  assert.deepStrictEqual(w.violations, [], "in particular nothing in the user's window: " + w.violations.join(" | "));
+  assert.deepStrictEqual(w.tabsIn(1).map((t) => t.url), ["https://www.youtube.com/"]);
+
+  // it works again at the next tick: starts over in a new, tagged window 2
+  await w.tick();
+  await w.flush(100);
+  assert.strictEqual(w.created.windows.length, 2, "a new window 2 replaces the closed one");
+  const second = w.created.windows[1];
+  assert.strictEqual(w.watchWindowId(), second);
+  assert.strictEqual(w.tags.get(second), true);
+  assert.ok(w.created.tabs.length > before && w.created.tabs.slice(before).every((t) => t.windowId === second));
+  assert.deepStrictEqual(w.violations, []);
+  assert.deepStrictEqual(w.tabsIn(1).map((t) => t.url), ["https://www.youtube.com/"], "the user's window never got a tab");
+  console.log("  OK  window 2 closed mid-run: forgotten, nothing opens in the user's window, a new tagged window 2 follows");
+}
+
+async function testUserWindowsAreRecordedAtSwitchOnIncludingLaterOnes() {
+  const w = makeWorld({
+    session: { tdcSessionStarted: 1 }, local: { enabled: false },
+    windows: [{ id: 1 }, { id: 2 }, { id: 3, tagged: true }],
+    tabs: [youtubeTab(10, 1), youtubeTab(11, 2), { id: 12, windowId: 3, url: INV, pinned: true }],
+  });
+  await w.boot();
+  w.storageLocal.enabled = true;
+  await w.run("applyEnabledState(true)");
+  await w.flush(100);
+  const users = () => [...w.run("userWindowIds")].sort();
+  assert.deepStrictEqual(users(), [1, 2], "every window that exists at switch-on and carries no tag is the user's; the tagged one is not");
+  // a window the user opens afterwards is theirs too
+  w.restoreWindow(9, { tagged: false, tabs: [youtubeTab(90, 9)] });
+  await w.flush(50);
+  assert.ok(users().includes(9), "a window opened after switching on belongs to the user");
+  assert.ok(!users().includes(w.watchWindowId()), "window 2 is not on the list");
+  console.log("  OK  user windows are recorded at switch-on (tagged one excluded) and any later window is the user's");
+}
+
+async function testALeftoverTaggedWindowIsClosedOnlyWhenItHoldsOnlyOurTabs() {
+  const w = makeWorld({ session: { tdcSessionStarted: 1 }, windows: [{ id: 1 }], tabs: [youtubeTab(10, 1)], local: { enabled: true } });
+  await w.boot();
+  await w.flush(150);
+  const ours = w.watchWindowId();
+  assert.ok(ours, "sanity: window 2 exists");
+
+  // a second restored window with our tag and only our tabs: a leftover
+  w.restoreWindow(7, { tagged: true, tabs: [{ id: 70, url: INV, pinned: true }, { id: 71, url: "https://www.twitch.tv/old", pinned: true }] });
+  await w.flush(250);
+  assert.ok(!w.winMap.has(7), "the leftover tagged window is closed");
+  assert.strictEqual(w.watchWindowId(), ours, "and window 2 stays the same");
+
+  // one with a tab of the user's inside: left alone
+  w.restoreWindow(8, { tagged: true, tabs: [{ id: 80, url: INV, pinned: true }, youtubeTab(81, 8)] });
+  await w.flush(250);
+  assert.ok(w.winMap.has(8) && w.tabMap.has(81), "a window holding a tab that is not ours is never closed");
+  assert.deepStrictEqual(w.violations, []);
+  console.log("  OK  a second tagged window is a leftover - closed only if nothing but our own tabs is in it");
+}
+
+async function testTheTagSurvivesAnExtensionReloadAndAStaleIdIsNotTrusted() {
+  // same browser session, the extension is reloaded: window 2 is still open and tagged -> found by its tag
+  const reload = makeWorld({ session: {}, local: { watchWindowId: null }, windows: [{ id: 1 }, { id: 2, tagged: true }], tabs: [youtubeTab(10, 1), { id: 20, windowId: 2, url: INV, pinned: true }] });
+  await reload.boot();
+  await reload.flush(300);
+  assert.deepStrictEqual(reload.created.windows, [], "found by its tag: no second window");
+  assert.strictEqual(reload.watchWindowId(), 2);
+  assert.ok(reload.tabMap.has(20), "its inventory tab is kept");
+
+  // a remembered id that now points at an untagged (the user's) window is dropped
+  const stale = makeWorld({ session: { tdcSessionStarted: 1 }, local: { watchWindowId: 1 }, windows: [{ id: 1 }], tabs: [youtubeTab(10, 1)] });
+  await stale.boot();
+  await stale.tick();
+  assert.notStrictEqual(stale.watchWindowId(), 1);
+  assert.deepStrictEqual(stale.violations, []);
+  assert.deepStrictEqual(stale.tabsIn(1).map((t) => t.url), ["https://www.youtube.com/"]);
+
+  // the same browser session keeps its own window and tabs
+  const same = makeWorld({
+    session: { tdcSessionStarted: 1 },
     local: { watchWindowId: 1, watchTabs: { warframe: 2 }, watchMeta: { warframe: { channel: "somechannel", tabId: 2, watchStartedAt: 1 } } },
-    windows: [1, 2],
-    tabs: [
-      { id: 1, windowId: 1, url: INV, pinned: true },
-      { id: 2, windowId: 1, url: "https://www.twitch.tv/somechannel", pinned: true },
-      { id: 4, windowId: 2, url: "https://www.youtube.com/", pinned: false },
-    ],
+    windows: [{ id: 1, tagged: true }, { id: 2 }],
+    tabs: [{ id: 1, windowId: 1, url: INV, pinned: true }, { id: 2, windowId: 1, url: "https://www.twitch.tv/somechannel", pinned: true }, youtubeTab(4, 2)],
   });
+  await same.boot();
+  assert.strictEqual(same.storageLocal.watchTabs.warframe, 2, "same session: remembered tab ids are kept");
+  assert.ok(same.tabMap.has(2));
+  assert.deepStrictEqual(same.created.windows, []);
+  console.log("  OK  the tag is found again after an extension reload; a stale remembered id is not trusted; a normal session keeps its state");
+}
+
+async function testWithoutSessionsApiNothingBreaksAndNothingTouchesTheUser() {
+  const w = makeWorld({ session: { tdcSessionStarted: 1 }, sessionsApi: false, windows: [{ id: 1 }], tabs: [youtubeTab(10, 1)], local: { enabled: true } });
   await w.boot();
-  assert.strictEqual(w.storageLocal.watchTabs.warframe, 2, "same session: remembered tab id is kept");
-  assert.ok(w.tabMap.has(2), "and its tab is not closed");
-  assert.deepStrictEqual(w.created.windows, []);
-  console.log("  OK  same browser session: remembered ids and tabs are kept");
-}
-
-async function testLateRestoredLookalikeWindowIsSwept() {
-  const w = makeWorld({
-    session: { tdcSessionStarted: 1 },
-    local: { watchWindowId: 10 },
-    windows: [10, 11, 12],
-    tabs: [
-      { id: 1, windowId: 10, url: INV, pinned: true },
-      { id: 2, windowId: 10, url: CAMP, pinned: true }, // leftover from < 0.6.14
-      { id: 3, windowId: 11, url: INV, pinned: true }, // session restore landed after our first tick
-      { id: 4, windowId: 11, url: "https://www.twitch.tv/old", pinned: true },
-      { id: 5, windowId: 12, url: "https://www.twitch.tv/ironmouse", pinned: true }, // user window, ONLY pinned twitch tabs but no inventory
-      { id: 6, windowId: 12, url: "https://www.twitch.tv/black_moon_", pinned: true },
-    ],
-  });
-  await vm.runInContext("void 0", w.ctx);
-  vm.runInContext(bgSrc(), w.ctx); // boot (session marker present -> no reset)
   await w.flush(150);
-  await w.tick();
-
-  assert.ok(!w.winMap.has(11), "the late-restored look-alike window is closed");
-  assert.ok(w.winMap.has(10) && w.winMap.has(12), "our window and the user's pinned-only window stay");
-  assert.ok(!w.tabMap.has(2), "the pinned /drops/campaigns leftover in the watch window is closed");
-  assert.ok(w.tabMap.has(5) && w.tabMap.has(6), "a user window without an inventory tab is never mistaken for ours");
-  console.log("  OK  sweep: late look-alike window + pinned campaigns leftover closed; user's pinned-only window kept");
+  assert.strictEqual(w.created.windows.length, 1, "a window 2 is still made (it just cannot be recognised after a restore)");
+  assert.deepStrictEqual(w.violations, []);
+  assert.deepStrictEqual(w.tabsIn(1).map((t) => t.url), ["https://www.youtube.com/"]);
+  console.log("  OK  a Firefox without a working sessions API still never touches the user's window");
 }
 
-async function testSweepReopensInventoryIfItWasOnlyInTheStaleWindow() {
-  const w = makeWorld({
-    session: { tdcSessionStarted: 1 },
-    local: { watchWindowId: 10 },
-    windows: [10, 11],
-    tabs: [
-      { id: 1, windowId: 10, url: "https://www.twitch.tv/somechannel", pinned: true },
-      { id: 3, windowId: 11, url: INV, pinned: true },
-      { id: 4, windowId: 11, url: "https://www.twitch.tv/old", pinned: true },
-    ],
-  });
-  vm.runInContext(bgSrc(), w.ctx);
-  await w.flush(150);
-  await w.tick();
-  assert.ok(!w.winMap.has(11), "stale window closed");
-  const inv = [...w.tabMap.values()].filter((t) => /drops\/inventory/.test(t.url));
-  assert.strictEqual(inv.length, 1, "exactly one inventory tab exists afterwards");
-  assert.strictEqual(inv[0].windowId, 10, "and it lives in our watch window");
-  console.log("  OK  sweep: the inventory tab is reopened in the watch window when the stale window held the only one");
-}
+// what the README promises about the `sessions` permission: only the tag is read or written, only
+// on a window the extension created, nothing else of the sessions API is used
+async function testTheSessionsApiIsUsedOnlyForTheTag() {
+  const w = makeWorld({ session: { tdcSessionStarted: 1 }, windows: [{ id: 1 }, { id: 2 }], tabs: [youtubeTab(10, 1), youtubeTab(11, 2)], local: { enabled: true } });
+  await w.boot();
+  await w.flush(250);
+  w.restoreWindow(9, { tagged: false, tabs: [youtubeTab(90, 9)] }); // a window the user opens
+  await w.flush(250);
+  const created = new Set(w.created.windows);
+  assert.ok(w.sessionsCalls.length > 0);
+  assert.ok(w.sessionsCalls.every((c) => c.key === TAG), "only the single key dropClaimerWatch is ever read or written");
+  const writes = w.sessionsCalls.filter((c) => c.fn === "set");
+  assert.ok(writes.length >= 1 && writes.every((c) => created.has(c.id) && c.value === true), "tags are written only on a window the extension itself created: " + JSON.stringify(writes));
+  assert.ok(!writes.some((c) => c.id === 1 || c.id === 2 || c.id === 9), "never on the user's windows");
+  assert.ok(w.sessionsCalls.some((c) => c.fn === "get" && c.id === 1), "the user's windows are only asked whether the tag is there");
 
-async function testSignatureBoundaries() {
-  const cases = [
-    ["unpinned inventory + pinned channels (a restored freshly-created window)", true, [
-      { id: 1, windowId: 5, url: INV, pinned: false },
-      { id: 2, windowId: 5, url: "https://www.twitch.tv/somechannel", pinned: true },
-    ]],
-    ["pinned inventory + about:home", true, [
-      { id: 1, windowId: 5, url: INV, pinned: true },
-      { id: 2, windowId: 5, url: "about:home", pinned: false },
-    ]],
-    ["an ordinary tab makes it the user's window", false, [
-      { id: 1, windowId: 5, url: INV, pinned: true },
-      { id: 2, windowId: 5, url: "https://www.youtube.com/", pinned: false },
-    ]],
-    ["the user's own unpinned twitch tab makes it theirs", false, [
-      { id: 1, windowId: 5, url: INV, pinned: true },
-      { id: 2, windowId: 5, url: "https://www.twitch.tv/somechannel", pinned: false },
-    ]],
-    ["an extension page (popup opened in a tab) makes it theirs", false, [
-      { id: 1, windowId: 5, url: INV, pinned: true },
-      { id: 2, windowId: 5, url: "moz-extension://abc/popup.html", pinned: false },
-    ]],
-    ["only a lone unpinned inventory tab (the user looking at it) is not enough", false, [
-      { id: 1, windowId: 5, url: INV, pinned: false },
-    ]],
-    ["no inventory at all", false, [
-      { id: 1, windowId: 5, url: "https://www.twitch.tv/a", pinned: true },
-      { id: 2, windowId: 5, url: "https://www.twitch.tv/b", pinned: true },
-    ]],
-  ];
-  for (const [label, expected, tabs] of cases) {
-    // enabled:false so loading background.js does no scheduling of its own while we look
-    const w = makeWorld({ session: { tdcSessionStarted: 1 }, local: { enabled: false }, windows: [5], tabs });
-    vm.runInContext(bgSrc(), w.ctx);
-    await w.flush(30);
-    const found = await vm.runInContext("findWatchWindowCandidates", w.ctx)();
-    assert.strictEqual(found.length === 1, expected, label);
+  // static: the code calls exactly these two members of the sessions API, and no history/restore API
+  const code = read("background.js").replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
+  const members = [...new Set([...code.matchAll(/browser\.sessions\.(\w+)/g)].map((m) => m[1]))].sort();
+  assert.deepStrictEqual(members, ["getWindowValue", "setWindowValue"], "no getRecentlyClosed, no restore, nothing else: " + members.join(","));
+  for (const f of ["background.js", "content.js", "popup.js", "inject.js", "gql-bridge.js", "shared.js"]) {
+    const src = read(f).replace(/\/\/.*$/gm, "");
+    assert.ok(!/browser\.history|browser\.browsingData|getRecentlyClosed|sessions\.restore/.test(src), `${f}: no history / recently-closed / restore API`);
+    if (f !== "background.js") assert.ok(!/browser\.sessions/.test(src), `${f}: does not touch the sessions API`);
   }
-  console.log("  OK  window signature: restored/blank-tab variants match; any ordinary, extension or lone tab never does");
-}
-
-async function testLoneInventoryWindowIsAdoptedButNeverClosed() {
-  // after an extension reload the old watch window holds just its inventory tab
-  const adopt = makeWorld({
-    session: {}, // reload cleared the session marker
-    local: { watchWindowId: 5 },
-    windows: [5],
-    tabs: [{ id: 1, windowId: 5, url: INV, pinned: false }],
-  });
-  await adopt.boot();
-  assert.deepStrictEqual(adopt.created.windows, [], "no extra window opened next to the old lone-inventory window");
-  assert.strictEqual(adopt.storageLocal.watchWindowId, 5, "the lone-inventory window was adopted");
-  assert.ok(adopt.tabMap.has(1), "its inventory tab is kept");
-
-  // ...but the sweep (which CLOSES windows) never treats such a window as stale
-  const sweep = makeWorld({
-    session: { tdcSessionStarted: 1 },
-    local: { watchWindowId: 10 },
-    windows: [10, 20],
-    tabs: [
-      { id: 1, windowId: 10, url: INV, pinned: true },
-      { id: 2, windowId: 20, url: INV, pinned: false }, // the user reading their inventory in a window of its own
-    ],
-  });
-  vm.runInContext(bgSrc(), sweep.ctx);
-  await sweep.flush(150);
-  await sweep.tick();
-  assert.ok(sweep.winMap.has(20), "a user's lone-inventory window is never closed");
-  console.log("  OK  a lone-inventory window is adopted after a reload, and never closed by the sweep");
-}
-
-async function testNoSessionStorageKeepsOldBehaviour() {
-  const w = makeWorld({
-    session: "none",
-    local: { watchWindowId: 1, watchTabs: { warframe: 2 } },
-    windows: [1],
-    tabs: [
-      { id: 1, windowId: 1, url: INV, pinned: true },
-      { id: 2, windowId: 1, url: "https://www.twitch.tv/directory/category/warframe?filter=drops", pinned: true },
-    ],
-  });
-  await w.boot();
-  assert.strictEqual(w.storageLocal.watchTabs.warframe, 2, "without storage.session nothing is reset");
-  assert.deepStrictEqual(w.created.windows, []);
-  console.log("  OK  a Firefox without storage.session behaves exactly as before");
-}
-
-
-// Firefox reports a tab opened with a URL as about:blank until the navigation
-// commits. Model the commit as a delayed url/status change on the fake tab.
-const navigateLater = (w, id, url, ms) => setTimeout(() => {
-  const t = w.tabMap.get(id);
-  if (t) { t.url = url; t.status = "complete"; }
-}, ms);
-const raceWindow = (blankTab) => ({
-  session: {}, // fresh browser session -> adoption runs at boot
-  local: { watchWindowId: null },
-  windows: [1],
-  tabs: [
-    { id: 1, windowId: 1, url: INV, pinned: true, status: "complete" },
-    { id: 2, windowId: 1, url: "https://www.twitch.tv/somechannel", pinned: true, status: "complete" },
-    { id: 3, windowId: 1, ...blankTab }, // the user's own tab, opened at browser start
-  ],
-});
-
-async function testUsersLoadingTabIsNotClosedByAdoption() {
-  const w = makeWorld(raceWindow({ url: "about:blank", pinned: false, status: "loading" }));
-  navigateLater(w, 3, CAMP, 20);
-  await w.boot();
-  await w.flush(SETTLE_MS * 3);
-  assert.ok(w.tabMap.has(3), "the user's still-loading tab is not closed");
-  assert.strictEqual(w.tabMap.get(3).url, CAMP, "and it ends up on the page they asked for");
-  assert.notStrictEqual(w.storageLocal.watchWindowId, 1, "their window is not adopted as the watch window");
-  assert.ok(w.tabMap.has(1) && w.tabMap.has(2), "no tab of theirs is touched");
-  console.log("  OK  race: a still-loading user tab keeps its window from being adopted (campaigns tab survives)");
-}
-
-async function testBlankTabThatNavigatesDuringSettleIsNotClosed() {
-  // worst case: the tab still reports status "complete" on the first look
-  const w = makeWorld(raceWindow({ url: "about:blank", pinned: false, status: "complete" }));
-  navigateLater(w, 3, CAMP, 15);
-  await w.boot();
-  await w.flush(SETTLE_MS * 3);
-  assert.ok(w.tabMap.has(3), "a blank tab that navigated during the settle wait is not closed");
-  assert.strictEqual(w.tabMap.get(3).url, CAMP);
-  assert.notStrictEqual(w.storageLocal.watchWindowId, 1, "the window is not adopted once it stopped looking like ours");
-  console.log("  OK  race: a blank tab that commits its navigation during the settle wait is re-checked and left alone");
-}
-
-async function testSweepDoesNotCloseWindowWithNavigatingTab() {
-  const w = makeWorld({
-    session: { tdcSessionStarted: 1 },
-    local: { watchWindowId: 10 },
-    windows: [10, 11],
-    tabs: [
-      { id: 1, windowId: 10, url: INV, pinned: true, status: "complete" },
-      { id: 2, windowId: 10, url: "https://www.twitch.tv/somechannel", pinned: true, status: "complete" },
-      { id: 3, windowId: 11, url: INV, pinned: true, status: "complete" },
-      { id: 4, windowId: 11, url: "https://www.twitch.tv/old", pinned: true, status: "complete" },
-      { id: 5, windowId: 11, url: "about:blank", pinned: false, status: "complete" }, // user's new tab, about to navigate
-    ],
-  });
-  navigateLater(w, 5, CAMP, 15);
-  vm.runInContext(bgSrc(), w.ctx);
-  await w.flush(150);
-  await w.tick();
-  await w.flush(SETTLE_MS * 3);
-  assert.ok(w.winMap.has(11), "a window whose blank tab just navigated is never closed as a stale watch window");
-  assert.ok(w.tabMap.has(5) && w.tabMap.get(5).url === CAMP, "and the user's campaigns tab is intact");
-  console.log("  OK  race: the stale-window sweep re-checks and leaves a window alone once its blank tab navigates");
+  const manifest = JSON.parse(read("manifest.json"));
+  assert.ok(manifest.permissions.includes("sessions") && !manifest.permissions.includes("history") && !manifest.permissions.includes("browsingData"));
+  console.log("  OK  sessions API: only the dropClaimerWatch tag, written only on the extension's own window, read (asked) elsewhere; no history/restore API");
 }
 
 (async () => {
-  console.log("Running session/window tests (no real browser, no network)...\n");
+  console.log("Running watch window / session tests (fake windows+tabs+sessions, no real browser, no network)...\n");
   try {
-    await testRestartAdoptsRestoredWatchWindowAndForgetsStaleIds();
-    await testSameSessionKeepsState();
-    await testLateRestoredLookalikeWindowIsSwept();
-    await testSweepReopensInventoryIfItWasOnlyInTheStaleWindow();
-    await testSignatureBoundaries();
-    await testLoneInventoryWindowIsAdoptedButNeverClosed();
-    await testNoSessionStorageKeepsOldBehaviour();
-    await testUsersLoadingTabIsNotClosedByAdoption();
-    await testBlankTabThatNavigatesDuringSettleIsNotClosed();
-    await testSweepDoesNotCloseWindowWithNavigatingTab();
+    await testConcurrentSwitchOnMakesOneWindowAndEveryTabLandsInIt();
+    await testAJobBeforeWindow2IsReadyWaitsAndNeverFallsBackToTheCurrentWindow();
+    await testUncleanShutdownRestoreAdoptsTheTaggedWindowOnly();
+    await testALateRestoredTaggedWindowIsAdoptedNotDuplicated();
+    await testAnUntaggedWindowThatLooksLikeOursIsNeverAdoptedOrClosed();
+    await testWindow2ClosedMidRunStartsOverWithoutTouchingTheUsersWindow();
+    await testUserWindowsAreRecordedAtSwitchOnIncludingLaterOnes();
+    await testALeftoverTaggedWindowIsClosedOnlyWhenItHoldsOnlyOurTabs();
+    await testTheTagSurvivesAnExtensionReloadAndAStaleIdIsNotTrusted();
+    await testWithoutSessionsApiNothingBreaksAndNothingTouchesTheUser();
+    await testTheSessionsApiIsUsedOnlyForTheTag();
     console.log("\nALL PASSED");
     process.exit(0);
   } catch (e) {

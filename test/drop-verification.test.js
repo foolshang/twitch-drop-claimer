@@ -91,6 +91,7 @@ function makeSandbox() {
     Blob: globalThis.Blob,
   };
 
+  require("./window-stubs").attachWindowApis(sandbox.browser, { createTab: (o) => sandbox.browser.tabs.create({ ...o, active: false }) }); // 0.6.19: tabs only open in a verified, tagged watch window
   const ctx = vm.createContext(sandbox);
   function flush(ms = 15) {
     return new Promise((resolve) => setTimeout(resolve, ms));

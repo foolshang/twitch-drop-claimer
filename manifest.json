@@ -1,13 +1,14 @@
 {
   "manifest_version": 2,
   "name": "Twitch Drop Auto-Claimer",
-  "version": "0.6.18",
+  "version": "0.6.19",
   "description": "Auto-claim Twitch Drops while you keep a stream/inventory tab open. Also reloads the inventory tab periodically.",
   "permissions": [
     "alarms",
     "tabs",
     "storage",
     "downloads",
+    "sessions",
     "*://*.twitch.tv/*",
     "https://35-188-24-245.sslip.io/*"
   ],

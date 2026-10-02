@@ -228,6 +228,7 @@
     line-height: 1.45;
   }
 
+  #sessionsHint a { color: inherit; text-decoration: underline; }
   .claim-warning a, .claim-warning button.link {
     color: var(--warn);
     background: none;
@@ -555,6 +556,8 @@
   <button id="reportBug" type="button" data-i18n="btn_report_bug"></button>
   <div class="hint" data-i18n="report_bug_hint"></div>
   <div id="reportBugStatus" class="hint"></div>
+  <div class="hint" id="sessionsHint"><span data-i18n="sessions_hint"></span>
+    <a id="sessionsHintLink" href="https://github.com/foolshang/twitch-drop-claimer#the-sessions-permission" target="_blank" rel="noopener" data-i18n="sessions_hint_link"></a></div>
 
   <hr>
 

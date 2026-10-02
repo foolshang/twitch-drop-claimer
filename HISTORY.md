@@ -2427,3 +2427,140 @@ and the slot went to nobody). All 16 test files pass; `web-ext lint` clean
 (0/0/0); i18n key parity holds (83/language).
 
 `BUILD_MARKER` -> `2026-10-02-r2`, `manifest.json` -> 0.6.18.
+
+
+## 0.6.19 - the watch window is recognised by a tag, not by a guess; "done" means 5/5
+
+**Problem 1 - the watch tabs duplicated into the user's own window (reported in
+real use of 0.6.18):** switching the extension on left Firefox window 1 (the
+user's, with no Twitch tab before) with exactly the same tabs as the watch
+window, window 2. The user normally closes Firefox with the X (no restore);
+windows only come back after an unclean shutdown (Windows restarting after an
+update, a power cut, shutting Windows down with Firefox open).
+
+**Investigation (honest):** there is no auto-report newer than #5 (2026-09-29,
+v0.6.15), so no log shows which path dropped a tab into window 1. From the code:
+the only way a tab lands in "the current window" is `tabs.create(...)` without a
+`windowId` - the three `...(watchWindowId ? { windowId } : {})` spreads (inventory
+tab, watch tabs, the slug-resolve search tab) when `getOrCreateWatchWindow()`
+returned `{ id: null }` (its `windows.create()` failed, or its adoption threw: "could
+not create a dedicated window, falling back to the current window"). A fake
+windows/tabs registry reproduces exactly that: with `windows.create` failing, 0.6.18
+puts the tabs in the user's window. The race the user suspected (the enabled
+handler + `openInventoryIfMissing` + `autoWatchTick` at once) did NOT reproduce a
+duplicate window or a stray tab on 0.6.18 in that registry (the shared in-flight
+promise holds); that hypothesis stays unconfirmed. Separately, 0.6.15-0.6.18
+recognised "their" window after a restore by how its tabs looked (all pinned
+twitch.tv, one the inventory): a user window of that shape could be adopted and
+have its tabs closed, and a look-alike could win over the real one.
+
+**Fix - a state machine with a tag:**
+1. On switch-on (and when Firefox starts with the extension already on) every
+   window that exists and carries no tag is recorded as a user window
+   (`recordUserWindows`); a window created later by anyone but the extension is
+   recorded too (`windows.onCreated`). User windows are never adopted, never used
+   for a tab, never closed.
+2. Window 2 is tagged `dropClaimerWatch` with `sessions.setWindowValue` the moment
+   it is created (new `sessions` permission). After a restore (or an extension
+   reload) it is found with `sessions.getWindowValue`: tagged = adopt it and keep
+   using it (its stale tabs are closed - but only tabs that look like ones the
+   extension opened; a tab of the user's inside it is never closed), untagged =
+   the user's, every time. A restored window that arrives late is caught by
+   `windows.onCreated` (re-checked after 2/10/30 s, because its session values may
+   not be readable at once): adopted if there is no window 2, a leftover (closed
+   only if nothing but our own tabs is in it) if there is one.
+3. `getOrCreateWatchWindow()` is the single path (concurrent callers share one
+   in-flight resolution) and `createWatchTab()` the single way to open a tab: it
+   waits for window 2, re-verifies it with `windows.get`, and passes
+   `windowId` explicitly. No window 2 = the job is skipped until the next tick; all
+   three fallbacks to the current window are gone.
+4. Back to step 1 on a new browser session (`resetStateForNewBrowserSession`) or
+   when window 2 closes (`windows.onRemoved`: forgotten, a new one follows at the
+   next tick - a user who closes it is not fought with on the spot).
+A found hazard on the way: `sweepStaleWatchLeftovers` closed the pinned
+`/drops/campaigns` tab in the window of a REMEMBERED id - which after a restart can
+be the user's window; it now believes a remembered id only while the window is
+tagged. The guessing (`findWatchWindowCandidates`, the 0.6.15 adoption, the 0.6.16
+settle delay) is gone; what stayed is the safety rule that a window with a tab that
+is not ours is never closed.
+
+**Differences from the spec worth knowing:** (a) a restore grace of 8 s
+(`WINDOW_RESTORE_GRACE_MS`) was added: at a new browser session with windows
+already open no window 2 is created before it has passed, otherwise a late restored
+tagged window could only ever be a leftover next to a new window instead of being
+adopted; (b) windows of 0.6.18 and older have no tag, so one of them that Firefox
+restores after the upgrade is "the user's" and is left alone (it needs closing by
+hand once); (c) the extension asks every normal window whether the tag is there
+(that is how it finds its own and records the user's) - it only ever writes the
+tag on a window it created; (d) a closed window 2 is replaced at the next tick, not
+at once.
+
+**Problem 2 - "done" with the count 4/5:** once the last tier is claimed the card
+leaves "In Progress"; the missing-card reconciliation set `allComplete` from "the
+card vanished for 2 scans + the Inventory GQL no longer lists it as ACTIVE" alone,
+never looked at the Claimed section and never raised `claimed` to `total`.
+
+**Fix 2:** the card record keeps every tier's reward name and claimed flag
+(`tiers`), the entry's progress keeps all names (`tierNames`), and
+`inventoryProgress` now carries the Claimed section. When a card vanishes
+(`claimedConfirmsEntry`, shared.js): every reward name must be listed in Claimed,
+one entry per tier (a name on two tiers needs two entries - 0.6.8's one-for-one
+rule); all listed = CONFIRMED: `claimed = total`, `allComplete`, tab closed. Some
+missing, or a tier whose name could not be read, or no Claimed list = "probably
+done - not confirmed" (`probablyDone`, badge `badge_probably_done` in 9 languages):
+nothing closed, nothing counted as finished, one log line; the Claimed section
+showing the rewards later confirms it; with no card back and the GQL still not
+listing the campaign it is accepted after `PROBABLY_DONE_TIMEOUT_MS` (30 min),
+`claimed = total` too, `inferredDone`, logged as INFERRED. A returning card
+withdraws "probably done". The popup shows total/total for a finished entry.
+
+**Why the `sessions` permission, and what else was considered:** Firefox will show
+"Access recently closed tabs" when the extension updates - Firefox's standard
+wording for the whole permission category; only `sessions.setWindowValue` /
+`getWindowValue` on one key (`dropClaimerWatch`) are used (a test pins this: no
+`getRecentlyClosed`, no `restore`, no history API). Window and tab ids are numbered
+from 1 again at every start, so nothing the extension can store tells a restored
+window from the user's. Alternatives: (1) keep guessing from tab appearance, as
+0.6.15 to 0.6.18 did - rejected: it was wrong in exactly the situation reported (a
+user window adopted/closed, duplicates left, tabs next to the user's); (2) remember
+the window's tabs' URLs/titles and match them after a restart - the same guess with
+more state; (3) a title preface on `windows.create` - not kept by Firefox's restore
+and not readable back; (4) never keep a watch window and use the user's - against
+the tab etiquette the extension is built on (an active:true flash must never happen
+in the user's window). The tag lives in Firefox's own session store with the window
+and is the only marker that survives a restart; the cost is the permission prompt,
+explained in README ("The `sessions` permission"), in the popup (`sessions_hint`,
+9 languages, linking to that section) and in `docs/release-notes-0.6.19.md`.
+
+**Not verified live** (README rule: no live tests with a real session): the fake
+registry models Firefox's window/tab/session-value APIs; whether a restored window's
+session value is readable at `windows.onCreated` is exactly the uncertainty the
+re-checks and the grace are for. The wording of the permission prompt is the
+user's report, not captured here.
+
+**Tests:** `session-windows.test.js` rewritten (11 cases, a fake windows/tabs/sessions
+registry that audits every `tabs.create`): concurrent switch-on = one tagged
+window 2 and every tab in it; a tab job waits for window 2 and, when none can be
+made, opens nothing (0.6.18 put it in the user's window); restore after an unclean
+shutdown adopts the tagged window and leaves the user's windows - a look-alike
+included - alone; a window restored late is adopted, not duplicated (and with no
+restore window 2 follows the grace); an untagged window with only pinned twitch
+tabs + inventory is never adopted or closed, even through a remembered id; window
+2 closed mid-run starts over without touching the user's window; user windows
+recorded at switch-on; a leftover tagged window closed only if it holds nothing but
+our tabs; the tag survives an extension reload and a stale id is not trusted; no
+sessions API; the sessions API is used only for the tag and only written on the
+window we created. New `claim-confirmation.test.js` (7 cases): the parser keeps tier
+names/claimed flags; vanishes with reward 5 in Claimed = confirmed 5/5, tab closed;
+without it = probably done, tab kept, confirmed later; the 30-minute timeout =
+inferred, 5/5, logged; a returning card withdraws it; duplicate names need one
+Claimed entry each; unreadable names / no Claimed list never confirm; popup
+total/total + the new badge. Shared `window-stubs.js` gives the other test sandboxes
+a windows/sessions fake (they now need one: nothing opens without a verified
+window). Against 0.6.18 (run one by one) every new case fails except "no sessions
+API", which only guards a regression, and the concurrent-switch-on case fails only
+at "it is tagged". All 17 test files pass; `web-ext lint` clean (0/0/0); i18n key
+parity holds (86/language).
+
+`BUILD_MARKER` -> `2026-10-02-r3`, `manifest.json` -> 0.6.19 (new permission:
+`sessions`).

@@ -502,6 +502,11 @@ async function renderGameStatus() {
       detail = t("detail_need_link");
     } else if (progress && progress.allComplete) {
       badge = badgeEl(t("badge_all_claimed"), "done");
+      // finished means every piece: never "4/5" next to "done" (older readings may still say so)
+      detail = t("detail_pieces", { claimed: progress.total, total: progress.total });
+    } else if (progress && progress.probablyDone) {
+      // the card left "In Progress" but the Claimed section does not (yet) list its rewards
+      badge = badgeEl(t("badge_probably_done"), "warn");
       detail = t("detail_pieces", { claimed: progress.claimed, total: progress.total });
     } else if (progress && progress.expired) {
       badge = badgeEl(t("badge_expired"), "done");

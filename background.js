@@ -187,6 +187,11 @@ const UNUSABLE_CHANNEL_COOLDOWN_MS = 20 * 60 * 1000; // offline / switched game 
 // with the card absent before inferring allComplete, matching the fail-closed
 // posture used everywhere else in this file.
 const REQUIRED_MISSING_SCANS = 2;
+// A card that vanished while the Claimed section does not (yet) list its rewards:
+// "probably done", not closed, not counted as finished - until the Claimed section
+// shows them or, with no card back and the Inventory GQL still not listing the
+// campaign, this long has passed (then it is accepted as done, logged as inferred)
+const PROBABLY_DONE_TIMEOUT_MS = 30 * 60 * 1000;
 
 // In-memory ring buffer of every log() line this file emits (rejectChannel,
 // handleChannelUnusable's "unusable (offline|game:<slug>)" line, verify, ...).
@@ -394,8 +399,8 @@ async function refreshBadge() {
 }
 
 // ============================================================================
-// dedicated watch window - isolates every tab this extension opens from
-// whatever the user is actually doing (see the tab-etiquette comment at the
+// dedicated watch window ("window 2") - isolates every tab this extension opens
+// from whatever the user is actually doing (see the tab-etiquette comment at the
 // top of this file). Needed for the brief active:true flash in
 // handleDirectoryPicked below: Twitch's own player does not reliably start
 // video in a tab that has never been the active tab of its window (live RDP
@@ -405,33 +410,66 @@ async function refreshBadge() {
 // user is never looking - a separate window they didn't ask to see, not a
 // tab switch in whatever window they're using for YouTube/anything else.
 // ============================================================================
-// Returns { id, freshlyCreated }. freshlyCreated tells callers whether this
-// call's window is the one that just got its initial tab navigated to
-// INVENTORY_URL right here - openInventoryIfMissing() relies on that
-// instead of re-querying browser.tabs right after, because whether
-// browser.tabs.query() reflects a just-created/just-navigated tab by the
-// very next call is not guaranteed (produced a real duplicate inventory tab
-// in a live test, 2026-09-04).
-//
-// Window and tab ids only mean something inside ONE browser session (Firefox
-// numbers them from 1 again on every start), and Firefox's session restore
-// brings back last session's watch window - pinned watch tabs and all - so
-// three things are handled here (2026-09-28: a restart used to give the user
-// three windows, and a remembered id can even equal one of their own):
-//   - resetStateForNewBrowserSession(): a fresh session forgets every
-//     remembered tab/window id;
-//   - findWatchWindowCandidates()/adoption below: an existing window that
-//     looks like ours (all tabs pinned twitch.tv, one of them the inventory)
-//     is adopted instead of opening a second one, with its stale tabs closed;
-//   - sweepStaleWatchLeftovers(): any further such window (session restore
-//     can land after the first tick) and any pinned /drops/campaigns tab in
-//     the watch window (left behind by versions before 0.6.14) is closed.
+// How the extension knows which window is its own (0.6.19; the earlier versions
+// guessed from what a window's tabs looked like, which could leave duplicates
+// or - worse - touch the user's window):
+//   - Window 2 carries a tag, "dropClaimerWatch", set with
+//     sessions.setWindowValue() the moment it is created. Firefox keeps that
+//     value in its session store, so it survives an unclean shutdown (Windows
+//     restarting after an update, a power cut, shutting down with Firefox
+//     open) and comes back on the restored window - the ONLY reliable marker,
+//     because window and tab ids are numbered from 1 again on every start.
+//   - Every other window belongs to the user, whatever it looks like and
+//     whenever it appeared (also windows the user opens after switching on).
+//     They are recorded when the switch goes on (recordUserWindows) and are
+//     never adopted, never used for a tab and never closed. The tag is only
+//     ever read from a window to see whether it is there - never written to,
+//     and nothing else is read from the session store (no closed tabs/windows,
+//     no history).
+//   - There is ONE path that finds or creates window 2: getOrCreateWatchWindow().
+//     Every tab the extension opens goes through createWatchTab(), which waits
+//     for it and passes windowId explicitly; when there is no verified window 2
+//     the job is skipped until the next tick - there is no fallback to "the
+//     current window".
+//   - Back to square one when a new browser session starts
+//     (resetStateForNewBrowserSession) or window 2 is closed/disappears.
+// ============================================================================
+const WINDOW_TAG = "dropClaimerWatch";
+// a restored window's session values may not be readable yet when it is created:
+// an untagged new window is looked at again after these delays
+const WINDOW_RECHECK_MS = [2_000, 10_000, 30_000];
+// When Firefox has just started (a new browser session) its restored windows
+// arrive over the first seconds - one of them may be the tagged watch window of
+// last time. A window 2 is not created before this has passed, so a late
+// restored one is adopted instead of ending up next to a new one.
+const WINDOW_RESTORE_GRACE_MS = 8_000;
+let windowCreateNotBefore = 0;
+let graceFollowUpScheduled = false;
+const ownWindowIds = new Set(); // windows this background page created or adopted (the tag, cached)
+let userWindowIds = new Set(); // windows that belong to the user (every window that is not window 2)
+
+const isTwitchUrl = (u) => /^https?:\/\/([^/]+\.)?twitch\.tv(\/|$)/.test(u || "");
+// A tab that is still loading is never "blank": a tab the user just opened with
+// a URL reports about:blank until its navigation commits.
+const isBlankTab = (t) => /^about:(blank|home|newtab)$/.test(t.url || "") && t.status !== "loading";
+const isInventoryTab = (t) => isTwitchUrl(t.url) && /\/drops\/inventory/.test(t.url || "");
+// a tab the extension itself could have opened (a pinned twitch.tv watch/campaigns/
+// inventory tab, or the blank tab windows.create() leaves) - the only kind it
+// ever closes inside a window of its own; anything else is the user's
+const looksLikeOurTab = (t) => (t.pinned && isTwitchUrl(t.url)) || isInventoryTab(t) || isBlankTab(t);
+
 async function resetStateForNewBrowserSession() {
   if (!browser.storage.session) return false; // no per-session storage -> nothing to compare against
   const { tdcSessionStarted } = await browser.storage.session.get("tdcSessionStarted");
   if (tdcSessionStarted) return false;
   await browser.storage.session.set({ tdcSessionStarted: Date.now() });
   await browser.storage.local.set({ watchTabs: {}, watchMeta: {}, dropSignals: {}, watchWindowId: null, claimHealth: null, claimNotLinked: null });
+  ownWindowIds.clear(); // window ids start from 1 again: nothing remembered about windows means anything now
+  userWindowIds = new Set();
+  try {
+    // Firefox restores its windows over the next seconds (only when there are windows at all)
+    if ((await browser.windows.getAll({ windowTypes: ["normal"] })).length > 0) windowCreateNotBefore = Date.now() + WINDOW_RESTORE_GRACE_MS;
+  } catch { /* no windows API yet: nothing to wait for */ }
   claimBackoff = new Map(); // and every reward's claim backoff (see getClaimBackoff)
   integrityFlag = null; // and Twitch's verdict on the session (see getIntegrityFlag)
   try { await browser.storage.session.set({ claimBackoff: {}, integrityFlag: null }); } catch { /* best effort */ }
@@ -439,87 +477,204 @@ async function resetStateForNewBrowserSession() {
   return true;
 }
 
-const isTwitchUrl = (u) => /^https?:\/\/([^/]+\.)?twitch\.tv(\/|$)/.test(u || "");
-// Windows that look like a leftover/restored watch window of ours. Every tab
-// must be one of: a pinned twitch.tv tab, the drops inventory (pinned or not -
-// a freshly created watch window's initial tab is navigated to it unpinned),
-// or Firefox's own blank/home page (windows.create() leaves an about:home tab
-// behind - seen in the real session file). At least one tab must be the
-// inventory and - unless `loose` - at least one a pinned twitch.tv tab. Any
-// ordinary tab (a YouTube tab, the user's own unpinned Twitch tab, an
-// extension page) means it is the user's window, never ours. `loose` is only
-// for ADOPTING a window (a lone-inventory window from before an extension
-// reload is still ours to reuse); CLOSING one always uses the strict form,
-// since a user looking at their inventory in a window of its own must be safe.
-// A tab that is still loading is never "blank": a tab the user just opened with
-// a URL (Firefox started with one, a link opened in a new tab) reports
-// about:blank until its navigation commits, and treating it as blank made the
-// user's window look like ours - adoption then closed their campaigns tab.
-const isBlankTab = (t) => /^about:(blank|home|newtab)$/.test(t.url || "") && t.status !== "loading";
-// How long a window that only qualifies thanks to a blank tab must keep
-// qualifying before we adopt or close it (a navigation that has not reported
-// "loading" yet has committed by then).
-const ADOPT_SETTLE_MS = 1_500;
-const isInventoryTab = (t) => isTwitchUrl(t.url) && /\/drops\/inventory/.test(t.url || "");
-async function findWatchWindowCandidates({ loose = false } = {}) {
+async function windowIsTagged(id) {
+  try { return (await browser.sessions.getWindowValue(id, WINDOW_TAG)) === true; } catch { return false; }
+}
+async function tagWindow(id) {
+  try { await browser.sessions.setWindowValue(id, WINDOW_TAG, true); return true; }
+  catch (e) { log("could not tag the watch window (it will not be recognised after a restore):", e); return false; }
+}
+const windowIsOurs = async (id) => ownWindowIds.has(id) || windowIsTagged(id);
+
+// step 1: every window that exists now and is not tagged is the user's
+async function recordUserWindows() {
   let wins;
-  try {
-    wins = await browser.windows.getAll({ populate: true, windowTypes: ["normal"] });
-  } catch { return []; }
-  return (wins || []).filter((w) => {
-    const tabs = w.tabs || [];
-    return tabs.length > 0 &&
-      tabs.every((t) => (t.pinned && isTwitchUrl(t.url)) || isInventoryTab(t) || isBlankTab(t)) &&
-      tabs.some(isInventoryTab) &&
-      (loose || tabs.some((t) => t.pinned && isTwitchUrl(t.url)));
-  });
+  try { wins = await browser.windows.getAll({ windowTypes: ["normal"] }); } catch { return; }
+  const next = new Set();
+  for (const w of wins || []) if (!(await windowIsOurs(w.id))) next.add(w.id);
+  userWindowIds = next;
 }
 
-// findWatchWindowCandidates() for the callers that ADOPT or CLOSE what it
-// returns. A window that qualifies only because a tab is momentarily blank
-// (the user's new tab before its navigation commits) is looked at again after
-// ADOPT_SETTLE_MS and kept only if it still qualifies; the tab lists of the
-// second look are returned, so nothing that navigated in between is touched.
-async function findSettledWatchWindowCandidates(opts) {
-  const first = await findWatchWindowCandidates(opts);
-  if (!first.some((w) => w.tabs.some(isBlankTab))) return first;
-  await new Promise((resolve) => setTimeout(resolve, ADOPT_SETTLE_MS));
-  const firstIds = new Set(first.map((w) => w.id));
-  return (await findWatchWindowCandidates(opts)).filter((w) => firstIds.has(w.id));
+// windows carrying our tag, with their tabs (a restore, or an extension reload inside one session)
+async function findTaggedWindows() {
+  let wins;
+  try { wins = await browser.windows.getAll({ populate: true, windowTypes: ["normal"] }); } catch { return []; }
+  const out = [];
+  for (const w of wins || []) if (await windowIsOurs(w.id)) out.push(w);
+  return out;
 }
 
-async function adoptExistingWatchWindow() {
-  const strict = await findSettledWatchWindowCandidates();
-  const strictIds = new Set(strict.map((w) => w.id));
-  const loose = (await findSettledWatchWindowCandidates({ loose: true })).filter((w) => !strictIds.has(w.id));
-  const candidates = [...strict, ...loose]; // an unmistakable watch window is preferred
-  if (candidates.length === 0) return null;
-  const [keep, ...others] = candidates;
-  for (const w of others) {
-    if (!strictIds.has(w.id)) continue; // a loose-only match could be the user's - never closed
-    log("closing an extra leftover watch window", w.id);
-    try { await browser.windows.remove(w.id); } catch { /* already gone */ }
-  }
-  // keep one inventory tab (the one the extension refreshes); everything else
-  // in there is a stale watch/campaigns tab from before the restart
+// a tagged window found by the tag: ours, so its stale tabs may go - but only
+// tabs that look like ones the extension opened (never anything else in it)
+async function adoptTaggedWindow(w) {
+  await browser.storage.local.set({ watchWindowId: w.id });
+  ownWindowIds.add(w.id);
+  userWindowIds.delete(w.id);
   let keptInventory = false;
-  for (const t of keep.tabs) {
-    if (!keptInventory && /\/drops\/inventory/.test(t.url || "")) { keptInventory = true; continue; }
-    try { await browser.tabs.remove(t.id); } catch { /* already gone */ }
+  for (const t of w.tabs || []) {
+    if (isInventoryTab(t) && !keptInventory) { keptInventory = true; continue; } // the one the extension refreshes
+    if (looksLikeOurTab(t)) { try { await browser.tabs.remove(t.id); } catch { /* already gone */ } }
   }
-  await browser.storage.local.set({ watchWindowId: keep.id });
-  log("adopted the existing watch window", keep.id, "instead of opening another");
-  return keep.id;
+  log("adopted the tagged watch window", w.id, "(still open or restored) instead of opening another");
+  return w.id;
 }
 
+// A second tagged window (a restore that landed late, next to the one in use) is a
+// leftover of ours - closed only when nothing but our own tabs is in it.
+async function closeLeftoverTaggedWindow(w) {
+  if (!Array.isArray(w.tabs) || !w.tabs.every(looksLikeOurTab)) { // unknown tabs count as "not ours" too
+    log("a second tagged window", w.id, "has tabs that are not ours - leaving it alone");
+    return false;
+  }
+  log("closing a leftover tagged watch window", w.id);
+  try { await browser.windows.remove(w.id); ownWindowIds.delete(w.id); return true; } catch { return false; }
+}
+
+async function resolveWatchWindow() {
+  // 1. the window already in use, if it is still there and still ours
+  const { watchWindowId } = await browser.storage.local.get("watchWindowId");
+  if (watchWindowId != null) {
+    try {
+      await browser.windows.get(watchWindowId);
+      if (await windowIsOurs(watchWindowId)) return { id: watchWindowId, freshlyCreated: false };
+      log("the remembered watch window id", watchWindowId, "is not tagged - it is the user's now, forgetting it");
+    } catch {
+      log("the watch window", watchWindowId, "is gone - starting over");
+    }
+    await browser.storage.local.set({ watchWindowId: null });
+  }
+  // 2. a tagged window that is still around (restore after an unclean shutdown, extension reload)
+  const tagged = await findTaggedWindows();
+  if (tagged.length > 0) return { id: await adoptTaggedWindow(tagged[0]), freshlyCreated: false };
+  // 3. make one - not while Firefox may still be restoring last session's windows
+  if (Date.now() < windowCreateNotBefore) {
+    log("waiting for Firefox's session restore before opening a watch window");
+    if (!graceFollowUpScheduled) {
+      graceFollowUpScheduled = true;
+      setTimeout(async () => {
+        graceFollowUpScheduled = false;
+        const { enabled } = await browser.storage.local.get("enabled");
+        if (enabled) { await serialized(openInventoryIfMissing); await serialized(autoWatchTick); }
+      }, windowCreateNotBefore - Date.now() + 50);
+    }
+    return { id: null, freshlyCreated: false };
+  }
+  try {
+    const win = await browser.windows.create({ type: "normal" }); // blank - navigated below
+    ownWindowIds.add(win.id);
+    userWindowIds.delete(win.id);
+    await tagWindow(win.id);
+    await browser.storage.local.set({ watchWindowId: win.id });
+    const initialTab = win.tabs && win.tabs[0];
+    if (initialTab) {
+      try { await browser.tabs.update(initialTab.id, { url: INVENTORY_URL, active: false }); } catch { /* best-effort */ }
+    }
+    return { id: win.id, freshlyCreated: true };
+  } catch (e) {
+    log("could not create the watch window - nothing is opened until the next tick (never in your window):", e);
+    return { id: null, freshlyCreated: false };
+  }
+}
+
+// Returns { id, freshlyCreated }; id is null when there is no window 2 right now.
+// The single path: concurrent callers (switch-on handler, inventory upkeep,
+// scheduler, flashes) share one in-flight resolution.
+let watchWindowEnsureInFlight = null;
+function getOrCreateWatchWindow() {
+  if (watchWindowEnsureInFlight) return watchWindowEnsureInFlight;
+  watchWindowEnsureInFlight = resolveWatchWindow().finally(() => { watchWindowEnsureInFlight = null; });
+  return watchWindowEnsureInFlight;
+}
+
+// freshlyCreated tells a caller whether the window it got is the one that just had
+// its initial tab navigated to INVENTORY_URL right here - openInventoryIfMissing()
+// relies on that instead of re-querying browser.tabs right after, because whether
+// browser.tabs.query() reflects a just-created/just-navigated tab by the very
+// next call is not guaranteed (produced a real duplicate inventory tab in a live
+// test, 2026-09-04).
+
+// Every tab the extension opens: in window 2, verified right now, or not at all.
+async function createWatchTab(props) {
+  const win = await getOrCreateWatchWindow();
+  if (win.id == null) {
+    log("no watch window yet - not opening", props.url, "(it waits for the next tick; never in your window)");
+    return null;
+  }
+  if (userWindowIds.has(win.id)) {
+    log("refusing to open", props.url, "in window", win.id, "- it is recorded as the user's");
+    return null;
+  }
+  try {
+    await browser.windows.get(win.id);
+  } catch {
+    await browser.storage.local.set({ watchWindowId: null });
+    log("the watch window", win.id, "vanished just before opening", props.url, "- not opening it anywhere else");
+    return null;
+  }
+  return browser.tabs.create({ ...props, windowId: win.id });
+}
+
+// a window that is not ours showed up: remembered as the user's, unless it turns
+// out (a restore may attach its session values a moment later) to carry the tag
+async function reviewNewWindow(id) {
+  if (watchWindowEnsureInFlight || ownWindowIds.has(id)) return; // we are the one creating/adopting it
+  const cfg = await browser.storage.local.get(["enabled", "watchWindowId"]);
+  if (!cfg.enabled) return;
+  let win;
+  try {
+    win = await browser.windows.get(id);
+    win = { ...win, tabs: await browser.tabs.query({ windowId: id }) };
+  } catch { return; }
+  if (win.type && win.type !== "normal") return;
+  if (!(await windowIsTagged(id))) { userWindowIds.add(id); return; }
+  userWindowIds.delete(id);
+  // tagged: ours. Window 2 is missing -> this is it; one exists already -> a leftover
+  let current = null;
+  if (cfg.watchWindowId != null) { try { current = await browser.windows.get(cfg.watchWindowId); } catch { /* gone */ } }
+  if (!current) {
+    log("a tagged watch window came back late:", id);
+    await getOrCreateWatchWindow(); // finds it by its tag
+    await openInventoryIfMissing();
+    await autoWatchTick();
+  } else if (cfg.watchWindowId !== id) {
+    await closeLeftoverTaggedWindow(win);
+  }
+}
+
+browser.windows?.onCreated?.addListener((win) => {
+  if (!win || (win.type && win.type !== "normal")) return;
+  if (!watchWindowEnsureInFlight && !ownWindowIds.has(win.id)) userWindowIds.add(win.id);
+  for (const ms of [0, ...WINDOW_RECHECK_MS]) {
+    setTimeout(() => { serialized(() => reviewNewWindow(win.id)).catch(() => {}); }, ms);
+  }
+});
+
+// window 2 closed: forget it; the next tick opens a new one (a user who closes it
+// is not fought with on the spot)
+browser.windows?.onRemoved?.addListener((id) => {
+  ownWindowIds.delete(id);
+  userWindowIds.delete(id);
+  serialized(async () => {
+    const { watchWindowId } = await browser.storage.local.get("watchWindowId");
+    if (watchWindowId === id) {
+      await browser.storage.local.set({ watchWindowId: null });
+      log("the watch window", id, "was closed - starting over at the next tick");
+    }
+  }).catch(() => {});
+});
+
+// at the start of every tick: a late-restored second tagged window, and the
+// pinned /drops/campaigns tab versions before 0.6.14 left in the watch window
 async function sweepStaleWatchLeftovers() {
   const { watchWindowId } = await browser.storage.local.get("watchWindowId");
-  if (!watchWindowId) return;
-  let closedInventoryWindow = false;
-  for (const w of await findSettledWatchWindowCandidates()) {
+  if (watchWindowId == null) return;
+  // a remembered id is only believed while the window it names is still tagged
+  // (ids are renumbered: it may be the user's window by now)
+  if (!(await windowIsOurs(watchWindowId))) return;
+  let closedWindow = false;
+  for (const w of await findTaggedWindows()) {
     if (w.id === watchWindowId) continue;
-    log("closing a stale watch window", w.id, "(restored from an earlier session)");
-    try { await browser.windows.remove(w.id); closedInventoryWindow = true; } catch { /* already gone */ }
+    if (await closeLeftoverTaggedWindow(w)) closedWindow = true;
   }
   try {
     for (const t of await browser.tabs.query({ windowId: watchWindowId, pinned: true })) {
@@ -528,41 +683,8 @@ async function sweepStaleWatchLeftovers() {
         try { await browser.tabs.remove(t.id); } catch { /* already gone */ }
       }
     }
-  } catch { /* window gone - the next getOrCreateWatchWindow recreates it */ }
-  if (closedInventoryWindow) await openInventoryIfMissing();
-}
-
-let watchWindowCreateInFlight = null;
-async function getOrCreateWatchWindow() {
-  const cfg = await browser.storage.local.get("watchWindowId");
-  if (cfg.watchWindowId) {
-    try {
-      await browser.windows.get(cfg.watchWindowId);
-      return { id: cfg.watchWindowId, freshlyCreated: false };
-    } catch {
-      // closed by the user (or gone) - fall through and make a new one
-    }
-  }
-  if (watchWindowCreateInFlight) return watchWindowCreateInFlight;
-  watchWindowCreateInFlight = (async () => {
-    try {
-      const adopted = await adoptExistingWatchWindow();
-      if (adopted != null) return { id: adopted, freshlyCreated: false };
-      const win = await browser.windows.create({ type: "normal" }); // blank - navigated below
-      await browser.storage.local.set({ watchWindowId: win.id });
-      const initialTab = win.tabs && win.tabs[0];
-      if (initialTab) {
-        try { await browser.tabs.update(initialTab.id, { url: INVENTORY_URL }); } catch { /* best-effort */ }
-      }
-      return { id: win.id, freshlyCreated: true };
-    } catch (e) {
-      log("getOrCreateWatchWindow: could not create a dedicated window, falling back to the current window:", e);
-      return { id: null, freshlyCreated: false };
-    } finally {
-      watchWindowCreateInFlight = null;
-    }
-  })();
-  return watchWindowCreateInFlight;
+  } catch { /* window gone - the next getOrCreateWatchWindow starts over */ }
+  if (closedWindow) await openInventoryIfMissing();
 }
 
 // ============================================================================
@@ -570,15 +692,17 @@ async function getOrCreateWatchWindow() {
 // ============================================================================
 async function openInventoryIfMissing() {
   const tabs = await browser.tabs.query({ url: "*://www.twitch.tv/drops/inventory*" });
-  if (tabs.length === 0) {
-    const { id: watchWindowId, freshlyCreated } = await getOrCreateWatchWindow();
-    if (freshlyCreated) {
-      // its initial tab was already navigated to INVENTORY_URL
-      log("dedicated watch window created with the inventory tab already open");
-    } else {
-      await browser.tabs.create({ url: INVENTORY_URL, active: false, pinned: true, ...(watchWindowId ? { windowId: watchWindowId } : {}) });
-      log("opened inventory tab");
-    }
+  if (tabs.length > 0) return;
+  const { id, freshlyCreated } = await getOrCreateWatchWindow();
+  if (id == null) {
+    log("no watch window yet - the inventory tab waits for the next tick (never opened in your window)");
+    return;
+  }
+  if (freshlyCreated) {
+    // its initial tab was already navigated to INVENTORY_URL
+    log("dedicated watch window created with the inventory tab already open");
+  } else if (await createWatchTab({ url: INVENTORY_URL, active: false, pinned: true })) {
+    log("opened inventory tab");
   }
 }
 
@@ -1083,9 +1207,9 @@ async function autoWatchTick() {
     if (!isParked && openCount >= quota) continue;
     if (watchTabs[game.slug]) continue; // already has a tab
 
-    const { id: watchWindowId } = await getOrCreateWatchWindow();
     const url = game.pinnedChannel ? channelUrl(game.channel) : directoryUrl(game.slug);
-    const tab = await browser.tabs.create({ url, active: false, pinned: true, ...(watchWindowId ? { windowId: watchWindowId } : {}) });
+    const tab = await createWatchTab({ url, active: false, pinned: true });
+    if (!tab) break; // no verified watch window right now: the rest waits for the next tick
     await browser.tabs.update(tab.id, { active: false, muted: true });
     watchTabs[game.slug] = tab.id;
     if (!isParked) openCount++;
@@ -1205,9 +1329,8 @@ async function handleDirectoryUnknownCategory(msg) {
   const found = await new Promise((resolve) => {
     const timer = setTimeout(() => resolve(null), 25_000);
     pendingSlugResolves.set(key, (slug) => { clearTimeout(timer); resolve(slug); });
-    getOrCreateWatchWindow()
-      .then(({ id: watchWindowId }) => browser.tabs.create({ url: searchUrl(gameName), active: false, pinned: true, ...(watchWindowId ? { windowId: watchWindowId } : {}) }))
-      .then((t) => { searchTab = t; })
+    createWatchTab({ url: searchUrl(gameName), active: false, pinned: true })
+      .then((t) => { if (!t) { clearTimeout(timer); resolve(null); } else searchTab = t; })
       .catch((e) => { clearTimeout(timer); log("slug-resolve: could not open search tab:", e); resolve(null); });
   });
   pendingSlugResolves.delete(key);
@@ -1326,7 +1449,7 @@ async function handleChannelPlayingGame(msg, tab) {
 // The latest DOM scan of /drops/inventory's cards and, from the Inventory GQL
 // (inject.js `inventoryCampaigns`), what each campaign is: either may arrive
 // first, so a late snapshot re-judges the scan that is already here.
-let lastInventoryCards = null; // { at, cards }
+let lastInventoryCards = null; // { at, cards, claimed }
 const INVENTORY_REJUDGE_MAX_AGE_MS = 5 * 60 * 1000;
 
 async function handleInventoryCampaigns(signal) {
@@ -1334,7 +1457,7 @@ async function handleInventoryCampaigns(signal) {
   for (const c of signal.campaigns || []) if (c && c.id) byId[c.id] = c;
   await browser.storage.local.set({ inventoryCampaigns: { at: Date.now(), byId } });
   if (lastInventoryCards && Date.now() - lastInventoryCards.at < INVENTORY_REJUDGE_MAX_AGE_MS) {
-    await mergeInventoryProgress(lastInventoryCards.cards);
+    await mergeInventoryProgress(lastInventoryCards.cards, lastInventoryCards.claimed);
   }
 }
 
@@ -1344,13 +1467,14 @@ async function handleInventoryCampaigns(signal) {
 // channel; an entry that owns no card yet simply has no progress - "unknown",
 // never done, and still watched (shared.js: entryOwnsCard). Finished = every
 // owned card complete (aggregateEntryProgress).
-async function mergeInventoryProgress(campaigns) {
+async function mergeInventoryProgress(campaigns, claimedList) {
   // campaigns may legitimately be [] (every watched entry's card is gone from
   // "In Progress") - still need to run so the missing-card reconciliation
   // below gets a chance to fire. Only a genuinely missing/malformed message
   // short-circuits.
   if (!campaigns) return;
-  lastInventoryCards = { at: Date.now(), cards: campaigns };
+  lastInventoryCards = { at: Date.now(), cards: campaigns, claimed: claimedList };
+  const claimedMap = Array.isArray(claimedList) ? new Map(claimedList) : null; // the Claimed section: name -> count
 
   return serialized(async () => {
     const cfg = await browser.storage.local.get([
@@ -1422,22 +1546,44 @@ async function mergeInventoryProgress(campaigns) {
       if (!p || p.allComplete || p.expired || !(p.total > 0)) continue;
 
       if ((p.campaignIds || []).some((id) => metaById[id] && metaById[id].status === "ACTIVE")) {
-        progress[key] = { ...p, missingScans: 0 };
+        // still in progress as far as Twitch says: the card is merely not readable now
+        const { probablyDone, probablyDoneSince, ...rest } = p;
+        progress[key] = { ...rest, missingScans: 0 };
         continue;
       }
 
       const missingScans = (p.missingScans || 0) + 1;
-      if (missingScans >= REQUIRED_MISSING_SCANS) {
-        progress[key] = { ...p, allComplete: true, missingScans: 0, updatedAt: Date.now() };
+      if (missingScans < REQUIRED_MISSING_SCANS) {
+        progress[key] = { ...p, missingScans };
+        continue;
+      }
+
+      // The card is gone (the last tier claimed leaves "In Progress"). Done only
+      // once the Claimed section lists the rewards - that also makes the count
+      // 5/5 instead of the 4/5 of the last reading; if it does not (yet), the
+      // entry is "probably done" and nothing is closed or counted as finished.
+      const check = claimedConfirmsEntry(p, claimedMap);
+      const since = p.probablyDoneSince || Date.now();
+      const inferred = !check.confirmed && Date.now() - since >= PROBABLY_DONE_TIMEOUT_MS;
+      if (check.confirmed || inferred) {
+        const { probablyDone, probablyDoneSince, ...rest } = p;
+        progress[key] = { ...rest, claimed: p.total, allComplete: true, inferredDone: inferred, missingScans: 0, updatedAt: Date.now() };
         if (watchTabs[key]) {
           await closeWatchTab(watchTabs, key);
           delete watchMeta[key];
           delete dropSignals[key];
           anyJustFinished = true;
         }
-        log(key, "card vanished from In Progress across", missingScans, "scans - treating as fully claimed");
+        log(key, check.confirmed
+          ? `card vanished from In Progress and the Claimed section lists all ${p.tierNames.length} reward(s) - confirmed fully claimed (${p.total}/${p.total})`
+          : `card vanished from In Progress ${Math.round((Date.now() - since) / 60_000)} min ago, the Claimed section still lacks ${JSON.stringify(check.missing)} and no card came back - INFERRED fully claimed (not confirmed)`);
       } else {
-        progress[key] = { ...p, missingScans };
+        if (!p.probablyDone) {
+          log(key, "card vanished from In Progress but the Claimed section does not list",
+            check.missing.length ? JSON.stringify(check.missing) : "its rewards (names or Claimed section unavailable)",
+            "- probably done, not confirmed: its tab stays open until the Claimed section shows them or", Math.round(PROBABLY_DONE_TIMEOUT_MS / 60_000), "min pass");
+        }
+        progress[key] = { ...p, missingScans, probablyDone: true, probablyDoneSince: since };
       }
     }
 
@@ -2038,6 +2184,7 @@ async function applyEnabledState(enabled) {
     browser.alarms.create(RELOAD_ALARM, { periodInMinutes: RELOAD_PERIOD_MIN });
     browser.alarms.create(AUTO_OFF_ALARM, { periodInMinutes: AUTO_OFF_PERIOD_MIN });
     browser.alarms.create(AUTO_WATCH_ALARM, { periodInMinutes: AUTO_WATCH_PERIOD_MIN });
+    await serialized(recordUserWindows); // step 1: every window that exists now (and is not tagged) is the user's
     await serialized(openInventoryIfMissing);
     await serialized(autoWatchTick);
   } else {
@@ -2147,7 +2294,7 @@ browser.runtime.onMessage.addListener((msg, sender) => {
       return handleGqlDropSignal(msg, sender.tab);
 
     case "inventoryProgress":
-      return mergeInventoryProgress(msg.campaigns);
+      return mergeInventoryProgress(msg.campaigns, msg.claimed);
 
     case "dropClaimed":
       return handleDropClaimed();

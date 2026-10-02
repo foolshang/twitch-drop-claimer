@@ -67,6 +67,7 @@ function makeSandbox() {
       downloads: { download: () => Promise.resolve(1), search: () => Promise.resolve([]) },
     },
   };
+  require("./window-stubs").attachWindowApis(sandbox.browser, { createTab: (o) => sandbox.browser.tabs.create({ ...o, active: false }) }); // 0.6.19: tabs only open in a verified, tagged watch window
   const ctx = vm.createContext(sandbox);
   vm.runInContext(read("shared.js"), ctx);
   vm.runInContext(read("i18n.js"), ctx);
