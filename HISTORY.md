@@ -3001,3 +3001,10 @@ no second reload. Against 0.6.22 the live-card, badge, explicit-marker, reload/f
 cases fail (the offline-page and sidebar cases are guards that pass there too).
 `pinned-verdict-recovery.test.js` adapted to the 10-minute safety net. `BUILD_MARKER` ->
 `2026-10-03-r2`, `manifest.json` -> 0.6.23 (the listed release will be 0.6.24).
+
+Signed to the UNLISTED channel on 2026-10-03 (`npm run submit`, no
+`--listed`) for testing in the user's real Firefox:
+`web-ext-artifacts/33d37586a96d443fa884-0.6.23.xpi`, built from `aac184b`
+(`BUILD_MARKER` `2026-10-03-r2`); the version is in the local, git-ignored
+`.amo-submitted-versions.json`. Not submitted to the listed channel; the listed
+release will be 0.6.24 (manifest + `BUILD_MARKER` bump only).
