@@ -523,6 +523,7 @@ async function resetStateForNewBrowserSession() {
   } catch { /* no windows API yet: nothing to wait for */ }
   claimBackoff = new Map(); // and every reward's claim backoff (see getClaimBackoff)
   integrityFlag = null; // and Twitch's verdict on the session (see getIntegrityFlag)
+  integrityEpisode = null;
   try { await browser.storage.session.set({ claimBackoff: {}, integrityFlag: null }); } catch { /* best effort */ }
   logLifecycle("new browser session (or the extension was just loaded): forgot remembered watch tab/window ids");
   return true;
@@ -821,17 +822,47 @@ function saveIntegrityFlag() {
   browser.storage.session.set({ integrityFlag: integrityFlag ? { since: integrityFlag.since, op: integrityFlag.op } : null }).catch(() => {});
 }
 
+// A single refusal is not a verdict: real use showed one operation answering
+// "failed integrity check" once and working again a second later (twice in an
+// hour, each time with the session fine). So the first failure only starts an
+// episode; the flag is set - claims stopped, the popup warns - when the failures
+// keep happening past INTEGRITY_CONFIRM_MS, or a SECOND operation fails in the
+// same episode (a really flagged session refuses several at once). Any
+// operation that works again (`dropsOpOk`) ends the episode: logged, nothing else.
+// An episode with no failure for INTEGRITY_EPISODE_GAP_MS is over (the next one
+// is a first blip again). In memory only: a restart starts clean.
+const INTEGRITY_CONFIRM_MS = 60_000;
+const INTEGRITY_EPISODE_GAP_MS = 10 * 60_000;
+let integrityEpisode = null; // { firstAt, lastAt, ops: Set<operationName> }
+
 async function handleIntegritySignal(signal) {
   const flag = await getIntegrityFlag();
   const now = Date.now();
+  const op = signal.operationName || "?";
   if (signal.kind === "integrityFailed") {
     if (flag) { flag.lastAt = now; return; } // already known: no log/storage spam (it fires on every page load, several times)
-    integrityFlag = { since: now, op: signal.operationName || "?", lastAt: now };
+    if (!integrityEpisode || now - integrityEpisode.lastAt > INTEGRITY_EPISODE_GAP_MS) {
+      integrityEpisode = { firstAt: now, lastAt: now, ops: new Set([op]) };
+      log(`Twitch refused ${op} with "failed integrity check" - first failure, not acting on it unless it keeps happening (over ${INTEGRITY_CONFIRM_MS / 1000} s) or a second operation fails too`);
+      return;
+    }
+    integrityEpisode.lastAt = now;
+    integrityEpisode.ops.add(op);
+    const spanMs = now - integrityEpisode.firstAt;
+    if (spanMs <= INTEGRITY_CONFIRM_MS && integrityEpisode.ops.size < 2) return; // the same blip repeating (every page load does)
+    const why = integrityEpisode.ops.size >= 2 ? `${integrityEpisode.ops.size} operations refused` : `still failing after ${Math.round(spanMs / 1000)} s`;
+    const firstOp = [...integrityEpisode.ops][0];
+    integrityEpisode = null;
+    integrityFlag = { since: now, op: firstOp, lastAt: now };
     saveIntegrityFlag();
-    log(`Twitch refused ${integrityFlag.op} with "failed integrity check" - this session looks flagged for Drops. Auto-claim is stopped in every tab; clear twitch.tv cookies and log in again`);
+    log(`Twitch refused ${firstOp} with "failed integrity check" (${why}) - this session looks flagged for Drops. Auto-claim is stopped in every tab; clear twitch.tv cookies and log in again`);
     return;
   }
   // dropsOpOk
+  if (integrityEpisode) {
+    log(`transient integrity failure - ignored (${[...integrityEpisode.ops].join(", ")} failed and ${op} works again after ${Math.round((now - integrityEpisode.firstAt) / 1000)} s)`);
+    integrityEpisode = null;
+  }
   if (!flag) return;
   integrityFlag = null;
   saveIntegrityFlag();
@@ -1953,14 +1984,19 @@ async function flashPinnedTabOnceLive(tabId, channel) {
 // script dying - and a reload works even on an already-discarded tab (it
 // fully reconstructs it, not a no-op against dead content).
 //
-// pinnedTabState: tabId -> { offlineTicks, lastHeartbeatAt }. In-memory only
+// pinnedTabState: tabId -> { offlineTicks, lastHeartbeatAt, offlineStep }. In-memory only
 // (like lastPlaybackFlashAt above) - lost on an extension reload/restart,
 // which is fine: the next status report (or the safety-net sweep once one
 // arrives) rebuilds it, and one spurious extra reload right after a restart
 // is harmless.
 const pinnedTabState = new Map();
-// routine reload cadence while a pinned channel's page keeps showing offline
-const PINNED_OFFLINE_RELOAD_TICKS = 3;
+// Routine reload cadence while a pinned channel's page keeps showing offline: a
+// growing interval per channel (in 60 s status ticks = minutes), the last step
+// repeating, back to the first when the channel is seen live. A channel that is
+// offline for hours is not reloaded every 3 minutes (4 channels = ~80 reloads an
+// hour was too much automated activity); the sidebar-live hint below still
+// reloads at once, so going live is caught quickly.
+const PINNED_OFFLINE_RELOAD_SCHEDULE_TICKS = [3, 6, 10, 15];
 // a status report (including "still loading/gated", live===null) counts as
 // proof of life; this is the safety net for when NO report arrives at all -
 // generously longer than PINNED_OFFLINE_RELOAD_TICKS*60s so it only fires for
@@ -1978,11 +2014,14 @@ async function getPinnedGameForTab(tabId) {
   return game && game.pinnedChannel ? game : null;
 }
 
-async function reloadPinnedTab(tabId, channel, reason) {
+// `logState`: the state this reload belongs to for logOnChange (one line when it
+// changes, one summary per 15 min while it repeats)
+async function reloadPinnedTab(tabId, channel, reason, logState = "reload") {
   if (Date.now() - (lastPinnedReloadAt.get(tabId) || 0) < PINNED_RELOAD_MIN_GAP_MS) return;
   lastPinnedReloadAt.set(tabId, Date.now());
-  pinnedTabState.set(tabId, { offlineTicks: 0, lastHeartbeatAt: Date.now() });
-  log("pinned channel", channel, "-", reason, "- reloading its tab");
+  const prev = pinnedTabState.get(tabId);
+  pinnedTabState.set(tabId, { offlineTicks: 0, lastHeartbeatAt: Date.now(), offlineStep: (prev && prev.offlineStep) || 0 });
+  logOnChange(`pinned-live:${channel}`, logState, "pinned channel", channel, "-", reason, "- reloading its tab");
   try { await browser.tabs.reload(tabId); } catch (e) { log("reloadPinnedTab: tab already gone", tabId, e); }
 }
 
@@ -1991,11 +2030,12 @@ async function handlePinnedChannelStatus(msg, tab) {
   const game = await getPinnedGameForTab(tab.id);
   if (!game) return; // not (or no longer) a tracked pinned-channel tab
 
-  const state = pinnedTabState.get(tab.id) || { offlineTicks: 0, lastHeartbeatAt: 0 };
+  const state = pinnedTabState.get(tab.id) || { offlineTicks: 0, lastHeartbeatAt: 0, offlineStep: 0 };
   state.lastHeartbeatAt = Date.now();
 
   if (msg.live === true) {
     state.offlineTicks = 0;
+    state.offlineStep = 0; // live again: the next offline spell starts at the short interval
     pinnedTabState.set(tab.id, state);
     await flashPinnedTabOnceLive(tab.id, msg.channel);
     return;
@@ -2004,9 +2044,14 @@ async function handlePinnedChannelStatus(msg, tab) {
     state.offlineTicks++;
     pinnedTabState.set(tab.id, state);
     if (msg.sidebarLive) {
-      await reloadPinnedTab(tab.id, msg.channel, "is live in the sidebar but this page still shows offline");
-    } else if (state.offlineTicks >= PINNED_OFFLINE_RELOAD_TICKS) {
-      await reloadPinnedTab(tab.id, msg.channel, "still offline - reloading to catch it going live");
+      await reloadPinnedTab(tab.id, msg.channel, "is live in the sidebar but this page still shows offline", "sidebar-live");
+    } else {
+      const steps = PINNED_OFFLINE_RELOAD_SCHEDULE_TICKS;
+      const due = steps[Math.min(state.offlineStep || 0, steps.length - 1)];
+      if (state.offlineTicks >= due) {
+        state.offlineStep = (state.offlineStep || 0) + 1;
+        await reloadPinnedTab(tab.id, msg.channel, `still offline (next check in ${steps[Math.min(state.offlineStep, steps.length - 1)]} min) - reloading to catch it going live`, "offline-reload");
+      }
     }
     return;
   }
@@ -2035,7 +2080,7 @@ async function sweepStalePinnedHeartbeats() {
     if (!state) { pinnedTabState.set(tabId, { offlineTicks: 0, lastHeartbeatAt: now }); continue; }
     if (now - state.lastHeartbeatAt > PINNED_HEARTBEAT_TIMEOUT_MS) {
       const idleMin = Math.round((now - state.lastHeartbeatAt) / 60000);
-      await reloadPinnedTab(tabId, game.channel, `stopped reporting entirely (tab likely discarded) for ${idleMin} min`);
+      await reloadPinnedTab(tabId, game.channel, `stopped reporting entirely (tab likely discarded) for ${idleMin} min`, "no-heartbeat");
     }
   }
 }

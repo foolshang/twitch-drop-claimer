@@ -2682,6 +2682,51 @@ warning as before, no last claim, no reminder; an older Claimed entry of the sam
 no evidence; popup wiring and 9-language texts. `integrity-signals.test.js` adapted: the
 stop now happens at the verdict. Against 0.6.19 + the A/B/C commit the new cases fail.
 
+**Also in 0.6.20, from the next real report (issue #9, v0.6.19):**
+
+*Pinned channels were reloaded every 3 minutes while offline* - four offline pinned
+channels = 22 reloads each in 64 minutes (~80 an hour), too much automated activity,
+and 88 identical log lines. Now the interval grows per channel: 3, 6, 10, then 15
+minutes (capped); it resets to 3 when the channel is seen live. Unchanged: the
+sidebar-live hint (`sidebarLive`) reloads at once (still within the 2-minute minimum
+gap between reloads of one tab), and the heartbeat safety net. The reload line goes
+through `logOnChange` with the live/flash lines of that channel (one line when it
+changes, a `[summary]` every 15 minutes). 8 hours offline = ~33 reloads instead of 160.
+
+*An integrity blip was taken for a flagged session* - twice in the report one operation
+(`DropsInventoryRewardGroupStatus`, `ViewerDropsDashboard`) answered "failed integrity
+check" and worked again within a second (the session was fine); each time the flag
+was set and claiming stopped for that moment. Now the first failure only opens an
+episode (one log line); the flag is set - claiming stopped, popup warns - only when
+failures continue for over 60 s, or a second, different operation fails in the same
+episode. Any Drops operation that works again ends the episode with one line
+`transient integrity failure - ignored (...)`; an episode with no failure for 10 minutes
+is over (a later blip starts fresh); the same operation repeating inside 60 s (a page load
+fires it several times) is still one blip. The flag keeps the first operation's name.
+Risk: a really flagged session that refuses only ONE operation, and does so rarely, is
+flagged at the first failure after 60 s from the first - a little later than before
+(claims in the meantime are subject to the normal backoff). The cause of the blips was
+not looked for (looks transient on Twitch's side).
+
+*Issue #9 check - were the four pinned channels really offline?* From the log: every
+status report of all four pages (14:20-15:24 UTC, 22 reloads each, the first at 14:20)
+said offline (`live === false`); there is no "went live" / "is live in the sidebar" line
+for any of them. They also never reached "resolved to game", which is why the
+`[verify]` line stayed at "no fresh inventory reading" for the whole hour: a pinned
+channel's progress is keyed by the game it plays, and an offline channel has none. So
+nothing shows a channel that was live yet produced no reading. What the log cannot
+show: whether a page that SAID offline really was (it only has the page's own check; a
+live channel mis-read as offline and not in the sidebar would look the same).
+Not treated as a bug; nothing changed for it.
+
+**Tests (this part):** new `pinned-reload-schedule.test.js` (growing intervals 3/6/10/15
+and the cap, the sidebar hint reloads at once, live resets the schedule, the reload line
+logged once + summaries); `integrity-signals.test.js`: one recovering blip = no flag,
+claiming goes on, one "ignored" line; the same operation repeating inside 60 s = no flag;
+failures past 60 s = flag as before; a second operation = flag at once; an old blip does
+not add to a new one. The existing flag tests now confirm with two operations. Against the
+previous background.js the new cases fail.
+
 `BUILD_MARKER` -> `2026-10-02-r5`, `manifest.json` -> 0.6.20. NOT covered: the "2 display
 bugs" the request mentions for this version were not described in it, so they are not
 in this change.

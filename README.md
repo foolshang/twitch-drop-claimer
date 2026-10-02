@@ -44,7 +44,10 @@ another channel if it's offline, and is never rotated/blocklisted for
 stalled drop progress the way an auto-picked channel would be. It shares
 the same priority-ordered list and tab quota as game entries, and may sit
 next to a game entry for the very game the channel plays ("Rust" +
-"@streamer"): each has its own tab and its own progress.
+"@streamer"): each has its own tab and its own progress. While a pinned channel
+is offline its page is reloaded on a growing interval (3, 6, 10, then every 15
+minutes; back to 3 once it has been seen live); a channel the Twitch sidebar shows
+as live while the page still says offline is reloaded at once.
 
 Progress is tracked per campaign, not per game. A game can have a general
 campaign for everybody and many that only count on named channels (their
@@ -193,7 +196,9 @@ a copied `cookies.sqlite`. Automated/debugged Firefox sessions may carry
 signals Twitch can use to flag a session (suspected, not proven), and a flagged
 session loses Drops for the account (seen 2026-09-30: `failed integrity check`
 on every Drops-only operation until the twitch.tv cookies were cleared and the
-user logged in again). If live testing is needed, use a **separate Twitch test account** in a
+user logged in again; one operation failing once and working again a second later
+is treated as a blip and ignored - the extension only stops claiming and warns when
+failures continue for over a minute or a second operation fails too). If live testing is needed, use a **separate Twitch test account** in a
 fresh profile - never someone's real one. Everything the extension does can be
 checked with the fake-DOM / fake-clock tests below.
 

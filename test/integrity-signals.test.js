@@ -156,6 +156,12 @@ async function testClaimRequestsAreNumberedInRequestOrder() {
 const gqlSignal = (operationName, kind, extra = {}) => ({ type: "gqlDropSignal", operationName, signal: { kind, operationName, ...extra }, at: 0 });
 const integrityFailed = (op = "ViewerDropsDashboard") => gqlSignal(op, "integrityFailed");
 const dropsOpOk = (op = "ViewerDropsDashboard") => gqlSignal(op, "dropsOpOk");
+// a really flagged session refuses several operations at once: that confirms it straight away
+// (one operation failing once is only a blip - see the transient-failure tests below)
+const flagIntegrity = async (bg, tabId = 1) => {
+  await bg.send(integrityFailed("ViewerDropsDashboard"), tabId);
+  await bg.send(integrityFailed("DropsInventoryRewardGroupStatus"), tabId);
+};
 
 async function testIntegrityFailureStopsClaimingEverywhereAtOnce() {
   const clock = makeClock();
@@ -168,21 +174,21 @@ async function testIntegrityFailureStopsClaimingEverywhereAtOnce() {
     tabs.push(tab);
   }
   // Twitch refuses the campaign list; nothing has been claimed or failed yet (no backoff has started)
-  await bg.send(integrityFailed(), 9);
+  await flagIntegrity(bg, 9);
   assert.strictEqual(bg.entry(K("Rust Isles Boots")), undefined, "no per-reward state involved");
   await run(tabs, 90 * SEC);
   assert.strictEqual(clickLog.length, 0, "three tabs, 90 s: not one click");
   assert.strictEqual((await bg.send({ type: "claimAsk", key: "anything else" })).reason, "integrity", "any reward is refused, not just the ones seen");
 
   assert.ok(bg.session.integrityFlag && bg.session.integrityFlag.op === "ViewerDropsDashboard", "flag in storage.session for the popup");
-  const lines = bg.logLines().filter((l) => /failed integrity check/.test(l));
+  const lines = bg.logLines().filter((l) => /failed integrity check/.test(l) && /flagged/.test(l));
   assert.strictEqual(lines.length, 1, "one clear log line: " + lines.join(" | "));
   assert.ok(/flagged/.test(lines[0]) && /clear twitch\.tv cookies and log in again/.test(lines[0]) && /stopped in every tab/.test(lines[0]));
 
   // it fires again on every page load, several times: no log/storage spam, flag unchanged
   const since = bg.session.integrityFlag.since;
   for (let i = 0; i < 5; i++) await bg.send(integrityFailed("DropsInventoryRewardGroupStatus"), 2);
-  assert.strictEqual(bg.logLines().filter((l) => /failed integrity check/.test(l)).length, 1);
+  assert.strictEqual(bg.logLines().filter((l) => /failed integrity check/.test(l) && /flagged/.test(l)).length, 1);
   assert.strictEqual(bg.session.integrityFlag.since, since);
   assert.ok(!bg.local.claimHealth, "an integrity refusal is not a claim failure: the streak is untouched");
   console.log("  OK  integrityFailed: no claim in any tab at once, one log line, flag in storage.session, streak untouched");
@@ -214,7 +220,7 @@ async function testFlagClearsWhenADropsOperationWorksAgain() {
     clock.advanceTo(clock.now + 20 * MIN);
   }
   assert.strictEqual(bg.entry("Boots").stop, true);
-  await bg.send(integrityFailed());
+  await flagIntegrity(bg);
   assert.strictEqual((await bg.send({ type: "claimAsk", key: "Boots" })).allowed, false);
 
   await bg.send(gqlSignal("Inventory", "gameIds", { games: [{ id: "1", name: "Rust" }] }), 1); // Inventory answering says nothing about integrity
@@ -238,7 +244,7 @@ async function testANewBrowserSessionClearsTheFlag() {
   // within one browser session a reloaded background page reads the flag back
   const session = { tdcSessionStarted: 1 };
   const bg1 = await makeBackground({ clock, session });
-  await bg1.send(integrityFailed(), 1);
+  await flagIntegrity(bg1, 1);
   const bg2 = await makeBackground({ clock, session });
   assert.strictEqual((await bg2.send({ type: "claimAsk", key: "Boots" })).reason, "integrity", "still flagged after a background reload");
   console.log("  OK  a new browser session clears the flag; a background reload inside a session keeps it");
@@ -250,7 +256,7 @@ async function testTabsResumeAfterTheFlagClears() {
   const clickLog = [];
   const tab = await openTab({ clock, bg, id: 1, clickLog });
   claimButton(tab, "Boots");
-  await bg.send(integrityFailed(), 1);
+  await flagIntegrity(bg, 1);
   await run([tab], 60 * SEC);
   assert.strictEqual(clickLog.length, 0);
   await bg.send(dropsOpOk("ViewerDropsDashboard"), 1);
@@ -328,6 +334,76 @@ async function testConnectingTheAccountResumesTheReward() {
   console.log("  OK  once the campaigns data says the account is connected the reward is claimed again");
 }
 
+
+// ---- a blip is not a verdict ---------------------------------------------------------------------
+// Real use (issue #9): one operation said "failed integrity check" once and worked again a second later,
+// twice in an hour, the session fine. That must not stop claiming or warn in the popup.
+async function testASingleBlipThatRecoversIsIgnored() {
+  const clock = makeClock();
+  const bg = await makeBackground({ clock });
+  const clickLog = [];
+  const tab = await openTab({ clock, bg, id: 1, clickLog });
+  const btn = claimButton(tab, "Boots", { onClick: (b) => removeButton(tab, b) });
+
+  await bg.send(integrityFailed("DropsInventoryRewardGroupStatus"), 1);
+  assert.ok(!bg.session.integrityFlag, "no flag on one failure");
+  assert.strictEqual((await bg.send({ type: "claimAsk", key: "something" })).allowed, true, "claiming is not stopped");
+  clock.advanceTo(clock.now + 700); // recovers within a second
+  await bg.send(dropsOpOk("DropsInventoryRewardGroupStatus"), 1);
+  assert.ok(!bg.session.integrityFlag, "still no flag");
+  await run([tab], 20 * SEC);
+  assert.strictEqual(btn.clicks, 1, "the claim went ahead");
+  const ignored = bg.logLines().filter((l) => /transient integrity failure - ignored/.test(l));
+  assert.strictEqual(ignored.length, 1, "one line says it was ignored: " + bg.logLines().filter((l) => /integrity/.test(l)).join(" | "));
+  assert.ok(!bg.logLines().some((l) => /flagged for Drops/.test(l)), "never called the session flagged");
+  assert.ok(!bg.local.claimHealth || !bg.local.claimHealth.streak, "streak untouched");
+  console.log("  OK  one integrity blip that recovers: no flag, claiming goes on, one 'transient ... ignored' line");
+}
+
+async function testTheSameOperationRepeatingWithinAMinuteIsStillABlip() {
+  const clock = makeClock();
+  const bg = await makeBackground({ clock });
+  for (let i = 0; i < 6; i++) { await bg.send(integrityFailed("ViewerDropsDashboard"), 1); clock.advanceTo(clock.now + 8 * SEC); } // a page load fires it several times
+  assert.ok(!bg.session.integrityFlag, "the same operation inside 60 s is one blip");
+  console.log("  OK  the same operation failing repeatedly inside 60 s does not flag the session");
+}
+
+async function testFailuresThatKeepGoingPastAMinuteFlagTheSession() {
+  const clock = makeClock();
+  const bg = await makeBackground({ clock });
+  await bg.send(integrityFailed("DropsPage_ClaimDropRewards"), 1);
+  clock.advanceTo(clock.now + 30 * SEC);
+  await bg.send(integrityFailed("DropsPage_ClaimDropRewards"), 1);
+  assert.ok(!bg.session.integrityFlag, "30 s in: not yet");
+  clock.advanceTo(clock.now + 35 * SEC); // 65 s since the first failure, no recovery in between
+  await bg.send(integrityFailed("DropsPage_ClaimDropRewards"), 1);
+  assert.ok(bg.session.integrityFlag, "past 60 s of failures: flagged as before");
+  assert.strictEqual((await bg.send({ type: "claimAsk", key: "anything" })).reason, "integrity");
+  assert.ok(bg.logLines().some((l) => /flagged for Drops/.test(l) && /still failing after 65 s/.test(l)));
+  console.log("  OK  failures that keep happening past 60 s flag the session as before");
+}
+
+async function testASecondOperationConfirmsAtOnce() {
+  const clock = makeClock();
+  const bg = await makeBackground({ clock });
+  await bg.send(integrityFailed("ViewerDropsDashboard"), 1);
+  assert.ok(!bg.session.integrityFlag);
+  clock.advanceTo(clock.now + 2 * SEC);
+  await bg.send(integrityFailed("Inventory"), 1);
+  assert.ok(bg.session.integrityFlag, "two different operations refused: flagged without waiting");
+  console.log("  OK  two separate operations refused in a row flag the session at once");
+}
+
+async function testABlipThenALaterBlipAreSeparateEpisodes() {
+  const clock = makeClock();
+  const bg = await makeBackground({ clock });
+  await bg.send(integrityFailed("ViewerDropsDashboard"), 1); // never recovers visibly (no ok signal came)...
+  clock.advanceTo(clock.now + 11 * MIN); // ...but nothing failed for 11 minutes: that episode is over
+  await bg.send(integrityFailed("ViewerDropsDashboard"), 1);
+  assert.ok(!bg.session.integrityFlag, "an old blip does not combine with a new one");
+  console.log("  OK  a blip long ago does not add up with a new one");
+}
+
 // ---- popup wiring ---------------------------------------------------------------------
 function testPopupWiring() {
   const html = read("popup.html"), js = read("popup.js");
@@ -357,6 +433,11 @@ function testPopupWiring() {
     await testFlagClearsWhenADropsOperationWorksAgain();
     await testANewBrowserSessionClearsTheFlag();
     await testTabsResumeAfterTheFlagClears();
+    await testASingleBlipThatRecoversIsIgnored();
+    await testTheSameOperationRepeatingWithinAMinuteIsStillABlip();
+    await testFailuresThatKeepGoingPastAMinuteFlagTheSession();
+    await testASecondOperationConfirmsAtOnce();
+    await testABlipThenALaterBlipAreSeparateEpisodes();
     await testAccountNotLinkedStopsOnlyThatReward();
     await testConnectingTheAccountResumesTheReward();
     testPopupWiring();
