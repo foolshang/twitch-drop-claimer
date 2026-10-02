@@ -2932,3 +2932,10 @@ and takeover cases fail (the whole-path case passes there - that path was fine).
 `pinned-offline-badge.test.js`: live-unknown shows as watching. `inventory-parse.test.js`: the
 End Date year. `BUILD_MARKER` -> `2026-10-03-r1`, `manifest.json` -> 0.6.22 (the listed release
 will be 0.6.23).
+
+Signed to the UNLISTED channel on 2026-10-03 (`npm run submit`, no
+`--listed`) for testing in the user's real Firefox:
+`web-ext-artifacts/33d37586a96d443fa884-0.6.22.xpi`, built from `3c8d91e`
+(`BUILD_MARKER` `2026-10-03-r1`); the version is in the local, git-ignored
+`.amo-submitted-versions.json`. Not submitted to the listed channel; the listed
+release will be 0.6.23 (manifest + `BUILD_MARKER` bump only).
