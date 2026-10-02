@@ -227,12 +227,24 @@
     return !!(claim && claim.isUserAccountConnected === false);
   }
 
+  // The claim response's own status, when it has one (shape not captured yet - see
+  // HISTORY 0.6.20): forwarded with the signal so a bug report shows it, and read
+  // as "claimed" only when it says so in as many words (e.g. ..._ALREADY_CLAIMED).
+  function claimStatus(body) {
+    const claim = body && body.data && body.data.claimDropRewards;
+    return claim && typeof claim.status === "string" ? claim.status : null;
+  }
+  const statusSaysClaimed = (st) => !!st && /CLAIMED/i.test(st) && !/NOT[_ ]?CLAIMED|UNCLAIMED/i.test(st);
+
   const INTEGRITY_EXTRACTORS = {
     ViewerDropsDashboard: integrityOrOk(true),
     DropsInventoryRewardGroupStatus: integrityOrOk(true),
     Inventory: integrityOrOk(false),
     DropsPage_ClaimDropRewards(body) {
-      if (claimNotLinked(body)) return { kind: "claimNotLinked" };
+      if (claimNotLinked(body)) {
+        const status = claimStatus(body);
+        return { kind: "claimNotLinked", status, claimed: statusSaysClaimed(status) };
+      }
       return integrityOrOk(true)(body);
     },
   };

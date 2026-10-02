@@ -881,12 +881,31 @@ async function handleClaimNotLinked(msg) {
   log(`claim needs a linked game account - not retrying "${key}"${msg.game ? ` (${msg.game})` : ""} this session; connect it on the campaigns page`);
 }
 
+// Twitch accepted a claim but said the game account is not connected (content.js
+// saw the reward in the Claimed list / its button gone): the reward is claimed on
+// Twitch and will not arrive in-game until the account is linked. A reminder for
+// the popup (storage.local `claimLinkReminders`) - nothing is stopped, and the
+// claim itself was reported as a success (claimResult ok) by content.js.
+async function handleClaimLinkReminder(msg) {
+  const key = String(msg.key || "");
+  if (!key) return;
+  const { claimLinkReminders } = await browser.storage.local.get("claimLinkReminders");
+  const list = Array.isArray(claimLinkReminders) ? claimLinkReminders.filter((e) => e && e.key !== key) : [];
+  list.push({ key, game: msg.game ? String(msg.game) : null, reward: msg.reward ? String(msg.reward) : null });
+  await browser.storage.local.set({ claimLinkReminders: list.slice(-20) });
+  log(`claimed ${msg.reward ? `"${msg.reward}"` : `"${key}"`}${msg.game ? ` (${msg.game})` : ""}, but the game account is not linked - it will not arrive in-game until it is linked on the campaigns page`);
+}
+
 // ViewerDropsDashboard says which games have a connected account: those
-// rewards can be claimed again
+// rewards can be claimed again, and the reminders for them are done
 async function clearNotLinkedForConnectedGames(games) {
+  const connected = new Set((games || []).filter((g) => g && g.accountConnected).map((g) => String(g.name)));
+  const { claimLinkReminders } = await browser.storage.local.get("claimLinkReminders");
+  if (Array.isArray(claimLinkReminders) && claimLinkReminders.some((e) => e && e.game && connected.has(e.game))) {
+    await browser.storage.local.set({ claimLinkReminders: claimLinkReminders.filter((e) => !(e && e.game && connected.has(e.game))) });
+  }
   const { claimNotLinked } = await browser.storage.local.get("claimNotLinked");
   if (!Array.isArray(claimNotLinked) || claimNotLinked.length === 0) return;
-  const connected = new Set((games || []).filter((g) => g && g.accountConnected).map((g) => String(g.name)));
   const gone = claimNotLinked.filter((e) => e && e.game && connected.has(e.game));
   if (gone.length === 0) return;
   const map = await getClaimBackoff();
@@ -2363,6 +2382,9 @@ browser.runtime.onMessage.addListener((msg, sender) => {
 
     case "claimNotLinked":
       return handleClaimNotLinked(msg);
+
+    case "claimLinkReminder":
+      return handleClaimLinkReminder(msg);
 
     case "claimResult":
       return handleClaimResult(msg);

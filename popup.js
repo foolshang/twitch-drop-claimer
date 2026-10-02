@@ -72,6 +72,7 @@ const $allDoneBanner = document.getElementById("allDoneBanner");
 const $claimWarning = document.getElementById("claimWarning");
 const $integrityWarning = document.getElementById("integrityWarning");
 const $notLinkedWarnings = document.getElementById("notLinkedWarnings");
+const $linkReminders = document.getElementById("linkReminders");
 const $sleepWarning = document.getElementById("sleepWarning");
 const $watchingChannel = document.getElementById("watchingChannel");
 const $watchingChannelHint = document.getElementById("watchingChannelHint");
@@ -408,7 +409,7 @@ async function renderGameStatus() {
   const cfg = await browser.storage.local.get([
     "watchList", "autoWatchEnabled", "watchPhase", "watchTabs",
     "invalidSlugs", "campaignProgress", "priorityMode", "emptyUntil",
-    "openCampaigns", "gameWaitUntil", "claimHealth", "claimNotLinked",
+    "openCampaigns", "gameWaitUntil", "claimHealth", "claimNotLinked", "claimLinkReminders",
   ]);
   const watchList = cfg.watchList || [];
   const openCampaigns = cfg.openCampaigns || null;
@@ -447,6 +448,20 @@ async function renderGameStatus() {
     link.addEventListener("click", () => browser.tabs.create({ url: "https://www.twitch.tv/drops/campaigns" }));
     box.append(link);
     $notLinkedWarnings.append(box);
+  }
+  // a claim Twitch accepted whose game account is not linked: claimed, but it will not arrive in-game
+  $linkReminders.replaceChildren();
+  for (const e of Array.isArray(cfg.claimLinkReminders) ? cfg.claimLinkReminders : []) {
+    const box = document.createElement("div");
+    box.className = "claim-warning";
+    box.append(t("claim_link_reminder", { game: e.game || "Twitch", reward: e.reward || e.key }));
+    const link = document.createElement("button");
+    link.type = "button";
+    link.className = "link";
+    link.textContent = t("claim_open_campaigns");
+    link.addEventListener("click", () => browser.tabs.create({ url: "https://www.twitch.tv/drops/campaigns" }));
+    box.append(link);
+    $linkReminders.append(box);
   }
   // Firefox has no way for an extension to keep the machine awake (no
   // browser.power API, and Screen Wake Lock API rejects on a background tab
@@ -646,7 +661,7 @@ browser.storage.onChanged.addListener((changes, area) => {
     changes.watchList || changes.watchTabs || changes.autoWatchEnabled ||
     changes.watchPhase || changes.invalidSlugs || changes.campaignProgress ||
     changes.priorityMode || changes.emptyUntil ||
-    changes.openCampaigns || changes.gameWaitUntil || changes.claimHealth || changes.claimNotLinked
+    changes.openCampaigns || changes.gameWaitUntil || changes.claimHealth || changes.claimNotLinked || changes.claimLinkReminders
   ) {
     renderGameStatus();
   }

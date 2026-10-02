@@ -2624,3 +2624,64 @@ Signed to the UNLISTED channel on 2026-10-02 (`npm run submit`, no
 `.amo-submitted-versions.json`. Not submitted to the listed channel. AMO does
 not allow reusing a version number, so if the test goes well the same code
 ships to listed as 0.6.20 (manifest + `BUILD_MARKER` bump only).
+
+## 0.6.20 - "game account not connected" after an accepted claim is a success, not a refusal
+
+**Problem (reported from real 0.6.19 use):** the popup warned that the claim of
+"Ammo Selection Pack Lv.4" was blocked because the game account is not linked, and
+claiming that reward stopped for the session - yet the inventory's Claimed list showed
+"Ammo Selection Pack Lv.4 - 3 minutes ago" and "Armament Voucher - 35 minutes ago" (both
+after installing 0.6.19), with Twitch's own "connect" button under them. Twitch had
+ACCEPTED the claim and then said "Connect your Twitch and game accounts to receive this
+reward in game": claimed on Twitch, undeliverable in-game until the account is linked.
+0.6.16 (account-link handling) read that answer, which was only ever guessed at, as a
+refusal: the reward was stopped, the "blocked" warning shown, and "Last claimed" and the
+backoff reset were skipped.
+
+**Fix:** the answer alone decides nothing any more. content.js only notes that Twitch
+sent it (`notLinkedSeen`), and judges at the verdict (12 s after the click) from what the
+page shows - never from the error text:
+- ACCEPTED when the reward's name appears in the Claimed list more often than before the
+  click (`extractClaimedCounts`; the count is read BEFORE the click, an earlier entry
+  with the same name proves nothing), or its claim button is gone, or the response's own
+  status says "claimed" (`status` is forwarded by inject.js and read only when it contains
+  CLAIMED, never NOT_CLAIMED/UNCLAIMED): a success - last claim recorded, `claimResult ok`
+  (backoff reset, claiming not stopped) - plus a reminder (`claimLinkReminder` ->
+  storage.local `claimLinkReminders`, popup `claim_link_reminder` in 9 languages: "<game> -
+  claimed <reward>, but your game account is not linked yet, so it won't arrive in-game -
+  link it on the campaigns page", with the campaigns link). The reminder goes away when
+  ViewerDropsDashboard says the game's account is connected.
+- REFUSED when the reward is not in Claimed and the button is still there: unchanged - the
+  reward stops for the session and the "blocked" warning shows (`claimNotLinked`); not
+  counted toward the failure streak nor the integrity warning.
+The game name is read from the card at click time (a claimed card may be gone by the
+verdict). A consequence: a refusal now stops the reward at the verdict (12 s), not at the
+answer; the reward is not re-clicked in between (its verdict is pending).
+
+**The real response shape is still not captured.** The claim answer is recognised as
+before - a loose match of the error message/code, or `claimDropRewards.isUserAccountConnected
+=== false` - and its `status` string is now forwarded and logged so the next bug report
+shows it; the decision uses the page, not the shape. To capture it yourself: DevTools >
+Network on /drops/inventory, tick "Persist Logs", claim a reward of a game whose account
+is not linked, filter `gql`, find the request whose Payload has `DropsPage_ClaimDropRewards`,
+and copy only its Request payload and Response (no headers, no cookies).
+
+**Not verified live** (README rule: no live tests with a real session): that the Claimed
+list shows the reward within 12 s of the click is not guaranteed - the "button gone" arm
+covers a slow list, and a reward whose button stays and whose Claimed entry arrives late
+would be treated as refused (the reward stops for the session; the Claimed list and the
+inventory reload then show it, but the popup warning would be wrong until the account is
+linked or the browser restarts). The status wording (`...CLAIMED`) is a guess.
+
+**Tests:** new `claim-link-accepted.test.js` (jsdom with a real Claimed section + the real
+background): claim + "not linked" answer + reward appears in Claimed = success, last
+claim recorded, no backoff, a reminder with game and reward, claiming not stopped;
+the button gone alone and a "claimed" status alone are accepted; the reminder clears
+when the account is connected; not in Claimed with the button still there = stopped +
+warning as before, no last claim, no reminder; an older Claimed entry of the same name is
+no evidence; popup wiring and 9-language texts. `integrity-signals.test.js` adapted: the
+stop now happens at the verdict. Against 0.6.19 + the A/B/C commit the new cases fail.
+
+`BUILD_MARKER` -> `2026-10-02-r5`, `manifest.json` -> 0.6.20. NOT covered: the "2 display
+bugs" the request mentions for this version were not described in it, so they are not
+in this change.

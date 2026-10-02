@@ -153,10 +153,11 @@
   const awaitingClaimVerify = new Set(); // reward keys clicked by THIS tab, verdict pending
   const claimVerifyTimeoutIds = new Set();
   let claimScanBusy = false; // a scan is waiting for background.js's answers
-  const awaitingClaimBtn = new Map(); // reward key -> the button clicked (to find its game)
+  const awaitingClaimBtn = new Map(); // reward key -> the button clicked
+  const claimBaseline = new Map(); // reward key -> { name, before, gameId }: what the page showed when we clicked
   const unmatchedClicks = []; // { key, at }: our clicks whose claim request inject.js has not reported yet
   const claimKeyBySeq = new Map(); // inject.js's claim request number -> reward key
-  const notLinkedKeys = new Set(); // rewards whose claim was refused: the game account is not connected
+  const notLinkedSeen = new Map(); // reward key -> { claimed }: Twitch answered "game account not connected" (decided at the verdict)
 
   function sendClaimMessage(msg) {
     try { return browser.runtime.sendMessage(msg); } catch (e) { return Promise.reject(e); }
@@ -223,13 +224,23 @@
     return `claim:${label}#${Math.max(0, findClaimButtons().indexOf(btn))}`;
   }
 
-  // ---- a claim refused because the game account is not connected -----------
+  // ---- Twitch answered "game account not connected" ------------------------
   // inject.js (page world) reports every claim request (`claimRequest`, numbered)
-  // and, for a refusal that says the account is not connected, `claimNotLinked`
+  // and, for an answer that says the account is not connected, `claimNotLinked`
   // with the same number. Each request belongs to the oldest click of ours that
-  // has no request yet, which tells which reward was refused. That is not an
-  // integrity problem and not a failed attempt: background.js stops that one
-  // reward for the session and the popup says to connect the account.
+  // has no request yet, which tells which reward it was.
+  //
+  // That answer is NOT proof the claim was refused: Twitch accepts the claim and
+  // then says the reward cannot be delivered in-game until the account is linked
+  // (seen in real use: the reward was in the Claimed list minutes later). So it
+  // is only noted here, and judged at the verdict (verifyClaim) by what the page
+  // shows - the reward in the Claimed list / its button gone / a response status
+  // that says "claimed":
+  //   accepted -> a success (last claim, backoff reset) plus a reminder to link
+  //               the account; the reward is never stopped;
+  //   refused  -> the reward stops for the session and the popup says to connect
+  //               the account, as before.
+  // Neither is an integrity problem or touches the failure streak.
   const CLAIM_REQUEST_MATCH_MS = 10_000;
 
   function gameIdOfCard(btn) {
@@ -242,16 +253,37 @@
     return null;
   }
 
-  async function onClaimNotLinked(key) {
-    if (notLinkedKeys.has(key)) return;
-    notLinkedKeys.add(key);
-    log(`claim of "${key}" refused: the game account is not connected`);
-    let game = null;
+  async function gameNameOf(gameId) {
     try {
-      const id = gameIdOfCard(awaitingClaimBtn.get(key));
-      if (id) game = ((await browser.storage.local.get("gameIdMap")).gameIdMap || {})[id] || null;
+      if (gameId) return ((await browser.storage.local.get("gameIdMap")).gameIdMap || {})[gameId] || null;
     } catch { /* the game name is only a nicety */ }
-    sendClaimMessage({ type: "claimNotLinked", key, game }).catch(() => {});
+    return null;
+  }
+
+  // how many times the Claimed list shows this reward; null = the list is not on the page
+  function claimedCountOf(name) {
+    if (!name) return null;
+    try {
+      const counts = extractClaimedCounts();
+      return counts ? counts.get(name) || 0 : null;
+    } catch { return null; }
+  }
+
+  async function settleLinkAnswer(key, text, base, note, stillThere) {
+    const after = base.name ? claimedCountOf(base.name) : null;
+    const inClaimed = after != null && after > base.before;
+    const accepted = inClaimed || note.claimed || !stillThere;
+    const game = await gameNameOf(base.gameId);
+    if (accepted) {
+      const why = inClaimed ? "it is in the Claimed list" : note.claimed ? `the response status is "${note.status}"` : "its button is gone";
+      log(`claim of "${key}" went through but the game account is not connected (${why}) - claimed on Twitch, link the account to get it in-game`);
+      recordClaim(text);
+      sendClaimMessage({ type: "claimResult", key, ok: true }).catch(() => {});
+      sendClaimMessage({ type: "claimLinkReminder", key, game, reward: base.name || text }).catch(() => {});
+    } else {
+      log(`claim of "${key}" refused: the game account is not connected (not in the Claimed list, the button is still there${note.status ? `, status "${note.status}"` : ""})`);
+      sendClaimMessage({ type: "claimNotLinked", key, game }).catch(() => {});
+    }
   }
 
   function onPageSignal(event) {
@@ -267,7 +299,7 @@
       if (click) claimKeyBySeq.set(signal.seq, click.key);
     } else if (signal.kind === "claimNotLinked") {
       const key = claimKeyBySeq.get(signal.seq);
-      if (key && awaitingClaimVerify.has(key)) onClaimNotLinked(key);
+      if (key && awaitingClaimVerify.has(key)) notLinkedSeen.set(key, { claimed: !!signal.claimed, status: signal.status || null });
     }
   }
   if (typeof window !== "undefined" && window.addEventListener) window.addEventListener("message", onPageSignal);
@@ -275,9 +307,13 @@
   function verifyClaim(key, text) {
     awaitingClaimVerify.delete(key);
     awaitingClaimBtn.delete(key);
-    if (notLinkedKeys.has(key)) return; // already dealt with: not a failed attempt
+    const base = claimBaseline.get(key) || { name: null, before: 0, gameId: null };
+    claimBaseline.delete(key);
+    const linkNote = notLinkedSeen.get(key);
+    notLinkedSeen.delete(key);
     if (!enabled || !isClaimScanPage()) { releaseClaim(key); return; } // switched off / navigated away: no verdict
     const stillThere = findClaimButtons().some((b) => claimKey(b) === key);
+    if (linkNote) { settleLinkAnswer(key, text, base, linkNote, stillThere); return; } // not a failed attempt either way
     if (stillThere) log(`claim of "${key}" was rejected (the button is still there) - background.js decides when to retry`);
     else recordClaim(text);
     sendClaimMessage({ type: "claimResult", key, ok: !stillThere }).catch(() => {});
@@ -310,10 +346,15 @@
         if (!enabled || !isClaimScanPage() || btn.isConnected === false) { releaseClaim(key); continue; }
         try {
           const text = (btn.textContent || "").trim();
+          // what the page shows BEFORE the click (the Claimed list may update at once)
+          const card = cardOf(btn);
+          const name = card ? tierRewardName(btn, card) : null;
+          const baseline = { name, before: claimedCountOf(name) || 0, gameId: gameIdOfCard(btn) };
           btn.click();
           log(`claimed via ${reason}:`, text);
           awaitingClaimVerify.add(key);
           awaitingClaimBtn.set(key, btn);
+          claimBaseline.set(key, baseline);
           unmatchedClicks.push({ key, at: Date.now() });
           const id = setTimeout(() => {
             claimVerifyTimeoutIds.delete(id);
@@ -1264,6 +1305,8 @@
     awaitingClaimVerify.forEach((key) => releaseClaim(key)); // pending verdicts are cancelled: let another tab have the reward
     awaitingClaimVerify.clear();
     awaitingClaimBtn.clear();
+    claimBaseline.clear();
+    notLinkedSeen.clear();
     unmatchedClicks.length = 0;
 
     log("stopped");

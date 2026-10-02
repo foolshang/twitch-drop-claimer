@@ -19,7 +19,9 @@ scan of every button on every page, and the channel-points chest in the chat
 community-points area) with its English label as a second net - this extension
 is for drops only. Clicks are debounced to one per 5s. Each reward has its own
 key (the campaign id + the reward's name), so one reward Twitch rejects backs
-off on its own without holding up the others. Every claim is recorded to
+off on its own without holding up the others. If Twitch accepts a claim but says the
+game account is not linked, the reward counts as claimed and the popup reminds you to
+link the account (it is judged by the Claimed list, not by the message). Every claim is recorded to
 `browser.storage.local` so the popup can show the most recent one.
 
 **Inventory upkeep.** Twitch's inventory page doesn't always reflect newly

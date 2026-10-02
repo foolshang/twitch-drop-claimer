@@ -279,17 +279,18 @@ async function testAccountNotLinkedStopsOnlyThatReward() {
   tab.postSignal("DropsPage_ClaimDropRewards", { kind: "claimNotLinked", seq: 6 });
   await flush();
   await flush();
+  // the answer alone decides nothing: it is judged at the verdict, by what the page shows (the button is still there = refused)
+  assert.ok(!bg.entry(K("Rust Isles Boots")).stop, "not stopped on the answer alone");
+
+  await run([tab], 30 * SEC); // verdicts arrive
 
   assert.deepStrictEqual({ ...bg.entry(K("Rust Isles Boots")) }, { f: 0, next: 0, stop: true, notLinked: true }, "that reward stops for the session");
   assert.deepStrictEqual(JSON.parse(JSON.stringify(bg.local.claimNotLinked)), [{ key: K("Rust Isles Boots"), game: "Rust" }], "with its game, for the popup");
   assert.ok(bg.logLines().some((l) => /claim needs a linked game account/.test(l) && /Rust Isles Boots/.test(l) && /campaigns page/.test(l)));
-  assert.strictEqual((bg.local.claimHealth || {}).streak || 0, 0, "right away: not a claim failure, the streak is untouched");
+  assert.strictEqual((bg.local.claimHealth || {}).streak || 0, 0, "not a claim failure, the streak is untouched");
   assert.ok(!bg.session.integrityFlag, "and not an integrity failure");
-
-  await run([tab], 30 * SEC); // verdicts arrive
   assert.deepStrictEqual(tab.results().map((m) => [m.key, m.ok]), [[K("Fine reward"), true]], "the refused reward is not reported as a failed attempt; the other one was claimed");
-  assert.strictEqual((bg.local.claimHealth || {}).streak || 0, 0, "it does not count toward the claim-failure warning");
-  assert.ok(!bg.session.integrityFlag, "nor toward the integrity warning");
+  assert.ok(!bg.local.claimLinkReminders, "a refusal is not a 'claimed' reminder");
 
   // the refused reward is left alone from now on, everything else keeps claiming
   const other = claimButton(tab, "Other reward", { onClick: (b) => removeButton(tab, b) });
@@ -316,6 +317,7 @@ async function testConnectingTheAccountResumesTheReward() {
   tab.postSignal("DropsPage_ClaimDropRewards", { kind: "claimNotLinked", seq: 0 });
   await flush();
   await flush();
+  await run([tab], 30 * SEC); // the verdict: its button is still there = refused
   assert.strictEqual((await bg.send({ type: "claimAsk", key: K("Rust Isles Boots") })).allowed, false);
 
   // the user connects the account; the campaigns page's own data says so
