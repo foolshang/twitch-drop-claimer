@@ -454,7 +454,7 @@ async function testInventoryExtractorReadsCampaignsAndAllowLists() {
   const camp = signals.find((s) => s.kind === "inventoryCampaigns");
   assert.ok(camp, "the Inventory response yields an inventoryCampaigns signal");
   assert.deepStrictEqual(camp.campaigns.map((c) => c.id), [TAC.id, GENERAL.id, "e1"]);
-  assert.deepStrictEqual(camp.campaigns[0], { id: TAC.id, name: TAC.name, status: "ACTIVE", endAt: Date.parse("2026-10-04T23:58:59.999Z"), gameId: RUST_ID, gameName: "Rust", channels: ["itsryanhiga", "welyn"] });
+  assert.deepStrictEqual(camp.campaigns[0], { id: TAC.id, name: TAC.name, status: "ACTIVE", endAt: Date.parse("2026-10-04T23:58:59.999Z"), gameId: RUST_ID, gameName: "Rust", channels: ["itsryanhiga", "welyn"], tiers: 1, tiersClaimed: 0, allClaimed: false });
   assert.strictEqual(camp.campaigns[1].channels, null, "allow.channels null -> not restricted");
   assert.strictEqual(camp.campaigns[2].channels, null, "an empty list is not restricted either");
   assert.strictEqual(camp.campaigns[2].status, "EXPIRED");

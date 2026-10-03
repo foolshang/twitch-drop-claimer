@@ -54,6 +54,11 @@ A pinned channel that goes live while its tab sits on the offline page (Twitch s
 channel's own badge, its tab is reloaded into the player (once per 10 minutes at most), and
 the tab is flashed once per live session to start playback.
 
+A pinned channel that matches no campaign and plays a game that has no open drops campaign
+(shown positively by a fresh `/drops/campaigns` snapshot and the Inventory data; with missing or stale data it
+stays "watching") holds no quota slot either, and the popup says "playing a game with no drops". A campaign
+whose every tier the Inventory data reports as claimed counts as done even when the page is stale.
+
 An offline pinned channel's tab stays open (that is how it notices the channel going
 live) but holds **no tab-quota slot**, so games that can earn drops use the slots
 meanwhile; at most 5 such tabs stay open, further offline entries wait without a tab

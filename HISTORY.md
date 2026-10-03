@@ -3009,7 +3009,7 @@ Signed to the UNLISTED channel on 2026-10-03 (`npm run submit`, no
 `.amo-submitted-versions.json`. Not submitted to the listed channel; the listed
 release will be 0.6.24 (manifest + `BUILD_MARKER` bump only).
 
-## After 0.6.23 (not yet signed): the extension's own inventory tab was never reloaded
+## 0.6.24 (part 1) - the extension's own inventory tab was never reloaded
 
 **Report:** the @Blooprint and @GEEGA rows stayed at 0/1 until the user refreshed the inventory
 page by hand, then showed "1/1 done" at once. So the done logic is right; the inventory data was
@@ -3028,7 +3028,54 @@ the log line says when it was the watch window's active tab. New `inventory-relo
 cases; the first fails on the previous background.js). `BUILD_MARKER` -> `2026-10-03-r3`; the
 manifest version is raised when it is signed.
 
-**Not done in this entry (details not available to me):** the second-layer "isClaimed from the
-Inventory GQL" evidence and the "no slot for a game with no drops" change for DisguisedToast were
-referred to as already agreed, but the earlier discussion is not part of what I have - waiting for
-the specifics.
+(The two items that were still open here - the Inventory GQL's isClaimed and the unmatched pinned
+channel on a game with no drops - are in 0.6.24 below.)
+
+## 0.6.24 (part 2) - the Inventory GQL confirms "done"; a pinned channel on a game with no drops holds no slot
+
+**Item 2 - `isClaimed` from the Inventory GQL as a second layer of evidence.**
+The real capture (`inventory.response.json`, 2026-10-01) has the field: every
+`dropCampaignsInProgress[].timeBasedDrops[].self` carries `isClaimed` (all `false` there - the
+capture has no claimed example, so "true" is by the field's name, not seen). inject.js now sends,
+per campaign, `tiers`, `tiersClaimed` and `allClaimed` (true only when there is at least one tier and
+EVERY tier has a boolean `isClaimed` that is true). Then (background.js `mergeInventoryProgress`,
+`gqlCampaignsAllClaimed` in shared.js):
+- the missing-card reconciliation: ACTIVE + every tier claimed = done (claimed = total, tab closed,
+  logged "card gone from In Progress and the Inventory GQL says every tier ... is claimed") - the
+  "GQL still lists it as ACTIVE" guard now applies only while the GQL shows an unclaimed tier or says
+  nothing about claims; no waiting for the corroboration scans (the GQL is positive evidence itself);
+- the matched-card path: a card that still shows progress (a stale page) while the GQL says everything is
+  claimed is confirmed done too (`gqlConfirmed`);
+- every entry whose campaigns are all claimed is done together (two pinned entries on one campaign:
+  both done, both tabs closed, the slots free for others - a pinned entry is handled exactly like a game
+  entry);
+- it only ever CONFIRMS: what the GQL confirmed stays done while the same campaigns match, even if a
+  stale card says 0% again or the GQL later drops the campaign. The DOM remains the main source; an entry
+  never seen on a card (total 0) is never invented as done.
+
+**Item 3 - an unmatched pinned channel playing a game with no open campaign.**
+"@DisguisedToast (MECCHA CHAMELEON)" showed "watching" and held a slot for a channel that matched no
+campaign on a game without drops. `entryPlaysNoDropsGame` (shared.js) is true only when ALL hold: the
+entry is pinned and has no matched campaign (no card/campaign ids in its progress); its game is known
+(`entryGameSlug`); the Inventory GQL has been read and no ACTIVE campaign in it lists the channel in
+`allow.channels` or is for that game; the `/drops/campaigns` snapshot is fresh (the existing 6 h rule),
+non-empty and has no ACTIVE entry for the game (by slug or normalised display name). Anything else
+FAILS OPEN (stale or empty snapshot, no Inventory GQL yet, game not resolved: still watched). Result: like
+the 0.6.18 wrong-game case the entry is parked - no quota slot, its tab stays open, it counts toward the
+cap of 5 non-quota tabs (further ones wait without a tab) - the popup says "playing a game with no drops -
+not earning drops" (`badge_no_drops_game`, 9 languages; an offline channel still says offline), and
+once it plays a game with a campaign the next scheduler run makes it watched again (the scheduler also
+re-runs after every Inventory GQL now). `pinnedNoDrops` in storage.local carries the verdict to the popup.
+Known limit: the game match uses the slug and the normalised display name; a game whose slug and name both
+differ between the channel page and Twitch's campaign list would be read as "no campaign" if the snapshot
+and the GQL both lack it by those names - the fail-open rules above are what protect against missing data.
+
+**Tests:** `gql-claimed.test.js` (4 cases: ACTIVE + every tier claimed + card gone = done; two pinned
+entries on one campaign both done with tabs closed; an unclaimed tier or no isClaimed data = not done; a
+stale 0% card confirmed done and never undone) - three fail on the previous sources;
+`pinned-no-drops-game.test.js` (6 cases: no slot + marked + logged; switching to a game with a campaign =
+watching; fail open for stale / empty / missing snapshot, no GQL, unresolved game; matched entries, a game
+with a campaign in the GQL or the snapshot, plain game entries unaffected; the cap of 5; the popup in 9
+languages) - four fail on the previous sources (the fail-open and unaffected cases are guards).
+`campaign-matching.test.js`: the extractor's expected record gained `tiers/tiersClaimed/allClaimed`.
+`BUILD_MARKER` -> `2026-10-03-r4`, `manifest.json` -> 0.6.24 (the listed release will be 0.6.25).

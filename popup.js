@@ -409,7 +409,7 @@ async function renderGameStatus() {
   const cfg = await browser.storage.local.get([
     "watchList", "autoWatchEnabled", "watchPhase", "watchTabs",
     "invalidSlugs", "campaignProgress", "priorityMode", "emptyUntil",
-    "openCampaigns", "gameWaitUntil", "claimHealth", "claimNotLinked", "claimLinkReminders", "pinnedLive", "idlePinned",
+    "openCampaigns", "gameWaitUntil", "claimHealth", "claimNotLinked", "claimLinkReminders", "pinnedLive", "idlePinned", "pinnedNoDrops",
   ]);
   const watchList = cfg.watchList || [];
   const openCampaigns = cfg.openCampaigns || null;
@@ -568,6 +568,9 @@ async function renderGameStatus() {
     // An offline channel says "offline" instead: what it played last is stale.
     if (cfg.autoWatchEnabled && !isWaiting && !invalid && pinnedState !== "offline" && entryPlaysWrongGame(game, progress)) {
       badge = badgeEl(t("badge_other_game"), "warn");
+    } else if (cfg.autoWatchEnabled && !isWaiting && !invalid && isWatching && pinnedState !== "offline" && cfg.pinnedNoDrops && cfg.pinnedNoDrops[game.slug]) {
+      // unmatched pinned channel playing a game with no open drops campaign: earns nothing, holds no slot
+      badge = badgeEl(t("badge_no_drops_game"), "warn");
     }
 
     if (!badge) {
@@ -677,7 +680,7 @@ browser.storage.onChanged.addListener((changes, area) => {
     changes.watchList || changes.watchTabs || changes.autoWatchEnabled ||
     changes.watchPhase || changes.invalidSlugs || changes.campaignProgress ||
     changes.priorityMode || changes.emptyUntil ||
-    changes.openCampaigns || changes.gameWaitUntil || changes.claimHealth || changes.claimNotLinked || changes.claimLinkReminders || changes.pinnedLive || changes.idlePinned
+    changes.openCampaigns || changes.gameWaitUntil || changes.claimHealth || changes.claimNotLinked || changes.claimLinkReminders || changes.pinnedLive || changes.idlePinned || changes.pinnedNoDrops
   ) {
     renderGameStatus();
   }

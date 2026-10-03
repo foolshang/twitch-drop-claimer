@@ -1291,7 +1291,7 @@ async function autoWatchTick() {
   const cfg = await browser.storage.local.get([
     "enabled", "autoWatchEnabled", "watchList", "invalidSlugs", "campaignProgress",
     "watchTabs", "tabQuota", "priorityMode", "emptyUntil", "watchMeta", "dropSignals",
-    "gameWaitUntil", "openCampaigns", "pinnedLive", "idlePinned", "slotChangeAt",
+    "gameWaitUntil", "openCampaigns", "pinnedLive", "idlePinned", "slotChangeAt", "inventoryCampaigns",
   ]);
   if (!cfg.enabled || !cfg.autoWatchEnabled) return;
 
@@ -1361,6 +1361,16 @@ async function autoWatchTick() {
   // channel is back on the campaign's game it counts again; the tabs open at that
   // moment are not closed to make room, so the total may briefly exceed the quota.
   const parked = new Set(eligible.filter((g) => entryPlaysWrongGame(g, campaignProgress[g.slug])).map((g) => g.slug));
+  // An unmatched pinned channel playing a game with no open campaign at all (positively shown by
+  // fresh data - see entryPlaysNoDropsGame; no data = it stays watched) is parked the same way.
+  const noDrops = new Set(eligible
+    .filter((g) => entryPlaysNoDropsGame(g, campaignProgress[g.slug], { inventoryCampaigns: cfg.inventoryCampaigns, openCampaigns: cfg.openCampaigns, now, maxAgeMs: OPEN_CAMPAIGNS_MAX_AGE_MS }))
+    .map((g) => g.slug));
+  for (const slug of noDrops) {
+    parked.add(slug);
+    const g = eligible.find((x) => x.slug === slug);
+    logOnChange(`pinned-slot:${slug}`, "no-drops-game", "pinned channel", g.channel, `is playing ${g.pinnedGameName || entryGameSlug(g)}, which has no open drops campaign, and is not matched to one - its tab stays open but holds no quota slot`);
+  }
 
   const ordered = orderByPriority(eligible, priorityMode, campaignProgress, emptyUntil);
   const rank = new Map(ordered.map((g, i) => [g.slug, i]));
@@ -1398,7 +1408,7 @@ async function autoWatchTick() {
   for (const [slug, at] of Object.entries(cfg.slotChangeAt || {})) if (now - at < SWAP_COOLDOWN_MS) slotChangeAt[slug] = at;
   const recentlyChanged = (slug) => slotChangeAt[slug] != null;
   for (const g of ordered) {
-    if (!idlePinned[g.slug] || watchTabs[g.slug] == null || !["live", "unknown"].includes(pinnedStateOf(g))) continue;
+    if (!idlePinned[g.slug] || watchTabs[g.slug] == null || noDrops.has(g.slug) || !["live", "unknown"].includes(pinnedStateOf(g))) continue;
     const counted = countedTabs();
     if (counted.length < quota) {
       delete idlePinned[g.slug];
@@ -1426,7 +1436,8 @@ async function autoWatchTick() {
     }
   }
   // the cap: only the highest-ranked idle tabs stay; the others close and wait without a tab
-  const idleTabs = ordered.filter((g) => idlePinned[g.slug] && watchTabs[g.slug] != null);
+  const nonQuota = (slug) => !!idlePinned[slug] || noDrops.has(slug); // tabs that hold no slot and count toward the cap
+  const idleTabs = ordered.filter((g) => nonQuota(g.slug) && watchTabs[g.slug] != null);
   for (const g of idleTabs.slice(OFFLINE_PINNED_TAB_CAP)) {
     await closeWatchTab(watchTabs, g.slug);
     delete watchMeta[g.slug];
@@ -1437,12 +1448,12 @@ async function autoWatchTick() {
 
   // fill remaining quota with the next-priority eligible games not already watched
   let openCount = countedTabs().length;
-  let idleCount = Object.keys(idlePinned).filter((k) => watchTabs[k] != null).length;
+  let idleCount = Object.keys(watchTabs).filter((k) => nonQuota(k)).length;
   for (const game of ordered) {
     if (watchTabs[game.slug]) continue; // already has a tab
     const knownOffline = game.pinnedChannel && pinnedStateOf(game) === "offline"; // no tab, last seen offline
     const isParked = parked.has(game.slug);
-    if (knownOffline) {
+    if (knownOffline || noDrops.has(game.slug)) {
       if (idleCount >= OFFLINE_PINNED_TAB_CAP) continue; // waits without a tab: no extra checking
     } else if (!isParked && openCount >= quota) continue;
 
@@ -1454,7 +1465,8 @@ async function autoWatchTick() {
     if (knownOffline) {
       idlePinned[game.slug] = true;
       idleCount++;
-    } else if (!isParked) openCount++;
+    } else if (noDrops.has(game.slug)) idleCount++;
+    else if (!isParked) openCount++;
     log("opened watch tab for", game.slug, `tab=${tab.id}`, knownOffline ? `(last seen offline - not counted, ${idleCount}/${OFFLINE_PINNED_TAB_CAP} waiting)` : isParked ? "(on another game than its campaign - not counted)" : `(${openCount}/${quota})`);
 
     if (game.pinnedChannel) {
@@ -1477,7 +1489,7 @@ async function autoWatchTick() {
     }
   }
 
-  await browser.storage.local.set({ watchTabs, watchPhase: "watching", watchMeta, dropSignals, idlePinned, slotChangeAt });
+  await browser.storage.local.set({ watchTabs, watchPhase: "watching", watchMeta, dropSignals, idlePinned, slotChangeAt, pinnedNoDrops: Object.fromEntries([...noDrops].map((k) => [k, true])) });
   await refreshBadge();
 }
 
@@ -1701,6 +1713,7 @@ async function handleInventoryCampaigns(signal) {
   if (lastInventoryCards && Date.now() - lastInventoryCards.at < INVENTORY_REJUDGE_MAX_AGE_MS) {
     await mergeInventoryProgress(lastInventoryCards.cards, lastInventoryCards.claimed);
   }
+  serialized(autoWatchTick).catch(() => {}); // whether a pinned channel's game has open drops may have changed
 }
 
 // Turns the cards content.js scanned into per-ENTRY progress. A game entry owns
@@ -1762,6 +1775,19 @@ async function mergeInventoryProgress(campaigns, claimedList) {
       const agg = aggregateEntryProgress(owned, entryExpectedCampaignIds(game, ctx));
       if (!agg) continue;
       matchedKeys.add(key);
+      // Second layer of evidence: the Inventory GQL says every tier of its campaigns is claimed
+      // (a fully claimed campaign is still sent as ACTIVE until it ends, and the page can be
+      // stale). It can only CONFIRM done - and what it confirmed stays confirmed while the same
+      // campaigns match, even if a stale card says 0/1 again.
+      const prevP = progress[key];
+      const sameCampaigns = !!prevP && (agg.campaignIds || []).length > 0 && (agg.campaignIds || []).every((id) => (prevP.campaignIds || []).includes(id));
+      if (!agg.allComplete && !agg.expired && agg.total > 0 &&
+          (gqlCampaignsAllClaimed(agg.campaignIds, metaById) || (prevP && prevP.gqlConfirmed && prevP.allComplete && sameCampaigns))) {
+        if (!(prevP && prevP.allComplete)) log(key, `the Inventory GQL says every tier of its campaign(s) is claimed - done (${agg.total}/${agg.total}), whatever the page shows`);
+        agg.allComplete = true;
+        agg.claimed = agg.total;
+        agg.gqlConfirmed = true;
+      }
       if (entryPlaysWrongGame(game, progress[key]) !== entryPlaysWrongGame(game, agg)) anyJustFinished = true; // parked <-> watching: re-run the scheduler
       progress[key] = { ...agg, updatedAt: Date.now(), missingScans: 0 };
       if ((agg.allComplete || agg.expired) && watchTabs[key]) {
@@ -1786,6 +1812,22 @@ async function mergeInventoryProgress(campaigns, claimedList) {
       if (matchedKeys.has(key)) continue;
       const p = progress[key];
       if (!p || p.allComplete || p.expired || !(p.total > 0)) continue;
+
+      // The Inventory GQL says every tier is claimed: done, even if it still lists the campaign as
+      // ACTIVE (it does until the campaign ends) - the "still ACTIVE" guard below only applies
+      // while the GQL shows an unclaimed tier. Every entry on the same campaign is done together.
+      if (gqlCampaignsAllClaimed(p.campaignIds, metaById)) {
+        const { probablyDone, probablyDoneSince, ...rest } = p;
+        progress[key] = { ...rest, claimed: p.total, allComplete: true, gqlConfirmed: true, missingScans: 0, updatedAt: Date.now() };
+        if (watchTabs[key]) {
+          await closeWatchTab(watchTabs, key);
+          delete watchMeta[key];
+          delete dropSignals[key];
+        }
+        anyJustFinished = true;
+        log(key, `card gone from In Progress and the Inventory GQL says every tier of its campaign(s) is claimed - confirmed fully claimed (${p.total}/${p.total})`);
+        continue;
+      }
 
       if ((p.campaignIds || []).some((id) => metaById[id] && metaById[id].status === "ACTIVE")) {
         // still in progress as far as Twitch says: the card is merely not readable now

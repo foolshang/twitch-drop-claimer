@@ -7,7 +7,7 @@
 // value out loud when asking for a fresh test - lets whoever's testing
 // confirm from the background console alone that Firefox is actually running
 // this exact source tree, not a stale reload/cached build/old .xpi.
-const BUILD_MARKER = "2026-10-03-r3";
+const BUILD_MARKER = "2026-10-03-r4";
 
 const ALIASES = {
   // Path of Exile
@@ -370,4 +370,47 @@ function claimEntryLabel(entry) {
   const game = entry && entry.game;
   if (game && reward) return `${game} - ${reward}`;
   return reward || game || "";
+}
+
+// Does the Inventory GQL say every tier of every one of these campaigns is claimed
+// (timeBasedDrops[].self.isClaimed, summarised by inject.js as `allClaimed`)? Claimed is
+// forever: this can only confirm "done" and never takes it back. false when a campaign is
+// not in the record or any tier is unclaimed / unknown.
+function gqlCampaignsAllClaimed(ids, metaById) {
+  if (!Array.isArray(ids) || ids.length === 0) return false;
+  return ids.every((id) => !!(metaById && metaById[id] && metaById[id].allClaimed === true));
+}
+
+// A pinned channel that is NOT matched to any campaign and is playing a game that has no open
+// drops campaign at all earns nothing: like a channel on the wrong game it holds no quota slot
+// (its tab stays). True only when the data POSITIVELY shows it - otherwise false (fail open):
+//   - the entry is pinned and its progress holds no matched campaign;
+//   - the game it plays is known (entryGameSlug);
+//   - the Inventory GQL has been read, and no ACTIVE campaign in it lists this channel in
+//     allow.channels (matched) or is for this game;
+//   - the /drops/campaigns snapshot is fresh and non-empty and has no ACTIVE entry for the game.
+// `data`: { inventoryCampaigns, openCampaigns, now, maxAgeMs }
+function entryPlaysNoDropsGame(g, progress, data) {
+  if (!g || !g.pinnedChannel) return false;
+  if (progress && (progress.allComplete || progress.expired || (progress.campaignIds || []).length > 0)) return false;
+  const gameSlug = entryGameSlug(g);
+  if (!gameSlug) return false; // game not resolved yet
+  const inv = data && data.inventoryCampaigns;
+  const oc = data && data.openCampaigns;
+  if (!inv || !inv.byId || !inv.at) return false;
+  if (!oc || !oc.bySlug || !oc.fetchedAt || Object.keys(oc.bySlug).length === 0) return false;
+  if ((data.now || Date.now()) - oc.fetchedAt > (data.maxAgeMs || 6 * 60 * 60 * 1000)) return false; // stale
+  const name = normalizeGameName(g.pinnedGameName || "");
+  const sameGame = (slug, displayName) =>
+    slug === gameSlug || (!!name && normalizeGameName(displayName) === name) || (!!displayName && toSlug(displayName) === gameSlug);
+  const channel = lcChannel(g.channel);
+  for (const c of Object.values(inv.byId)) {
+    if (!c || c.status !== "ACTIVE") continue;
+    if (Array.isArray(c.channels) && c.channels.includes(channel)) return false; // the channel is in a campaign's allow list
+    if (sameGame(null, c.gameName)) return false;
+  }
+  for (const e of Object.values(oc.bySlug)) {
+    if (e && e.active && sameGame(e.slug, e.displayName)) return false;
+  }
+  return true;
 }

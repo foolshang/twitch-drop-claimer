@@ -267,6 +267,11 @@
             ? c.allow.channels.map((ch) => String((ch && ch.name) || "").toLowerCase()).filter(Boolean)
             : [];
           const endAt = c.endAt ? Date.parse(c.endAt) : NaN;
+          // timeBasedDrops[].self.isClaimed (real capture): every tier claimed = the campaign is done,
+          // whatever the page shows (a fully claimed campaign is still sent as ACTIVE until it ends)
+          const drops = Array.isArray(c.timeBasedDrops) ? c.timeBasedDrops : [];
+          const tiersClaimed = drops.filter((d) => d && d.self && d.self.isClaimed === true).length;
+          const allClaimed = drops.length > 0 && drops.every((d) => d && d.self && typeof d.self.isClaimed === "boolean") && tiersClaimed === drops.length;
           return {
             id: String(c.id),
             name: c.name || null,
@@ -275,6 +280,9 @@
             gameId: c.game && c.game.id ? String(c.game.id) : null,
             gameName: (c.game && (c.game.name || c.game.displayName)) || null,
             channels: channels.length ? channels : null,
+            tiers: drops.length,
+            tiersClaimed,
+            allClaimed,
           };
         });
       return { kind: "inventoryCampaigns", campaigns };
