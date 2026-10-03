@@ -105,12 +105,42 @@ const REDACTED_VALUES = Object.entries(process.env)
   .filter(([name, value]) => /SECRET|KEY|TOKEN/i.test(name) && value && value.length >= 6)
   .map(([, value]) => value);
 
-function redact(str) {
+function redactWith(values, str) {
   let out = String(str);
-  for (const value of REDACTED_VALUES) {
+  for (const value of values) {
     out = out.split(value).join("[REDACTED]");
   }
   return out;
+}
+
+function redact(str) {
+  return redactWith(REDACTED_VALUES, str);
+}
+
+// Redaction of a STREAM (a child process's output arrives in arbitrary chunks): redacting each chunk on its own
+// lets a secret that is split across two chunks through. This holds back the last (longest secret - 1)
+// characters - a secret cannot start earlier than that and still be incomplete - redacts everything it has, and
+// writes out the rest; flush() at the end writes the held tail.
+function makeStreamRedactor(values, write) {
+  const usable = values.filter((v) => v && v.length > 0);
+  const hold = Math.max(0, ...usable.map((v) => v.length)) - 1;
+  let pending = "";
+  return {
+    push(text) {
+      pending = redactWith(usable, pending + String(text));
+      if (hold > 0 && pending.length > hold) {
+        write(pending.slice(0, pending.length - hold));
+        pending = pending.slice(pending.length - hold);
+      } else if (hold <= 0) {
+        write(pending);
+        pending = "";
+      }
+    },
+    flush() {
+      if (pending) write(redactWith(usable, pending));
+      pending = "";
+    },
+  };
 }
 
 function safeLog(...args) {
@@ -185,21 +215,24 @@ function stageSource() {
 // (see package.json / `npm install`), so we call its binary in
 // node_modules/.bin directly - a plain child process npm/npx never sees or
 // logs.
-const WEB_EXT_BIN = path.join(
-  ROOT, "node_modules", ".bin", process.platform === "win32" ? "web-ext.cmd" : "web-ext"
-);
+// web-ext's own entry script, run by THIS node binary: no .cmd shim, so no shell is needed - with shell:true the
+// arguments were only concatenated into a command line (a secret with a space, quote or & broke it or was
+// interpreted by the shell). Now every argument reaches web-ext exactly as it is.
+const WEB_EXT_BIN = path.join(ROOT, "node_modules", "web-ext", "bin", "web-ext.js");
+
+function webExtCommand(args) {
+  return { command: process.execPath, args: [WEB_EXT_BIN, ...args] };
+}
 
 function runWebExt(args, { allowFailure = false } = {}) {
   if (!fs.existsSync(WEB_EXT_BIN)) {
-    throw new Error(`web-ext binary not found at ${WEB_EXT_BIN} - run "npm install" first.`);
+    throw new Error(`web-ext not found at ${WEB_EXT_BIN} - run "npm install" first.`);
   }
   safeLog(`\n$ web-ext ${redact(args.join(" "))}`);
-  // Windows needs shell:true to resolve a .cmd shim at all. Unlike the old
-  // npx-based call, this no longer risks npm's own argv-logging side effect -
-  // the only remaining exposure is this process's own argv list in memory
-  // (visible to e.g. Task Manager while it runs), which is unavoidable for
-  // any CLI tool that takes credentials as flags.
-  const res = spawnSync(WEB_EXT_BIN, args, { stdio: "inherit", shell: true });
+  // (the only remaining exposure of a credential is this process's own argv list in memory, visible to e.g.
+  // Task Manager while it runs - unavoidable for any CLI tool that takes credentials as flags)
+  const { command, args: full } = webExtCommand(args);
+  const res = spawnSync(command, full, { stdio: "inherit" });
   if (res.status !== 0 && !allowFailure) {
     throw new Error(`web-ext ${args[0]} failed with exit code ${res.status}`);
   }
@@ -214,18 +247,15 @@ function runWebExt(args, { allowFailure = false } = {}) {
 function runWebExtCaptured(args) {
   return new Promise((resolve, reject) => {
     safeLog(`\n$ web-ext ${redact(args.join(" "))}`);
-    const child = spawn(WEB_EXT_BIN, args, { shell: true });
+    const { command, args: full } = webExtCommand(args);
+    const child = spawn(command, full);
     let combined = "";
-    child.stdout.on("data", (chunk) => {
-      process.stdout.write(redact(chunk.toString()));
-      combined += chunk.toString();
-    });
-    child.stderr.on("data", (chunk) => {
-      process.stderr.write(redact(chunk.toString()));
-      combined += chunk.toString();
-    });
+    const out = makeStreamRedactor(REDACTED_VALUES, (t) => process.stdout.write(t));
+    const err = makeStreamRedactor(REDACTED_VALUES, (t) => process.stderr.write(t));
+    child.stdout.on("data", (chunk) => { out.push(chunk.toString()); combined += chunk.toString(); });
+    child.stderr.on("data", (chunk) => { err.push(chunk.toString()); combined += chunk.toString(); });
     child.on("error", reject);
-    child.on("close", (code) => resolve({ code, combined }));
+    child.on("close", (code) => { out.flush(); err.flush(); resolve({ code, combined }); });
   });
 }
 
@@ -259,11 +289,42 @@ function apiGet(urlStr, token) {
   });
 }
 
-async function assertVersionNotAlreadySubmitted(version, issuer, secret) {
+// The versions endpoint is paginated (the first page is not everything) and by default lists only public listed
+// versions: `filter=all_with_unlisted` includes the unlisted ones this project signs for testing (an AMO version
+// number can never be reused, listed or not).
+const AMO_VERSIONS_FILTER = "all_with_unlisted";
+
+async function fetchAllAmoVersions(token, get = apiGet) {
+  let url = `https://addons.mozilla.org/api/v5/addons/addon/${encodeURIComponent(GECKO_ID)}/versions/?filter=${AMO_VERSIONS_FILTER}&page_size=50`;
+  const existing = [];
+  for (let page = 0; url && page < 50; page++) {
+    let res;
+    try {
+      res = await get(url, token);
+    } catch (e) {
+      throw new Error(`Could not reach AMO API to check existing versions: ${e.message} (use --skip-version-check to bypass)`);
+    }
+    if (res.status === 404 && page === 0) return null; // no add-on record yet
+    if (res.status < 200 || res.status >= 300) {
+      throw new Error(`AMO version-history check failed: HTTP ${res.status} - ${res.body.slice(0, 300)}`);
+    }
+    let data;
+    try { data = JSON.parse(res.body); } catch { data = null; }
+    const results = (data && (Array.isArray(data) ? data : data.results)) || [];
+    for (const v of results) if (v && v.version) existing.push(v.version);
+    const next = data && !Array.isArray(data) ? data.next : null;
+    // only ever follow a link to AMO itself (the JWT is sent with every request)
+    if (next && new URL(next).origin !== "https://addons.mozilla.org") throw new Error(`AMO returned a next-page link to another host: ${next}`);
+    url = next || null;
+  }
+  return existing;
+}
+
+async function assertVersionNotAlreadySubmitted(version, issuer, secret, { ledgerPath = LEDGER_PATH, get = apiGet } = {}) {
   // local ledger first - works even without network/credentials
-  const ledger = fs.existsSync(LEDGER_PATH) ? JSON.parse(fs.readFileSync(LEDGER_PATH, "utf8")) : [];
+  const ledger = fs.existsSync(ledgerPath) ? JSON.parse(fs.readFileSync(ledgerPath, "utf8")) : [];
   if (ledger.some((e) => e.version === version)) {
-    throw new Error(`Version ${version} is already in the local submit ledger (${LEDGER_PATH}). Bump the version first.`);
+    throw new Error(`Version ${version} is already in the local submit ledger (${ledgerPath}). Bump the version first.`);
   }
 
   if (!issuer || !secret) {
@@ -271,27 +332,11 @@ async function assertVersionNotAlreadySubmitted(version, issuer, secret) {
     return;
   }
 
-  const token = signJwt(issuer, secret);
-  const url = `https://addons.mozilla.org/api/v5/addons/addon/${encodeURIComponent(GECKO_ID)}/versions/`;
-  let res;
-  try {
-    res = await apiGet(url, token);
-  } catch (e) {
-    throw new Error(`Could not reach AMO API to check existing versions: ${e.message} (use --skip-version-check to bypass)`);
-  }
-
-  if (res.status === 404) {
+  const existing = await fetchAllAmoVersions(signJwt(issuer, secret), get);
+  if (existing === null) {
     safeLog("AMO has no record of this add-on yet - nothing to collide with.");
     return;
   }
-  if (res.status < 200 || res.status >= 300) {
-    throw new Error(`AMO version-history check failed: HTTP ${res.status} - ${res.body.slice(0, 300)}`);
-  }
-
-  let data;
-  try { data = JSON.parse(res.body); } catch { data = null; }
-  const versions = (data && (data.results || data)) || [];
-  const existing = versions.map((v) => v.version).filter(Boolean);
   if (existing.includes(version)) {
     throw new Error(`Version ${version} was already submitted to AMO. Bump the version (--bump=patch) before signing.`);
   }
@@ -376,7 +421,11 @@ async function main() {
   safeLog(`\nSigned and recorded version ${version} (${channel}) in ${LEDGER_PATH}`);
 }
 
-main().catch((e) => {
-  safeError(`\nsubmit-amo.js failed: ${e.message}`);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((e) => {
+    safeError(`\nsubmit-amo.js failed: ${e.message}`);
+    process.exit(1);
+  });
+}
+
+module.exports = { makeStreamRedactor, redactWith, webExtCommand, fetchAllAmoVersions, assertVersionNotAlreadySubmitted, AMO_VERSIONS_FILTER };
