@@ -53,6 +53,8 @@
     'div[class*="callout"] button[class*="primary"]',
   ];
 
+  const DEFINITE_CLAIM_SELECTORS = [CLAIM_SELECTORS[0], CLAIM_SELECTORS[1]];
+
   // button text/aria-label considered a claim button (supports multiple UI languages).
   // Whole-string matches only: the bare Thai "รับ" ("receive") is also the start
   // of unrelated labels such as "รับชม…" ("watch"), and "claim" is the start of
@@ -112,8 +114,10 @@
 
     for (const sel of CLAIM_SELECTORS) {
       document.querySelectorAll(sel).forEach((b) => {
-        // callout selectors can also match unrelated buttons -> check text first
-        if (sel.includes("callout") ? textMatches(b) : true) found.add(b);
+        // only the two selectors that ARE a drop's claim button by definition are taken as they
+        // are; a toast / callout holds other buttons too (its close "X"), and clicking one made
+        // it vanish, which then read as a successful claim - those need the claim text as well
+        if (DEFINITE_CLAIM_SELECTORS.includes(sel) || textMatches(b)) found.add(b);
       });
     }
 
@@ -184,9 +188,20 @@
   // Never one key shared by every reward.
   const claimButtonsIn = (root) => [...root.querySelectorAll('button, [role="button"]')].filter((b) => textMatches(b) && !isChannelPointsButton(b));
 
-  // the biggest ancestor below the card that holds only this claim button
+  // This tier's own element: the biggest ancestor of the button, below the card, that holds exactly
+  // ONE progress bar (the tier's own). Only a claimable tier has a button, so "holds only this
+  // button" climbed to the wrapper around ALL tiers when the others had none - and the first tier's
+  // name became the reward name (wrong key, wrong Last claimed, retro-success never matched).
+  // Without any progress-bar markup (older pages) the old rule applies.
   function tierOf(btn, card) {
-    let tier = btn.parentElement;
+    let tier = null;
+    for (let el = btn.parentElement; el && el !== card && el.querySelectorAll; el = el.parentElement) {
+      const bars = el.querySelectorAll('[role="progressbar"]').length;
+      if (bars > 1) break;
+      if (bars === 1) tier = el;
+    }
+    if (tier) return tier;
+    tier = btn.parentElement;
     for (let el = btn.parentElement; el && el !== card && el.querySelectorAll; el = el.parentElement) {
       if (claimButtonsIn(el).length === 1) tier = el; else break;
     }

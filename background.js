@@ -607,7 +607,7 @@ async function resolveWatchWindow() {
       setTimeout(async () => {
         graceFollowUpScheduled = false;
         const { enabled } = await browser.storage.local.get("enabled");
-        if (enabled) { await serialized(openInventoryIfMissing); await serialized(autoWatchTick); }
+        if (enabled !== false) { await serialized(openInventoryIfMissing); await serialized(autoWatchTick); }
       }, windowCreateNotBefore - Date.now() + 50);
     }
     return { id: null, freshlyCreated: false };
@@ -673,7 +673,7 @@ async function createWatchTab(props) {
 async function reviewNewWindow(id) {
   if (watchWindowEnsureInFlight || ownWindowIds.has(id)) return; // we are the one creating/adopting it
   const cfg = await browser.storage.local.get(["enabled", "watchWindowId"]);
-  if (!cfg.enabled) return;
+  if (cfg.enabled === false) return;
   let win;
   try {
     win = await browser.windows.get(id);
@@ -1156,7 +1156,7 @@ async function annotateWatchListFromCampaigns() {
 // ============================================================================
 async function checkAutoOff() {
   const cfg = await browser.storage.local.get(["enabled", "autoOffEnabled", "watchPhase", "enabledSince"]);
-  if (!cfg.enabled || !cfg.autoOffEnabled) return;
+  if (cfg.enabled === false || !cfg.autoOffEnabled) return;
   if (cfg.watchPhase !== "all-done") return;
   // grace window right after a manual re-enable so flipping the switch back
   // on (e.g. to add games / wait for new campaigns) isn't instantly undone
@@ -1168,12 +1168,16 @@ async function checkAutoOff() {
 // ============================================================================
 // auto-watch orchestration - one tab per eligible game, up to tabQuota
 // ============================================================================
-function isGameDone(slug, campaignProgress, invalidSlugs) {
-  if (invalidSlugs && (invalidSlugs[slug] || 0) > Date.now()) return true;
+function isGameDone(slug, campaignProgress) {
   const p = campaignProgress && campaignProgress[slug];
   if (!p) return false;
   return !!(p.allComplete || p.expired);
 }
+
+// A game whose slug Twitch did not know is blocked for a while (invalidSlugs: slug -> retry-after
+// time). That is WAITING, not done: it is not eligible, but it must never count toward "everything
+// is finished" (finishAllDone + auto-off would switch the extension off for good).
+const isGameBlocked = (slug, invalidSlugs) => !!invalidSlugs && !Array.isArray(invalidSlugs) && (invalidSlugs[slug] || 0) > Date.now();
 
 // True only when we have a reasonably fresh /drops/campaigns snapshot that
 // positively shows NO open campaign for this game - never on missing or
@@ -1293,7 +1297,7 @@ async function autoWatchTick() {
     "watchTabs", "tabQuota", "priorityMode", "emptyUntil", "watchMeta", "dropSignals",
     "gameWaitUntil", "openCampaigns", "pinnedLive", "idlePinned", "slotChangeAt", "inventoryCampaigns",
   ]);
-  if (!cfg.enabled || !cfg.autoWatchEnabled) return;
+  if (cfg.enabled === false || !cfg.autoWatchEnabled) return;
 
   const list = cfg.watchList || [];
   if (list.length === 0) {
@@ -1317,7 +1321,8 @@ async function autoWatchTick() {
 
   const now = Date.now();
   const eligible = list.filter((g) =>
-    !isGameDone(g.slug, campaignProgress, invalidSlugs) &&
+    !isGameDone(g.slug, campaignProgress) &&
+    !isGameBlocked(g.slug, invalidSlugs) &&
     !((gameWaitUntil[g.slug] || 0) > now) &&
     !lacksOpenCampaign(g, cfg.openCampaigns)
   );
@@ -1328,10 +1333,10 @@ async function autoWatchTick() {
     // same as "all done". Only call it done when at least one game is
     // genuinely finished/expired and none are merely waiting.
     const anyWaiting = list.some((g) =>
-      (gameWaitUntil[g.slug] || 0) > now || lacksOpenCampaign(g, cfg.openCampaigns)
+      (gameWaitUntil[g.slug] || 0) > now || lacksOpenCampaign(g, cfg.openCampaigns) || isGameBlocked(g.slug, invalidSlugs)
     );
     if (anyWaiting) {
-      await teardownAllWatch("all games waiting on a start date / open campaign");
+      await teardownAllWatch("all games waiting on a start date / open campaign / slug retry");
     } else {
       await finishAllDone();
     }
@@ -2188,7 +2193,7 @@ const lastPinnedReloadAt = new Map();
 
 async function getPinnedGameForTab(tabId) {
   const cfg = await browser.storage.local.get(["watchTabs", "watchList", "enabled"]);
-  if (!cfg.enabled) return null; // disabling clears watchTabs anyway - this is belt-and-braces
+  if (cfg.enabled === false) return null; // disabling clears watchTabs anyway - this is belt-and-braces
   const watchTabs = cfg.watchTabs || {};
   const slug = Object.keys(watchTabs).find((s) => watchTabs[s] === tabId);
   const game = slug && (cfg.watchList || []).find((g) => g.slug === slug);
@@ -2641,7 +2646,7 @@ async function applyEnabledState(enabled) {
 
 browser.alarms.onAlarm.addListener(async (alarm) => {
   const cfg = await browser.storage.local.get("enabled");
-  if (!cfg.enabled) return;
+  if (cfg.enabled === false) return;
 
   if (alarm.name === RELOAD_ALARM) {
     try {
@@ -2670,7 +2675,7 @@ browser.runtime.onMessage.addListener((msg, sender) => {
         const cfg = await browser.storage.local.get([
           "enabled", "autoWatchEnabled", "watchTabs", "watchList", "blockedChannels", "watchMeta",
         ]);
-        if (!cfg.enabled || !cfg.autoWatchEnabled || !sender.tab) {
+        if (cfg.enabled === false || !cfg.autoWatchEnabled || !sender.tab) {
           return { isWatchTab: false, activeGame: null, blockedChannels: [] };
         }
         const watchTabs = cfg.watchTabs || {};
@@ -2826,10 +2831,21 @@ browser.storage.onChanged.addListener(async (changes, area) => {
 // ---- runs when the background script loads (extension enabled / browser just started) ----
 (async () => {
   const cfg = await browser.storage.local.get(["enabled", "enabledSince"]);
-  const enabled = cfg.enabled ?? true;
+  // A fresh install has no `enabled` value: the popup shows "on" for it and so does this
+  // function, but every scheduler check used to read a missing value as OFF - a new user saw
+  // "on" and nothing happened. Write the default so the stored state is what everyone reads.
+  if (cfg.enabled === undefined) await browser.storage.local.set({ enabled: true });
+  const enabled = cfg.enabled !== false;
   if (enabled && !cfg.enabledSince) {
     await browser.storage.local.set({ enabledSince: Date.now() });
   }
   await resetStateForNewBrowserSession();
   await applyEnabledState(enabled);
 })();
+
+if (browser.runtime.onInstalled) {
+  browser.runtime.onInstalled.addListener(async () => {
+    const { enabled } = await browser.storage.local.get("enabled");
+    if (enabled === undefined) await browser.storage.local.set({ enabled: true });
+  });
+}

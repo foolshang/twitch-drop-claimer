@@ -718,12 +718,17 @@ document.getElementById("save").addEventListener("click", async () => {
   // seen playing is learned from its page (and only re-reported when it
   // changes), so carry it over for channels that stay on the list
   const prevList = (await browser.storage.local.get("watchList")).watchList || [];
-  for (const g of watchList) {
-    const prev = g.pinnedChannel && prevList.find((p) => p.slug === g.slug);
-    if (prev) {
-      if (prev.gameSlug) g.gameSlug = prev.gameSlug;
-      if (prev.pinnedGameName) g.pinnedGameName = prev.pinnedGameName;
-    }
+  const norm = (x) => String(x || "").trim().toLowerCase();
+  for (let i = 0; i < watchList.length; i++) {
+    const g = watchList[i];
+    // An entry whose text did not change keeps EVERYTHING background.js resolved for it (slug,
+    // displayName, gameId, campaign...). The textarea shows the resolved display name, so a line
+    // equal to a previous entry's input OR display name is that same entry. Starting it from scratch
+    // dropped the resolved slug, and background then pruned its "watch from" date / retry state.
+    const prev = prevList.find((p) =>
+      p.pinnedChannel ? g.pinnedChannel && p.slug === g.slug
+        : !g.pinnedChannel && (norm(p.input) === norm(g.input) || (p.displayName && norm(p.displayName) === norm(g.input)) || p.slug === g.slug));
+    if (prev) watchList[i] = { ...g, ...prev, input: g.pinnedChannel ? g.input : prev.input && norm(prev.input) === norm(g.input) ? g.input : prev.input || g.input };
   }
   const quota = Math.max(1, Math.min(10, parseInt($tabQuota.value, 10) || DEFAULT_TAB_QUOTA));
   $tabQuota.value = quota;
