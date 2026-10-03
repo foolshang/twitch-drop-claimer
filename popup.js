@@ -146,7 +146,7 @@ function badgeEl(text, cls) {
   return span;
 }
 
-function gameRowEl(game, index, isWatching, badge, detail, waitUntil, campaignNames) {
+function gameRowEl(game, index, isWatching, badge, detail, waitUntil, campaignNames, showCurrentGame = true) {
   const row = document.createElement("div");
   row.className = isWatching ? "game-status-row current" : "game-status-row";
 
@@ -157,7 +157,10 @@ function gameRowEl(game, index, isWatching, badge, detail, waitUntil, campaignNa
   const canonical = game.displayName && game.displayName !== game.input ? game.displayName : null;
   // a pinned channel has no canonical game name to swap in - show the
   // channel plus whatever game it's currently been observed playing, if known
-  const label = canonical || (game.pinnedChannel && game.pinnedGameName
+  // The game in brackets is the one the channel plays NOW: only while its tab is open and reporting. Without
+  // that (done, waiting without a tab, over the cap, offline) the last value seen would look current - it is
+  // shown on its own line as "last seen" instead.
+  const label = canonical || (game.pinnedChannel && game.pinnedGameName && showCurrentGame
     ? `${game.input} (${game.pinnedGameName})`
     : game.input);
   nameSpan.textContent = `${index + 1}. ${label}`;
@@ -170,6 +173,13 @@ function gameRowEl(game, index, isWatching, badge, detail, waitUntil, campaignNa
     alias.className = "g-detail";
     alias.textContent = t("row_typed_as", { input: game.input });
     row.appendChild(alias);
+  }
+
+  if (game.pinnedChannel && game.pinnedGameName && !showCurrentGame) {
+    const last = document.createElement("div");
+    last.className = "g-detail";
+    last.textContent = t("row_last_game", { game: game.pinnedGameName });
+    row.appendChild(last);
   }
 
   // a pinned channel is tracked through the campaign(s) that name it: say which
@@ -597,7 +607,8 @@ async function renderGameStatus() {
     }
 
     rows.push(gameRowEl(game, i, isWatching, badge, detail, waitUntil,
-      game.pinnedChannel && progress ? progress.campaignNames : null));
+      game.pinnedChannel && progress ? progress.campaignNames : null,
+      !game.pinnedChannel || (isWatching && (pinnedState === "live" || pinnedState === "unknown"))));
   });
 
   // Rebuilding the rows closes an open "watch from" calendar and loses a half-typed time - and

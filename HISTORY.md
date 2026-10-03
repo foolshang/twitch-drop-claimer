@@ -3195,3 +3195,7 @@ Signed to the UNLISTED channel on 2026-10-03 (`npm run submit`, no
 `.amo-submitted-versions.json`. Not submitted to the listed channel; the listed
 release will be 0.6.26 (manifest + `BUILD_MARKER` bump only). The relay
 (`report-service/main.py`) is NOT part of the .xpi and still has to be deployed by hand.
+
+## Next build (not yet signed): a pinned row shows the current game only while it is current
+
+"@GEEGA (Grand Theft Auto V)" stayed on the last game seen after its campaign was done and its tab closed. The game in brackets is now shown only while the entry's tab is open and its page reports live (or live-unknown); otherwise the row shows a separate line "last seen: <game>" (`row_last_game`, 9 languages). Test: `pinned-last-game.test.js` (fails on the previous popup.js). No version bump yet - it goes into the next build.
