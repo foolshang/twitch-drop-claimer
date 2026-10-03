@@ -3079,3 +3079,10 @@ with a campaign in the GQL or the snapshot, plain game entries unaffected; the c
 languages) - four fail on the previous sources (the fail-open and unaffected cases are guards).
 `campaign-matching.test.js`: the extractor's expected record gained `tiers/tiersClaimed/allClaimed`.
 `BUILD_MARKER` -> `2026-10-03-r4`, `manifest.json` -> 0.6.24 (the listed release will be 0.6.25).
+
+Signed to the UNLISTED channel on 2026-10-03 (`npm run submit`, no
+`--listed`) for testing in the user's real Firefox:
+`web-ext-artifacts/33d37586a96d443fa884-0.6.24.xpi`, built from `4f73af3`
+(`BUILD_MARKER` `2026-10-03-r4`); the version is in the local, git-ignored
+`.amo-submitted-versions.json`. Not submitted to the listed channel; the listed
+release will be 0.6.25 (manifest + `BUILD_MARKER` bump only).
