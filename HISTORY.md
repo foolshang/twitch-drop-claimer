@@ -3199,3 +3199,7 @@ release will be 0.6.26 (manifest + `BUILD_MARKER` bump only). The relay
 ## Next build (not yet signed): a pinned row shows the current game only while it is current
 
 "@GEEGA (Grand Theft Auto V)" stayed on the last game seen after its campaign was done and its tab closed. The game in brackets is now shown only while the entry's tab is open and its page reports live (or live-unknown); otherwise the row shows a separate line "last seen: <game>" (`row_last_game`, 9 languages). Test: `pinned-last-game.test.js` (fails on the previous popup.js). No version bump yet - it goes into the next build.
+
+## 0.6.26 - released to the LISTED channel (2026-10-03)
+
+0.6.26 = 0.6.25 (tested unlisted) + the pinned last-game display fix (`cbe5b6f`). `BUILD_MARKER` `2026-10-03-r6`, built from `b259df4` (code) with the release notes of `docs/release-notes-0.6.26.md` as the AMO release notes (`npm run submit:listed -- --release-notes=...`; `submit-amo.js` puts the text after the first line of dashes into `version.release_notes`, en-US). AMO limits release notes to 3000 characters: the first attempt was refused by validation (nothing uploaded, nothing recorded), the notes were shortened (the `sessions` permission section kept in full, the rest condensed) and the script now checks the limit before uploading. AMO signed it at once (no manual review pause): `web-ext-artifacts/33d37586a96d443fa884-0.6.26.xpi`, recorded in the local ledger.
