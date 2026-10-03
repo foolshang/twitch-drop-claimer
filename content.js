@@ -223,8 +223,10 @@
   function tierRewardName(btn, card) {
     const tier = tierOf(btn, card);
     if (!tier) return null;
+    const bar = tier.querySelector && tier.querySelector('[role="progressbar"]');
     const ps = [...tier.querySelectorAll("p")].filter((p) =>
-      !(p.querySelector && p.querySelector(DROP_LINK)) && !/%\s*of\s|end date|to continue the progress/i.test(p.textContent || ""));
+      !(p.querySelector && p.querySelector(DROP_LINK)) && !/end date|to continue the progress/i.test(p.textContent || "") &&
+      !isProgressLine(p, (p.textContent || "").trim(), bar));
     const text = ps.length ? (ps[0].textContent || "").trim() : "";
     return text || null;
   }
@@ -240,8 +242,19 @@
       const sameName = btns.some((other) => other !== btn && tierRewardName(other, card) === name);
       return sameName ? `${id}:${name}#${order}` : `${id}:${name}`;
     }
+    // A button outside any card (a drop toast, a chat callout) has no campaign or reward to name it by.
+    // Label + POSITION made every "Claim Now" toast share one key, and the position shifted when one
+    // disappeared - verdicts got flipped between toasts. A short in-memory id per button element:
+    // stable while the element lives, never shared.
     const label = (btn.getAttribute("aria-label") || btn.textContent || "").trim();
-    return `claim:${label}#${Math.max(0, findClaimButtons().indexOf(btn))}`;
+    return `claim:${label}#e${elementKeyId(btn)}`;
+  }
+  const elementKeyIds = new WeakMap();
+  let nextElementKeyId = 1;
+  function elementKeyId(el) {
+    let id = elementKeyIds.get(el);
+    if (!id) { id = nextElementKeyId++; elementKeyIds.set(el, id); }
+    return id;
   }
 
   // ---- Twitch answered "game account not connected" ------------------------
@@ -358,6 +371,9 @@
     const linkNote = notLinkedSeen.get(key);
     notLinkedSeen.delete(key);
     if (!enabled || !isClaimScanPage()) { releaseClaim(key); return; } // switched off / navigated away: no verdict
+    // The page changed since the click (Twitch is an SPA): the button is "gone" because the page is, not because
+    // the claim went through - neither a success nor a failure. Drop the verdict.
+    if (base.path && base.path !== location.pathname) { log(`claim of "${key}": the page changed before the verdict - dropped`); releaseClaim(key); return; }
     const stillThere = findClaimButtons().some((b) => claimKey(b) === key);
     if (linkNote) { settleLinkAnswer(key, text, base, linkNote, stillThere); return; } // not a failed attempt either way
     if (stillThere) {
@@ -399,7 +415,7 @@
           // what the page shows BEFORE the click (the Claimed list may update at once)
           const card = cardOf(btn);
           const name = card ? tierRewardName(btn, card) : null;
-          const baseline = { name, before: claimedCountOf(name) || 0, gameId: gameIdOfCard(btn) };
+          const baseline = { name, before: claimedCountOf(name) || 0, gameId: gameIdOfCard(btn), path: location.pathname };
           btn.click();
           log(`claimed via ${reason}:`, text);
           awaitingClaimVerify.add(key);
@@ -635,14 +651,33 @@
   // Directory page: pick the live, lowest-viewer channel for the active game
   // =========================================================================
   // BEST-EFFORT / needs real-world verification against Twitch's current markup.
+  // The count on a directory card, or null when it cannot be read (never a guess). The number is
+  // "<n>[K|M] viewers" / "ผู้ชม <n>[พัน|ล้าน]": with K/M a separator is a decimal point ("1,2K" = 1200),
+  // without it a thousands separator ("12,345"). A line holding ONLY the count wins - a stream title
+  // can say "Road to 1000 viewers" - and when there is no such line the text must hold exactly one
+  // candidate, otherwise it is ambiguous and unreadable.
+  const VIEWER_NUM = "(\\d[\\d.,]*)\\s*(K|M|พัน|หมื่น|ล้าน)?";
+  const VIEWER_WORD = "(?:viewers?|watching|ผู้ชม)";
+  const VIEWER_AFTER = new RegExp(`^${VIEWER_NUM}\\s*${VIEWER_WORD}$`, "i");
+  const VIEWER_BEFORE = new RegExp(`^${VIEWER_WORD}\\s*${VIEWER_NUM}$`, "i");
+  function viewerNumber(numStr, unit) {
+    const u = (unit || "").toLowerCase();
+    const mult = u === "k" || u === "พัน" ? 1_000 : u === "m" || u === "ล้าน" ? 1_000_000 : u === "หมื่น" ? 10_000 : 1;
+    let s = numStr.replace(/[.,]+$/, "");
+    if (mult > 1) return Math.round(parseFloat(s.replace(",", ".")) * mult);
+    s = s.replace(/[.,](?=\d{3}(?!\d))/g, "").replace(/[.,]/g, "");
+    const n = parseInt(s, 10);
+    return Number.isNaN(n) ? null : n;
+  }
   function extractViewerCount(card) {
     const text = card.innerText || "";
-    const m = text.match(/([\d,.]+)\s*([KM]?)\s*viewers?/i);
-    if (!m) return null;
-    let n = parseFloat(m[1].replace(/,/g, ""));
-    if (/K/i.test(m[2])) n *= 1_000;
-    if (/M/i.test(m[2])) n *= 1_000_000;
-    return Math.round(n);
+    for (const line of text.split(/\n+/)) {
+      const t = line.trim();
+      const m = t.match(VIEWER_AFTER) || t.match(VIEWER_BEFORE);
+      if (m) return viewerNumber(m[1], m[2]);
+    }
+    const loose = [...text.matchAll(new RegExp(`${VIEWER_NUM}\\s*${VIEWER_WORD}`, "gi"))];
+    return loose.length === 1 ? viewerNumber(loose[0][1], loose[0][2]) : null;
   }
 
   // blockedNames: channels rejected by the background verification check
@@ -662,12 +697,17 @@
       const card = link.closest("article") || link.parentElement;
       const viewers = card ? extractViewerCount(card) : null;
       const name = href.split("/").filter(Boolean).pop();
-      candidates.push({ href, name, viewers: viewers ?? Infinity });
+      candidates.push({ href, name, viewers });
     });
     const usable = candidates.filter((c) => !blocked.has((c.name || "").toLowerCase()));
     if (usable.length === 0) return null;
-    usable.sort((a, b) => a.viewers - b.viewers);
-    return usable[0];
+    // A card whose count cannot be read is not "the most viewers" and not "the fewest": it is left out.
+    // (It used to count as Infinity, so with no readable count at all the FIRST card - the most viewed -
+    // was picked, the opposite of the intent.) Nothing readable = nothing picked; the caller retries.
+    const known = usable.filter((c) => c.viewers != null);
+    if (known.length === 0) return null;
+    known.sort((a, b) => a.viewers - b.viewers);
+    return known[0];
   }
 
   // =========================================================================
@@ -679,30 +719,38 @@
   // and can't be undone by the page re-rendering its player.
   // =========================================================================
   let qualityAttempts = 0;
+  // true = done or given up (stop calling it); false = try again at the next tick. It used to say true even
+  // when the settings button was not there (the page still loading), so it was never retried.
+  // The menu is looked up inside the player's own settings menu (by its data-a-target, so any UI language and
+  // not another "Quality" button of the page); only when that menu cannot be found is the whole document used.
   function applyLowQuality() {
     qualityAttempts++;
     try {
       const settingsBtn = document.querySelector('button[data-a-target="player-settings-button"]');
-      if (settingsBtn) {
-        settingsBtn.click();
-        setTimeout(() => {
-          const qualityItem = [...document.querySelectorAll('button, [role="menuitem"]')]
-            .find((el) => /quality/i.test(el.textContent || ""));
-          if (qualityItem) {
-            qualityItem.click();
-            setTimeout(() => {
-              const options = [...document.querySelectorAll('input[type="radio"], [role="menuitemradio"]')];
-              if (options.length > 0) {
-                const lowest = options[options.length - 1]; // Twitch lists Auto first, lowest last
-                (lowest.closest("label") || lowest).click();
-              }
-              settingsBtn.click(); // close the menu we opened
-            }, 400);
-          } else {
-            settingsBtn.click();
-          }
-        }, 300);
+      if (!settingsBtn) {
+        log("quality: the player's settings button is not there yet", qualityAttempts >= 5 ? "- giving up" : "- will retry");
+        return qualityAttempts >= 5;
       }
+      const menuRoot = () => document.querySelector('[data-a-target="player-settings-menu"], [role="menu"]') || document;
+      settingsBtn.click();
+      setTimeout(() => {
+        const root = menuRoot();
+        const qualityItem = root.querySelector('[data-a-target="player-settings-menu-item-quality"]') ||
+          [...root.querySelectorAll('button, [role="menuitem"]')].find((el) => /quality|คุณภาพ/i.test(el.textContent || ""));
+        if (qualityItem) {
+          qualityItem.click();
+          setTimeout(() => {
+            const options = [...menuRoot().querySelectorAll('input[type="radio"], [role="menuitemradio"]')];
+            if (options.length > 0) {
+              const lowest = options[options.length - 1]; // Twitch lists Auto first, lowest last
+              (lowest.closest("label") || lowest).click();
+            }
+            settingsBtn.click(); // close the menu we opened
+          }, 400);
+        } else {
+          settingsBtn.click();
+        }
+      }, 300);
       log("applied quality setting (best-effort)");
       return true;
     } catch (e) {
@@ -818,13 +866,27 @@
   // down against every real card layout - if this returns null, the tier
   // is still counted correctly by extractTierPercent, it's only the
   // minutes-remaining estimate that's skipped for it.
+  // The length of the tier's reward, from the text after its "%" ("40% of 1 hour 30 minutes",
+  // "12% of 1.5 hours", "5% of 90 minutes", Thai units too): hours AND minutes added, decimals read.
+  // `tierEl` must be THIS tier only (tierRootOfBar) - a wrapper holding several tiers would give the
+  // first tier's length to all of them.
   function extractTierDurationMin(tierEl) {
     const text = (tierEl && tierEl.innerText) || "";
-    let m = text.match(/of\s+(\d+)\s*hours?/i);
-    if (m) return parseInt(m[1], 10) * 60;
-    m = text.match(/of\s+(\d+)\s*minutes?/i);
-    if (m) return parseInt(m[1], 10);
-    return null;
+    const i = text.indexOf("%");
+    if (i < 0) return null;
+    const tail = text.slice(i + 1);
+    let total = 0;
+    let found = false;
+    const re = /(\d+(?:[.,]\d+)?)\s*(hours?|hrs?|h\b|ชั่วโมง|ชม\.?|minutes?|mins?|m\b|นาที)/gi;
+    let m;
+    while ((m = re.exec(tail))) {
+      const n = parseFloat(m[1].replace(",", "."));
+      if (Number.isNaN(n)) continue;
+      const unit = m[2].toLowerCase();
+      total += /^(h|ชั่วโมง|ชม)/.test(unit) ? n * 60 : n;
+      found = true;
+    }
+    return found ? Math.round(total) : null;
   }
 
   // Best-effort campaign expiry date, used by the "soonest expiry first"
@@ -849,6 +911,11 @@
     // forward a year. Trailing time/timezone ignored; day granularity is
     // enough for "soonest expiry first" ordering.
     m = cardText.match(/End Date:\s*(?:([A-Za-z]{3,9}),?\s*)?([A-Za-z]{3,9}\s+\d{1,2})/i);
+    if (!m) {
+      // day first ("End Date: Wed, 26 Aug"): the same thing with the two swapped
+      const d = cardText.match(/End Date:\s*(?:([A-Za-z]{3,9}),?\s*)?(\d{1,2})\s+([A-Za-z]{3,9})/i);
+      if (d) m = [d[0], d[1], `${d[3]} ${d[2]}`];
+    }
     if (m) {
       const WEEKDAYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
       const weekday = m[1] ? m[1].slice(0, 3).toLowerCase() : null;
@@ -871,7 +938,11 @@
     // "ends on Aug 26" / "ends Aug 26" - relative phrasing only ever used on
     // an in-progress campaign, so a date that looks already-past must mean
     // next year (Dec -> Jan wraparound).
-    m = cardText.match(/ends?\s+(?:on\s+)?([A-Za-z]{3,9}\s+\d{1,2})/i);
+    m = cardText.match(/\bends?\s+(?:on\s+)?([A-Za-z]{3,9}\s+\d{1,2})\b/i);
+    if (!m) {
+      const d = cardText.match(/\bends?\s+(?:on\s+)?(\d{1,2})\s+([A-Za-z]{3,9})\b/i);
+      if (d) m = [d[0], `${d[2]} ${d[1]}`];
+    }
     if (m) {
       const now = new Date();
       let candidate = new Date(`${m[1]} ${now.getFullYear()}`);
@@ -892,7 +963,7 @@
   // of the bar that still holds only this one bar (real capture, 2026-09-25:
   // name <p> and bar sit in sibling divs under a per-tier wrapper), stopping
   // before the card root (which also holds the boxart).
-  function extractTierName(bar) {
+  function tierRootOfBar(bar) {
     let node = bar;
     for (let i = 0; i < 10; i++) {
       const parent = node.parentElement;
@@ -901,9 +972,16 @@
       if (parent.querySelector(GAME_CARD_IMAGE_SELECTOR)) break;
       node = parent;
     }
+    return node;
+  }
+  // The progress line ("40% of 1 hour") in any language: it starts with a percentage, or it sits next to the bar.
+  const PROGRESS_TEXT = /^\s*\d+(?:[.,]\d+)?\s*%|%\s*of\b/i;
+  const isProgressLine = (p, text, bar) => PROGRESS_TEXT.test(text) || !!(bar && bar.parentElement && bar.parentElement.contains(p));
+  function extractTierName(bar) {
+    const node = tierRootOfBar(bar);
     for (const p of node.querySelectorAll("p")) {
       const text = (p.innerText || "").replace(/\s+/g, " ").trim();
-      if (text && !/%\s*of\b/i.test(text)) return text;
+      if (text && !isProgressLine(p, text, bar)) return text;
     }
     return null;
   }
@@ -1037,8 +1115,7 @@
           continue; // 100% but not in Claimed yet (e.g. "Claim Now" pending): not claimed, no time left either
         }
         tiers.push({ name: tierName, claimed: false });
-        const tierEl = bar.closest(".tw-tower") || bar.parentElement || bar;
-        const durationMin = extractTierDurationMin(tierEl);
+        const durationMin = extractTierDurationMin(tierRootOfBar(bar));
         if (durationMin != null) {
           timeRemainingMin += Math.round((durationMin * (100 - percent)) / 100);
           foundDuration = true;
@@ -1111,13 +1188,29 @@
   let searchResolveTimeoutId = null;
   let playerNudgeTimeoutId = null;
 
+  // Twitch is a single-page app: the page can change without a reload. start() decides what to run from
+  // the page it is on (inventory scans, the directory pick, the channel monitor), so a change of page
+  // (not of query string - except the search term) restarts it: the old page's timers stop (an inventory
+  // scan on a channel page sent junk progress), the new page gets its own.
+  let activePageKey = null;
+  let navIntervalId = null;
+  const pageKey = () => location.pathname + (location.pathname === "/search" ? location.search : "");
+  function checkNavigation() {
+    if (!running || pageKey() === activePageKey) return;
+    log("page changed:", activePageKey, "->", pageKey(), "- restarting");
+    stop();
+    if (enabled) start();
+  }
+
   function start() {
     if (running) return; // avoid stacking duplicate timers when toggled ON/OFF rapidly
     running = true;
+    activePageKey = pageKey();
 
     // ---- MutationObserver: catch claim buttons as soon as they appear ------
-    observer = new MutationObserver(() => clickClaims("observer"));
+    observer = new MutationObserver(() => { checkNavigation(); return running ? clickClaims("observer") : undefined; });
     observer.observe(document.body, { childList: true, subtree: true });
+    navIntervalId = setInterval(checkNavigation, 1_000);
 
     // ---- repeating scan in case the observer misses something --------------
     scanIntervalId = setInterval(() => clickClaims("interval"), SCAN_INTERVAL_MS);
@@ -1401,6 +1494,8 @@
     if (observer) observer.disconnect();
     observer = null;
 
+    clearInterval(navIntervalId);
+    navIntervalId = null;
     clearInterval(scanIntervalId);
     clearInterval(inventoryIntervalId);
     clearInterval(inventoryScanIntervalId);

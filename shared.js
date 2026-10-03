@@ -40,8 +40,12 @@ const ALIASES = {
   "rainbow 6 siege": "tom-clancys-rainbow-six-siege",
 };
 
+// Accents are folded, not deleted: "Pokémon UNITE" is "pokemon-unite" (it was "pok-mon-unite", so its
+// campaign never matched). Combining marks are dropped after a canonical decomposition.
+const foldAccents = (s) => String(s || "").normalize("NFD").replace(/\p{M}/gu, "");
+
 function toSlug(input) {
-  const key = (input || "").trim().toLowerCase();
+  const key = foldAccents((input || "").trim().toLowerCase());
   if (!key) return "";
   if (ALIASES[key]) return ALIASES[key];
   return key
@@ -123,7 +127,18 @@ function searchUrl(term) {
 // differences between what a user types and Twitch's own displayName
 // ("Tom Clancy's The Division 2" -> "tomclancysthedivision2")
 function normalizeGameName(s) {
-  return (s || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+  return foldAccents((s || "").toLowerCase()).replace(/[^a-z0-9]+/g, "");
+}
+
+// The lines of the watch-list text that cannot be used: a game line with nothing a category slug can be
+// built from (only non-Latin letters, symbols) was dropped silently. The popup lists them instead.
+function invalidWatchLines(raw) {
+  const out = [];
+  for (const line of (raw || "").split("\n").map((l) => l.trim()).filter(Boolean)) {
+    if (line.startsWith("@")) continue;
+    if (!toSlug(line)) out.push(line);
+  }
+  return out;
 }
 
 // Given a user's typed game name and the list of games that currently have

@@ -649,6 +649,9 @@ function getOrCreateWatchWindow() {
 
 // Every tab the extension opens: in window 2, verified right now, or not at all.
 async function createWatchTab(props) {
+  // switched off (or auto-watch off for a watch tab) while this job was queued or running: open nothing
+  const { enabled } = await browser.storage.local.get("enabled");
+  if (enabled === false) { log("switched off - not opening", props.url); return null; }
   const win = await getOrCreateWatchWindow();
   if (win.id == null) {
     log("no watch window yet - not opening", props.url, "(it waits for the next tick; never in your window)");
@@ -745,6 +748,7 @@ async function sweepStaleWatchLeftovers() {
 // inventory tab upkeep
 // ============================================================================
 async function openInventoryIfMissing() {
+  if ((await browser.storage.local.get("enabled")).enabled === false) return; // no window either while switched off
   const tabs = await browser.tabs.query({ url: "*://www.twitch.tv/drops/inventory*" });
   if (tabs.length > 0) return;
   const { id, freshlyCreated } = await getOrCreateWatchWindow();
@@ -915,6 +919,15 @@ const claimLabelOf = async (key, game, reward) => {
   const names = await claimNames(key, game, reward);
   return claimEntryLabel({ key, ...names }) || "a reward";
 };
+
+// claimHealth / claimNotLinked / claimLinkReminders are read, changed and written back: two messages in
+// the same instant lost one of the updates. One queue for every writer of them.
+let claimStateChain = Promise.resolve();
+function claimQueued(fn) {
+  const run = claimStateChain.then(fn, fn);
+  claimStateChain = run.catch(() => {});
+  return run;
+}
 
 async function handleClaimNotLinked(msg) {
   const map = await getClaimBackoff();
@@ -1356,7 +1369,7 @@ async function autoWatchTick() {
 
   // drop bookkeeping for tabs the user closed manually
   for (const slug of Object.keys(watchTabs)) {
-    if (!(await tabExists(watchTabs[slug]))) delete watchTabs[slug];
+    if (!(await tabExists(watchTabs[slug]))) { delete watchTabs[slug]; delete watchMeta[slug]; delete dropSignals[slug]; }
   }
 
   // A pinned channel that is matched to a campaign but streams another game earns
@@ -1494,6 +1507,10 @@ async function autoWatchTick() {
     }
   }
 
+  // a tab that is gone (closed by the user, discarded, swapped out) takes its verify baseline and signals
+  // with it: reopening the same channel must not be judged against the old tab's baseline
+  for (const k of Object.keys(watchMeta)) if (watchTabs[k] == null || (watchMeta[k] && watchMeta[k].tabId != null && watchMeta[k].tabId !== watchTabs[k])) delete watchMeta[k];
+  for (const k of Object.keys(dropSignals)) if (watchTabs[k] == null) delete dropSignals[k];
   await browser.storage.local.set({ watchTabs, watchPhase: "watching", watchMeta, dropSignals, idlePinned, slotChangeAt, pinnedNoDrops: Object.fromEntries([...noDrops].map((k) => [k, true])) });
   await refreshBadge();
 }
@@ -2140,21 +2157,24 @@ async function flashTabToStartPlayback(tabId, holdMs = PLAYBACK_FLASH_HOLD_MS) {
 // flash the tab then, exactly as for a freshly-picked channel. Only for a
 // tab this file tracks as a pinned entry, only inside the dedicated watch
 // window, and not twice within PINNED_LIVE_FLASH_MIN_GAP_MS.
+// Returns true only when the tab was actually flashed (callers record "this live session was flashed"
+// from it - a skipped flash must not count as one).
 async function flashPinnedTabOnceLive(tabId, channel, why = "went live") {
   if (Date.now() - (lastPlaybackFlashAt.get(tabId) || 0) < PINNED_LIVE_FLASH_MIN_GAP_MS) {
     logOnChange(`pinned-live:${channel}`, "flash-skipped", "pinned channel", channel, "is live - tab was flashed moments ago, not again");
-    return;
+    return false;
   }
   const { id: watchWindowId } = await getOrCreateWatchWindow();
-  if (watchWindowId == null) return; // no isolated window - never flash in the user's own
+  if (watchWindowId == null) return false; // no isolated window - never flash in the user's own
   try {
     const liveTab = await browser.tabs.get(tabId);
-    if (liveTab.windowId !== watchWindowId) return;
+    if (liveTab.windowId !== watchWindowId) return false;
   } catch {
-    return; // tab already gone
+    return false; // tab already gone
   }
   logOnChange(`pinned-live:${channel}`, "flashed", "pinned channel", channel, why + " - flashing its tab to start playback");
   await flashTabToStartPlayback(tabId);
+  return true;
 }
 
 // ============================================================================
@@ -2303,8 +2323,9 @@ async function handlePinnedChannelStatus(msg, tab) {
     const rec = pinnedLive && pinnedLive[game.slug];
     const run = (rec && rec.tabId === tab.id && rec.liveSince) || null;
     if (run != null && pinnedFlashedRun.get(tab.id) === run) return;
-    if (run != null) pinnedFlashedRun.set(tab.id, run);
-    await flashPinnedTabOnceLive(tab.id, msg.channel);
+    // recorded only when the flash really happened: one skipped (flashed moments ago, no window yet)
+    // is tried again with the next live report, not given up for the whole live session
+    if (await flashPinnedTabOnceLive(tab.id, msg.channel) && run != null) pinnedFlashedRun.set(tab.id, run);
     return;
   }
   if (msg.live === false) {
@@ -2507,7 +2528,7 @@ async function handleGqlDropSignal(msg, tab) {
   // Twitch refusing Drops for this session / clearing up again - account-wide,
   // handled before anything slug-related. (`claimRequest` / `claimNotLinked`
   // are for content.js, which knows which reward it clicked: nothing to do here.)
-  if (msg.signal.kind === "integrityFailed" || msg.signal.kind === "dropsOpOk") return handleIntegritySignal(msg.signal);
+  if (msg.signal.kind === "integrityFailed" || msg.signal.kind === "dropsOpOk") return claimQueued(() => handleIntegritySignal(msg.signal));
   if (msg.signal.kind === "claimNotLinked" || msg.signal.kind === "claimRequest") return;
   if (msg.signal.kind === "inventoryCampaigns") return handleInventoryCampaigns(msg.signal);
 
@@ -2545,7 +2566,7 @@ async function handleGqlDropSignal(msg, tab) {
       const activeCount = Object.values(bySlug).filter((c) => c.active).length;
       log("[openCampaigns] snapshot:", Object.keys(bySlug).length, "games,", activeCount, "with an open campaign");
     });
-    await clearNotLinkedForConnectedGames(msg.signal.games);
+    await claimQueued(() => clearNotLinkedForConnectedGames(msg.signal.games));
     // not inside the serialized block above - annotateWatchListFromCampaigns
     // runs its own serialized units (see its comment)
     await annotateWatchListFromCampaigns();
@@ -2639,7 +2660,9 @@ async function applyEnabledState(enabled) {
     await browser.alarms.clear(RELOAD_ALARM);
     await browser.alarms.clear(AUTO_OFF_ALARM);
     await browser.alarms.clear(AUTO_WATCH_ALARM);
-    await teardownAllWatch("master switch off");
+    // through the queue: a tick that is running finishes first (its tabs are then closed too) - a
+    // teardown beside it left the tab the tick was opening playing while the extension was off
+    await serialized(() => teardownAllWatch("master switch off"));
   }
   await refreshBadge();
 }
@@ -2745,16 +2768,16 @@ browser.runtime.onMessage.addListener((msg, sender) => {
       return handleClaimRelease(msg);
 
     case "claimNotLinked":
-      return handleClaimNotLinked(msg);
+      return claimQueued(() => handleClaimNotLinked(msg));
 
     case "claimLinkReminder":
-      return handleClaimLinkReminder(msg);
+      return claimQueued(() => handleClaimLinkReminder(msg));
 
     case "claimRetroSuccess":
-      return handleClaimRetroSuccess(msg);
+      return claimQueued(() => handleClaimRetroSuccess(msg));
 
     case "claimResult":
-      return handleClaimResult(msg);
+      return claimQueued(() => handleClaimResult(msg));
 
     default:
       return undefined;
@@ -2782,26 +2805,35 @@ browser.storage.onChanged.addListener(async (changes, area) => {
     if (changes.autoWatchEnabled.newValue) {
       await serialized(autoWatchTick);
     } else {
-      await teardownAllWatch("auto-watch turned off");
+      await serialized(() => teardownAllWatch("auto-watch turned off"));
     }
   }
 
   if (changes.watchList && !suppressWatchListReaction) {
     const newList = changes.watchList.newValue || [];
     const slugs = new Set(newList.map((g) => g.slug));
-    const cfg = await browser.storage.local.get(["invalidSlugs", "gameWaitUntil"]);
-    const prevInvalidSlugs = cfg.invalidSlugs;
-    const invalidSlugs = { ...(prevInvalidSlugs && !Array.isArray(prevInvalidSlugs) ? prevInvalidSlugs : {}) };
-    for (const s of Object.keys(invalidSlugs)) {
-      if (!slugs.has(s)) delete invalidSlugs[s];
-    }
-    // drop any manual wait-until date for a game that's no longer listed
-    const gameWaitUntil = { ...(cfg.gameWaitUntil || {}) };
-    let waitPruned = false;
-    for (const s of Object.keys(gameWaitUntil)) {
-      if (!slugs.has(s)) { delete gameWaitUntil[s]; waitPruned = true; }
-    }
-    await browser.storage.local.set(waitPruned ? { invalidSlugs, gameWaitUntil } : { invalidSlugs });
+    // read-modify-write of invalidSlugs / gameWaitUntil: through the same queue as every other writer of them
+    await serialized(async () => {
+      const cfg = await browser.storage.local.get(["invalidSlugs", "gameWaitUntil", "campaignProgress"]);
+      const prevInvalidSlugs = cfg.invalidSlugs;
+      const invalidSlugs = { ...(prevInvalidSlugs && !Array.isArray(prevInvalidSlugs) ? prevInvalidSlugs : {}) };
+      for (const s of Object.keys(invalidSlugs)) {
+        if (!slugs.has(s)) delete invalidSlugs[s];
+      }
+      // drop any manual wait-until date for a game that's no longer listed
+      const gameWaitUntil = { ...(cfg.gameWaitUntil || {}) };
+      let waitPruned = false;
+      for (const s of Object.keys(gameWaitUntil)) {
+        if (!slugs.has(s)) { delete gameWaitUntil[s]; waitPruned = true; }
+      }
+      // and the progress of an entry that is gone (it only grew)
+      const campaignProgress = { ...(cfg.campaignProgress || {}) };
+      let progressPruned = false;
+      for (const s of Object.keys(campaignProgress)) {
+        if (!slugs.has(s)) { delete campaignProgress[s]; progressPruned = true; }
+      }
+      await browser.storage.local.set({ invalidSlugs, ...(waitPruned ? { gameWaitUntil } : {}), ...(progressPruned ? { campaignProgress } : {}) });
+    });
     await serialized(autoWatchTick);
     // re-resolve names / open-campaign status for the new list against
     // whatever snapshot is already stored (account-wide, so it covers a
@@ -2827,6 +2859,25 @@ browser.storage.onChanged.addListener(async (changes, area) => {
     await serialized(autoWatchTick);
   }
 });
+
+// A tab that closes (by the user, Firefox, or us) leaves nothing behind: its entry in watchTabs / watchMeta /
+// dropSignals / idlePinned and every in-memory per-tab map.
+if (browser.tabs.onRemoved) {
+  browser.tabs.onRemoved.addListener((tabId) => {
+    for (const m of [pinnedTabState, lastPinnedReloadAt, lastPlaybackFlashAt, pinnedLastDiag, pinnedStuck, pinnedCardState, pinnedFlashedRun]) m.delete(tabId);
+    serialized(async () => {
+      const cfg = await browser.storage.local.get(["watchTabs", "watchMeta", "dropSignals", "idlePinned"]);
+      const watchTabs = { ...(cfg.watchTabs || {}) };
+      const slug = Object.keys(watchTabs).find((k) => watchTabs[k] === tabId);
+      if (!slug) return;
+      delete watchTabs[slug];
+      const watchMeta = { ...(cfg.watchMeta || {}) }; delete watchMeta[slug];
+      const dropSignals = { ...(cfg.dropSignals || {}) }; delete dropSignals[slug];
+      const idlePinned = { ...(cfg.idlePinned || {}) }; delete idlePinned[slug];
+      await browser.storage.local.set({ watchTabs, watchMeta, dropSignals, idlePinned });
+    }).catch(() => {});
+  });
+}
 
 // ---- runs when the background script loads (extension enabled / browser just started) ----
 (async () => {

@@ -131,9 +131,12 @@ async function renderInfo() {
 
 function renderGamesPreview() {
   const list = parseWatchList($gamesList.value);
-  $gamesPreview.textContent = list.length
+  const invalid = invalidWatchLines($gamesList.value);
+  const text = list.length
     ? list.map((g, i) => `${i + 1}. ${g.pinnedChannel ? `@${g.channel}` : `${g.input} → ${g.slug}`}`).join("   ")
     : "";
+  // a line nothing can be built from (e.g. only non-Latin letters) is not dropped silently
+  $gamesPreview.textContent = invalid.length ? `${text}${text ? "   " : ""}⚠ ${t("preview_invalid", { lines: invalid.join(" | ") })}` : text;
 }
 
 function badgeEl(text, cls) {
@@ -252,6 +255,7 @@ function waitControlEl(game, waitUntil) {
   if (hasInitial && (initial.getHours() || initial.getMinutes())) {
     timeField.value = `${pad(initial.getHours())}:${pad(initial.getMinutes())}`;
   }
+  // (a gate at 00:00 of the next day, typed as "24:00", is shown as the next day at an empty time - the same moment)
 
   // Forgiving about how the time is typed, so neither a 24-hour nor a
   // 12-hour habit is wrong. Case-insensitive, optional space before am/pm:
@@ -273,7 +277,7 @@ function waitControlEl(game, waitUntil) {
       if (h < 1 || h > 12) return null;
       h = mer === "a" ? (h === 12 ? 0 : h) : (h === 12 ? 12 : h + 12);
     } else if (h === 24 && mi === 0) {
-      h = 0;
+      return { h: 0, mi: 0, nextDay: true }; // 24:00 = the end of the chosen day = 00:00 of the next
     } else if (h > 23) {
       return null;
     }
@@ -289,19 +293,19 @@ function waitControlEl(game, waitUntil) {
     const time = parseTime();
     timeField.classList.toggle("invalid", time === null);
     if (time === null) return; // keep the stored gate until they fix the time
-    const { h, mi } = time === "empty" ? { h: 0, mi: 0 } : time;
+    const { h, mi, nextDay } = time === "empty" ? { h: 0, mi: 0 } : time;
     // echo back the parsed time in one canonical 24-hour form, so whatever
     // shorthand was typed ("2pm", "1430") the user sees exactly what stuck
-    if (time !== "empty") timeField.value = `${pad(h)}:${pad(mi)}`;
+    if (time !== "empty") timeField.value = nextDay ? "24:00" : `${pad(h)}:${pad(mi)}`;
     // clamp the day to the chosen month (e.g. 31 -> 30 / 28) instead of the
     // Date constructor silently rolling over into the next month
     const maxDay = new Date(sel.y, sel.m + 1, 0).getDate();
     const day = Math.min(sel.d, maxDay);
-    const ts = new Date(sel.y, sel.m, day, h, mi, 0, 0).getTime();
+    const ts = new Date(sel.y, sel.m, day + (nextDay ? 1 : 0), h, mi, 0, 0).getTime();
     if (!Number.isNaN(ts)) await setGameWaitUntil(game.slug, ts);
   };
   timeField.addEventListener("change", commit);
-  timeField.addEventListener("blur", commit);
+  timeField.addEventListener("blur", async () => { await commit(); setTimeout(renderDeferredStatus, 0); });
 
   // --- calendar, drawn inline below the row ---
   const cal = document.createElement("div");
@@ -386,6 +390,7 @@ function waitControlEl(game, waitUntil) {
   dateField.addEventListener("click", () => {
     if (cal.hidden) renderCal();
     cal.hidden = !cal.hidden;
+    if (cal.hidden) renderDeferredStatus();
   });
 
   wrap.append(dateField, atSep, timeField);
@@ -470,8 +475,10 @@ async function renderGameStatus() {
   // open to lose.
   $sleepWarning.hidden = !(cfg.autoWatchEnabled && Object.keys(watchTabs).length > 0);
 
-  $gameStatusList.replaceChildren();
+  const rows = [];
   if (watchList.length === 0) {
+    $gameStatusList.replaceChildren();
+    lastStatusSig = null;
     $gameStatusEmpty.hidden = false;
     return;
   }
@@ -589,10 +596,26 @@ async function renderGameStatus() {
       else if (cfg.autoWatchEnabled) badge = badgeEl(t("badge_queued"));
     }
 
-    $gameStatusList.appendChild(gameRowEl(game, i, isWatching, badge, detail, waitUntil,
+    rows.push(gameRowEl(game, i, isWatching, badge, detail, waitUntil,
       game.pinnedChannel && progress ? progress.campaignNames : null));
   });
+
+  // Rebuilding the rows closes an open "watch from" calendar and loses a half-typed time - and
+  // background writes watchTabs every minute. So: nothing visible changed = leave the DOM alone; a
+  // change while a picker is open or a time is being typed waits until it is closed.
+  const sig = rows.map((r) => r.textContent).join("\u241e");
+  if (sig === lastStatusSig && $gameStatusList.childElementCount === rows.length) return;
+  if (statusEditingNow()) { statusRenderDeferred = true; return; }
+  lastStatusSig = sig;
+  statusRenderDeferred = false;
+  $gameStatusList.replaceChildren(...rows);
 }
+
+let lastStatusSig = null;
+let statusRenderDeferred = false;
+const statusEditingNow = () =>
+  !!document.querySelector(".g-cal:not([hidden])") || !!(document.activeElement && document.activeElement.classList && document.activeElement.classList.contains("g-time"));
+const renderDeferredStatus = () => { if (statusRenderDeferred && !statusEditingNow()) renderGameStatus(); };
 
 // populate the language picker once (each option labelled in its own script)
 for (const { code, label } of I18N_LANGS) {
@@ -630,7 +653,9 @@ for (const { code, label } of I18N_LANGS) {
   await reconcileGamesTextarea();
 })();
 
-$gamesList.addEventListener("input", renderGamesPreview);
+// unsaved edits: while there are any, background's own rewrites of the list never touch the textarea
+let gamesDirty = false;
+$gamesList.addEventListener("input", () => { gamesDirty = true; renderGamesPreview(); });
 
 // language picker - persist and re-render immediately (no "save" needed)
 $uiLang.addEventListener("change", async () => {
@@ -649,7 +674,7 @@ $power.addEventListener("change", async () => {
 // so a typo like "msf" becomes "MARVEL Strike Force" once matched. Only when
 // the user isn't mid-edit, and only if it actually differs.
 async function reconcileGamesTextarea() {
-  if (document.activeElement === $gamesList) return;
+  if (gamesDirty || document.activeElement === $gamesList) return;
   const cfg = await browser.storage.local.get(["watchList", "watchListRaw"]);
   const list = cfg.watchList || [];
   if (list.length === 0) return;
@@ -741,6 +766,7 @@ document.getElementById("save").addEventListener("click", async () => {
     priorityMode: $priorityMode.value === "expiry" ? "expiry" : "list-order",
     autoOffEnabled: $autoOff.checked,
   });
+  gamesDirty = false;
   await renderGameStatus();
   $status.textContent = t("saved");
   setTimeout(() => ($status.textContent = ""), 2000);

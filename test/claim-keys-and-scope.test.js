@@ -154,7 +154,7 @@ async function testFallbackKeysAreStillPerReward() {
   await toast.tab.scan(); await flush();
   const keys = toast.tab.asks();
   assert.strictEqual(new Set(keys).size, 2, "two toasts, two keys: " + JSON.stringify(keys));
-  assert.ok(keys.every((k) => /^claim:Claim Now#\d+$/.test(k)));
+  assert.ok(keys.every((k) => /^claim:Claim Now#e\d+$/.test(k)), JSON.stringify(keys));
   console.log("  OK  fallback keys: campaign id + order, name + order for duplicates, label + position outside a card - never one shared key");
 }
 
