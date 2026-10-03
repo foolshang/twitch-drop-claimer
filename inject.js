@@ -343,36 +343,71 @@
   }
 
   // ---- fetch ----------------------------------------------------------------
+  // `input` may be a string, a URL object or a Request (whose body is only readable from a clone made BEFORE
+  // the native fetch consumes it); only a string body in `init` used to be read, so any request built from a
+  // Request never announced a claim.
+  const urlOf = (input) => {
+    if (typeof input === "string") return input;
+    if (typeof URL !== "undefined" && input instanceof URL) return input.href;
+    return input && typeof input.url === "string" ? input.url : null;
+  };
   const nativeFetch = window.fetch;
   window.fetch = function (input, init) {
-    const promise = nativeFetch.call(this, input, init);
+    let bodyText = null; // sync when init.body is a string
+    let bodyPromise = null; // async for a Request
+    let isGql = false;
     try {
-      const url = typeof input === "string" ? input : input && input.url;
+      const url = urlOf(input);
       if (url && url.startsWith(GQL_URL)) {
-        const body = init && typeof init.body === "string" ? init.body : null;
-        const requestEntries = parseJsonArray(body);
-        const claimSeqs = reserveClaimSeqs(requestEntries);
-        promise
-          .then((res) => res.clone().text().then((text) => handleExchange(requestEntries, text, claimSeqs)))
-          .catch(() => {});
+        isGql = true;
+        if (init && typeof init.body === "string") bodyText = init.body;
+        else if (typeof Request !== "undefined" && input instanceof Request) bodyPromise = input.clone().text().catch(() => null);
       }
     } catch { /* never break the page's real request */ }
+    const promise = nativeFetch.call(this, input, init);
+    if (isGql) {
+      try {
+        const entriesNow = bodyPromise ? null : parseJsonArray(bodyText);
+        const seqsNow = bodyPromise ? null : reserveClaimSeqs(entriesNow);
+        Promise.all([bodyPromise || Promise.resolve(null), promise])
+          .then(([asyncBody, res]) => {
+            const requestEntries = bodyPromise ? parseJsonArray(asyncBody) : entriesNow;
+            const claimSeqs = bodyPromise ? reserveClaimSeqs(requestEntries) : seqsNow;
+            return res.clone().text().then((text) => handleExchange(requestEntries, text, claimSeqs));
+          })
+          .catch(() => {});
+      } catch { /* never break the page's real request */ }
+    }
     return promise;
   };
 
   // ---- XHR (Twitch's client mixes fetch and XHR across code paths) ---------
+  // responseText throws for responseType json / blob / arraybuffer: read the response the way its type allows.
   const nativeOpen = XMLHttpRequest.prototype.open;
   const nativeSend = XMLHttpRequest.prototype.send;
   XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-    this.__dropClaimerIsGql = typeof url === "string" && url.startsWith(GQL_URL);
+    try {
+      const u = typeof url === "string" ? url : url && typeof url.href === "string" ? url.href : "";
+      this.__dropClaimerIsGql = u.startsWith(GQL_URL);
+    } catch { this.__dropClaimerIsGql = false; }
     return nativeOpen.call(this, method, url, ...rest);
   };
+  function xhrResponseText(xhr) {
+    const type = xhr.responseType;
+    if (type === "" || type === "text") return Promise.resolve(xhr.responseText);
+    if (type === "json") return Promise.resolve(xhr.response == null ? null : JSON.stringify(xhr.response));
+    if (type === "blob") return xhr.response && typeof xhr.response.text === "function" ? xhr.response.text() : Promise.resolve(null);
+    if (type === "arraybuffer") return Promise.resolve(xhr.response ? new TextDecoder().decode(xhr.response) : null);
+    return Promise.resolve(null);
+  }
   XMLHttpRequest.prototype.send = function (body) {
     if (this.__dropClaimerIsGql) {
       const requestEntries = parseJsonArray(typeof body === "string" ? body : null);
       const claimSeqs = reserveClaimSeqs(requestEntries);
       this.addEventListener("load", () => {
-        try { handleExchange(requestEntries, this.responseText, claimSeqs); } catch { /* ignore */ }
+        try {
+          xhrResponseText(this).then((text) => handleExchange(requestEntries, text, claimSeqs)).catch(() => {});
+        } catch { /* ignore */ }
       });
     }
     return nativeSend.call(this, body);

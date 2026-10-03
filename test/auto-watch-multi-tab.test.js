@@ -576,7 +576,14 @@ function makeSandboxWithWatchWindow() {
             if (opts.active === true && t.windowId !== storageData.watchWindowId) {
               unsafeActivations.push(`tab ${id} in window ${t.windowId} (watch window is ${storageData.watchWindowId})`);
             }
-            Object.assign(t, opts);
+            // Firefox semantics (ext-tabs.js has no answer to "which tab then?"): {active:false} does
+            // nothing; a tab stops being active only when another one in its window is activated
+            const { active, ...rest } = opts;
+            Object.assign(t, rest);
+            if (active === true) {
+              for (const other of tabsById.values()) if (other.windowId === t.windowId) other.active = false;
+              t.active = true;
+            }
           }
           return Promise.resolve();
         },
@@ -586,7 +593,9 @@ function makeSandboxWithWatchWindow() {
           return Promise.resolve();
         },
         get: (id) => tabsById.has(id) ? Promise.resolve({ id, ...tabsById.get(id) }) : Promise.reject(new Error("no such tab")),
-        query: () => Promise.resolve([]),
+        query: (q = {}) => Promise.resolve([...tabsById.entries()]
+          .filter(([, t]) => (q.windowId == null || t.windowId === q.windowId) && (q.active == null || t.active === q.active))
+          .map(([id, t]) => ({ id, ...t }))),
         reload: () => {},
       },
       alarms: {
@@ -646,10 +655,20 @@ async function testFreshChannelPickFlashesOnlyInsideWatchWindowThenReverts() {
   assert.deepStrictEqual(unsafeActivations, [], "active:true must only ever happen on a tab inside the dedicated watch window");
 
   // exercise the revert directly with a short hold instead of waiting out
-  // the real ~8s default - same function, just a smaller holdMs
+  // the real ~8s default - same function, just a smaller holdMs. Another tab of the watch window (the
+  // inventory tab) is the one being shown: the flash must hand the window back to it, because Firefox ignores
+  // {active:false} - without that the flashed tab stayed the window's active tab for good
+  const winId = tabsById.get(tabId).windowId;
+  const shown = [...tabsById.entries()].find(([id, t]) => id !== tabId && t.windowId === winId);
+  assert.ok(shown, "sanity: the watch window has another tab");
+  shown[1].active = true;
+  tabsById.get(tabId).active = false;
   await vm.runInContext("flashTabToStartPlayback", ctx)(tabId, 20);
+  await flush(5);
+  assert.strictEqual(tabsById.get(tabId).active, true, "flashed: active during the hold");
   await flush(60);
-  assert.strictEqual(tabsById.get(tabId).active, false, "the tab must be switched back to active:false after the hold");
+  assert.strictEqual(tabsById.get(tabId).active, false, "after the hold the flashed tab is not the window's active tab any more");
+  assert.strictEqual(shown[1].active, true, "the tab that was shown before is active again");
 
   console.log("  OK  a freshly-picked channel is briefly activated inside the watch window only, then reverted");
 }

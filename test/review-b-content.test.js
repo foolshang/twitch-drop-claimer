@@ -174,6 +174,7 @@ async function testTheQualityMenuIsLookedUpInThePlayersMenu() {
   const html = `<button data-test="elsewhere">Video quality guide</button><label><input type="radio" data-test="poll1"></label>
                 <button data-a-target="player-settings-button" data-test="settings">⚙</button>`;
   const h = contentGlobals(html);
+  await flush(); // content.js's own start() (after its storage read) settles first, as it would on a real page
   const doc = h.window.document;
   const clicked = [];
   doc.addEventListener("click", (e) => { const t = e.target.closest("[data-test]"); if (t) clicked.push(t.getAttribute("data-test")); }, true);

@@ -19,6 +19,7 @@ function makeWorld(storage = {}, { createDelay = 0 } = {}) {
   const storageData = { autoWatchEnabled: true, tabQuota: 2, openCampaigns: { fetchedAt: Date.now(), bySlug: {} }, ...storage };
   const listeners = [];
   const removedListeners = [];
+  const changeListeners = [];
   const tabsById = new Map();
   let nextTabId = 1;
   let nowMs = Date.now();
@@ -40,7 +41,7 @@ function makeWorld(storage = {}, { createDelay = 0 } = {}) {
           },
           set: (obj) => { Object.assign(storageData, obj); return Promise.resolve(); },
         },
-        onChanged: { addListener: () => {} },
+        onChanged: { addListener: (fn) => changeListeners.push(fn) },
       },
       runtime: { onMessage: { addListener: (fn) => listeners.push(fn) }, getManifest: () => ({ version: "0.0.0-test" }) },
       tabs: {
@@ -68,7 +69,9 @@ function makeWorld(storage = {}, { createDelay = 0 } = {}) {
   const ctx = vm.createContext(sandbox);
   const wait = (ms = 40) => new Promise((r) => setTimeout(r, ms));
   return {
-    ctx, storageData, listeners, removedListeners, tabsById, wait,
+    ctx, storageData, listeners, removedListeners, changeListeners, tabsById, wait,
+    // what storage.onChanged would deliver after a write
+    async storageChanged(changes) { for (const fn of changeListeners) await fn(changes, "local"); await wait(); },
     advance(ms) { nowMs += ms; },
     tabs: () => Object.keys(storageData.watchTabs || {}).sort(),
     logs: () => vm.runInContext("debugLogBuffer.slice()", ctx),
@@ -86,13 +89,14 @@ function makeWorld(storage = {}, { createDelay = 0 } = {}) {
 
 // content.js on a jsdom page; `bg` is a claim-harness background (bg.send)
 async function openDomTab({ clock, bg, html, pathname = "/drops/inventory", search = "", local = {} }) {
-  const dom = new JSDOM(`<!doctype html><html><body>${html}</body></html>`, { url: `https://www.twitch.tv${pathname}${search}` });
+  const dom = new JSDOM(`<!doctype html><html><body>${html}</body></html>`, { url: `https://www.twitch.tv${pathname}${search}`, virtualConsole: new (require("jsdom").VirtualConsole)() });
   const { window } = dom;
   Object.defineProperty(window.HTMLElement.prototype, "innerText", { get() { return this.textContent; } });
   const observers = [];
   const sent = [];
   const localSets = [];
   const intervals = []; // { fn, ms, cleared }
+  const changeListeners = [];
   const sandbox = {
     console: { log() {}, error() {}, warn() {} },
     Set, Map, WeakMap, Promise, URL, URLSearchParams, JSON, Math, Array, Object, Number, String, RegExp,
@@ -103,7 +107,7 @@ async function openDomTab({ clock, bg, html, pathname = "/drops/inventory", sear
     clearInterval: (id) => { if (intervals[id - 1]) intervals[id - 1].cleared = true; },
     setTimeout: (fn, ms) => clock.setTimeout(fn, ms), clearTimeout: (t) => clock.clearTimeout(t),
     browser: {
-      storage: { local: { get: () => Promise.resolve({ enabled: true, gameIdMap: {}, ...local }), set: (o) => { localSets.push(o); return Promise.resolve(); } }, onChanged: { addListener() {} } },
+      storage: { local: { get: () => Promise.resolve({ enabled: true, gameIdMap: {}, ...local }), set: (o) => { localSets.push(o); return Promise.resolve(); } }, onChanged: { addListener: (fn) => changeListeners.push(fn) } },
       runtime: { sendMessage: (m) => { sent.push(m); return bg.send(m, 1); }, onMessage: { addListener() {} } },
     },
   };
@@ -119,6 +123,9 @@ async function openDomTab({ clock, bg, html, pathname = "/drops/inventory", sear
     liveObservers: () => observers.filter((o) => o.alive).length,
     scan: () => Promise.all(observers.filter((o) => o.alive).map((o) => o.cb([]))).then(() => flush()),
     navigate: (to) => window.history.pushState({}, "", to),
+    setEnabled: (v) => changeListeners.forEach((fn) => fn({ enabled: { newValue: v, oldValue: !v } }, "local")),
+    // what inject.js's postMessage would deliver to content.js
+    signal: (s, op = "DropsPage_ClaimDropRewards") => window.dispatchEvent(new window.MessageEvent("message", { data: { type: "__DROP_CLAIMER_GQL__", payload: { operationName: op, signal: { ...s, operationName: op }, at: clock.now } }, origin: "https://www.twitch.tv", source: window })),
     asks: () => sent.filter((m) => m.type === "claimAsk").map((m) => m.key),
     results: () => sent.filter((m) => m.type === "claimResult"),
   };

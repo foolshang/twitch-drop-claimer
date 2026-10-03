@@ -1308,9 +1308,20 @@ async function autoWatchTick() {
   const cfg = await browser.storage.local.get([
     "enabled", "autoWatchEnabled", "watchList", "invalidSlugs", "campaignProgress",
     "watchTabs", "tabQuota", "priorityMode", "emptyUntil", "watchMeta", "dropSignals",
-    "gameWaitUntil", "openCampaigns", "pinnedLive", "idlePinned", "slotChangeAt", "inventoryCampaigns",
+    "gameWaitUntil", "openCampaigns", "pinnedLive", "idlePinned", "slotChangeAt", "inventoryCampaigns", "blockedChannels",
   ]);
   if (cfg.enabled === false || !cfg.autoWatchEnabled) return;
+
+  // blocked channels are kept until their time is up - and then dropped (they only ever accumulated)
+  if (cfg.blockedChannels) {
+    const nowMs = Date.now();
+    const pruned = {};
+    for (const [slug, byName] of Object.entries(cfg.blockedChannels)) {
+      const live = Object.fromEntries(Object.entries(byName || {}).filter(([, until]) => until > nowMs));
+      if (Object.keys(live).length) pruned[slug] = live;
+    }
+    if (JSON.stringify(pruned) !== JSON.stringify(cfg.blockedChannels)) await browser.storage.local.set({ blockedChannels: pruned });
+  }
 
   const list = cfg.watchList || [];
   if (list.length === 0) {
@@ -1733,7 +1744,7 @@ async function handleInventoryCampaigns(signal) {
   for (const c of signal.campaigns || []) if (c && c.id) byId[c.id] = c;
   await browser.storage.local.set({ inventoryCampaigns: { at: Date.now(), byId } });
   if (lastInventoryCards && Date.now() - lastInventoryCards.at < INVENTORY_REJUDGE_MAX_AGE_MS) {
-    await mergeInventoryProgress(lastInventoryCards.cards, lastInventoryCards.claimed);
+    await mergeInventoryProgress(lastInventoryCards.cards, lastInventoryCards.claimed, { replay: true });
   }
   serialized(autoWatchTick).catch(() => {}); // whether a pinned channel's game has open drops may have changed
 }
@@ -1744,13 +1755,15 @@ async function handleInventoryCampaigns(signal) {
 // channel; an entry that owns no card yet simply has no progress - "unknown",
 // never done, and still watched (shared.js: entryOwnsCard). Finished = every
 // owned card complete (aggregateEntryProgress).
-async function mergeInventoryProgress(campaigns, claimedList) {
+async function mergeInventoryProgress(campaigns, claimedList, { replay = false } = {}) {
   // campaigns may legitimately be [] (every watched entry's card is gone from
   // "In Progress") - still need to run so the missing-card reconciliation
   // below gets a chance to fire. Only a genuinely missing/malformed message
   // short-circuits.
   if (!campaigns) return;
-  lastInventoryCards = { at: Date.now(), cards: campaigns, claimed: claimedList };
+  // `replay`: the SAME scan judged again because a newer Inventory GQL arrived - not a new page reading, so
+  // it must not count as another scan with the card missing (REQUIRED_MISSING_SCANS means DOM scans)
+  if (!replay) lastInventoryCards = { at: Date.now(), cards: campaigns, claimed: claimedList };
   const claimedMap = Array.isArray(claimedList) ? new Map(claimedList) : null; // the Claimed section: name -> count
 
   return serialized(async () => {
@@ -1858,7 +1871,7 @@ async function mergeInventoryProgress(campaigns, claimedList) {
         continue;
       }
 
-      const missingScans = (p.missingScans || 0) + 1;
+      const missingScans = (p.missingScans || 0) + (replay ? 0 : 1);
       if (missingScans < REQUIRED_MISSING_SCANS) {
         progress[key] = { ...p, missingScans };
         continue;
@@ -2134,6 +2147,15 @@ const lastPlaybackFlashAt = new Map();
 const PINNED_LIVE_FLASH_MIN_GAP_MS = 2 * 60 * 1000;
 async function flashTabToStartPlayback(tabId, holdMs = PLAYBACK_FLASH_HOLD_MS) {
   lastPlaybackFlashAt.set(tabId, Date.now());
+  // `tabs.update(id, { active: false })` does nothing in Firefox (its implementation has no answer to "which
+  // tab then?" - a tab stops being active only when ANOTHER one is activated), so the flashed tab used to
+  // stay the window's active tab for good. Remember the tab that was active and activate it again.
+  let previous = null;
+  try {
+    const flashed = await browser.tabs.get(tabId);
+    const [active] = await browser.tabs.query({ windowId: flashed.windowId, active: true });
+    if (active && active.id !== tabId) previous = active.id;
+  } catch { /* no way to know: nothing to restore */ }
   try {
     await browser.tabs.update(tabId, { active: true });
   } catch (e) {
@@ -2142,9 +2164,9 @@ async function flashTabToStartPlayback(tabId, holdMs = PLAYBACK_FLASH_HOLD_MS) {
   }
   setTimeout(async () => {
     try {
-      await browser.tabs.update(tabId, { active: false });
+      if (previous != null) await browser.tabs.update(previous, { active: true });
     } catch {
-      // tab already gone/rotated away - nothing to revert
+      // the previous tab is gone - nothing to put back
     }
   }, holdMs);
 }

@@ -89,18 +89,37 @@ function channelFromUrl(urlStr) {
 // the real category slug (see handleChannelPlayingGame) and everything
 // downstream (inventory-progress matching, badges, isGameDone) treats it
 // exactly like an ordinary typed-game entry from that point on.
+// One line of the watch-list text as a pinned channel: { channel } for "@name", for a twitch.tv channel URL
+// (with or without a leading "@", with or without "https://"), { invalid: true } for a line that is meant as one
+// but cannot work ("@@x", "@ a b", "@https://example.com/x", a twitch.tv URL that is not a channel page), and
+// null for an ordinary game line. A login is letters, digits and underscores (1-25).
+const CHANNEL_LOGIN = /^[A-Za-z0-9_]{1,25}$/;
+function pinnedLineOf(line) {
+  const t = String(line || "").trim();
+  const bare = t.replace(/^@/, "");
+  if (/^(?:https?:\/\/)?(?:www\.|m\.)?twitch\.tv\//i.test(bare)) {
+    const ch = channelFromUrl(/^https?:/i.test(bare) ? bare : "https://" + bare);
+    return ch && CHANNEL_LOGIN.test(ch) ? { channel: ch } : { invalid: true };
+  }
+  if (/^@?https?:\/\//i.test(t)) return { invalid: true }; // some other site's URL
+  if (!t.startsWith("@")) return null;
+  const channel = t.slice(1).trim();
+  return CHANNEL_LOGIN.test(channel) ? { channel } : { invalid: true };
+}
+
 function parseWatchList(raw) {
   const lines = (raw || "").split("\n").map((l) => l.trim()).filter(Boolean);
   const seen = new Set();
   const list = [];
   for (const input of lines) {
-    if (input.startsWith("@")) {
-      const channel = input.slice(1).trim();
-      if (!channel) continue;
+    const pinned = pinnedLineOf(input);
+    if (pinned) {
+      if (pinned.invalid) continue; // reported by invalidWatchLines, never turned into a broken URL
+      const channel = pinned.channel;
       const key = "channel:" + channel.toLowerCase();
       if (seen.has(key)) continue;
       seen.add(key);
-      list.push({ input, slug: key, channel, pinnedChannel: true });
+      list.push({ input: "@" + channel, slug: key, channel, pinnedChannel: true });
       continue;
     }
     const slug = toSlug(input);
@@ -135,7 +154,8 @@ function normalizeGameName(s) {
 function invalidWatchLines(raw) {
   const out = [];
   for (const line of (raw || "").split("\n").map((l) => l.trim()).filter(Boolean)) {
-    if (line.startsWith("@")) continue;
+    const pinned = pinnedLineOf(line);
+    if (pinned) { if (pinned.invalid) out.push(line); continue; }
     if (!toSlug(line)) out.push(line);
   }
   return out;

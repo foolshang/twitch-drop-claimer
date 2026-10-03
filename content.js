@@ -274,7 +274,9 @@
   //   refused  -> the reward stops for the session and the popup says to connect
   //               the account, as before.
   // Neither is an integrity problem or touches the failure streak.
-  const CLAIM_REQUEST_MATCH_MS = 10_000;
+  // the page's request follows its click at once; a click that produced none (blocked, nothing to claim) must
+  // not wait long enough to be paired with a LATER click's request
+  const CLAIM_REQUEST_MATCH_MS = 3_000;
 
   function gameIdOfCard(btn) {
     let el = btn;
@@ -331,9 +333,13 @@
 
   // Called on every claim scan of the inventory page: a reward judged refused whose
   // name has since appeared in the Claimed list was claimed after all.
+  let lastRetroCheckAt = 0;
   function checkRetroactiveSuccess() {
     if (refusedPending.size === 0 || !isInventoryPage()) return;
     const now = Date.now();
+    // called on every DOM mutation: reading the Claimed list is not free - at most every 5 s
+    if (now - lastRetroCheckAt < 5_000) return;
+    lastRetroCheckAt = now;
     for (const [key, r] of refusedPending) {
       if (now - r.at > REFUSED_PENDING_TTL_MS) { refusedPending.delete(key); continue; }
       const after = claimedCountOf(r.name);
@@ -355,7 +361,10 @@
       const now = Date.now();
       while (unmatchedClicks.length && now - unmatchedClicks[0].at > CLAIM_REQUEST_MATCH_MS) unmatchedClicks.shift();
       const click = unmatchedClicks.shift();
-      if (click) claimKeyBySeq.set(signal.seq, click.key);
+      if (click) {
+        claimKeyBySeq.set(signal.seq, click.key);
+        while (claimKeyBySeq.size > 50) claimKeyBySeq.delete(claimKeyBySeq.keys().next().value); // never grows
+      }
     } else if (signal.kind === "claimNotLinked") {
       const key = claimKeyBySeq.get(signal.seq);
       if (key && awaitingClaimVerify.has(key)) notLinkedSeen.set(key, { claimed: !!signal.claimed, status: signal.status || null });
@@ -366,6 +375,7 @@
   function verifyClaim(key, text) {
     awaitingClaimVerify.delete(key);
     awaitingClaimBtn.delete(key);
+    for (const [seq, k] of claimKeyBySeq) if (k === key) claimKeyBySeq.delete(seq); // its request number is spent
     const base = claimBaseline.get(key) || { name: null, before: 0, gameId: null };
     claimBaseline.delete(key);
     const linkNote = notLinkedSeen.get(key);
@@ -732,14 +742,17 @@
         return qualityAttempts >= 5;
       }
       const menuRoot = () => document.querySelector('[data-a-target="player-settings-menu"], [role="menu"]') || document;
+      const gen = runGeneration;
       settingsBtn.click();
       setTimeout(() => {
+        if (gen !== runGeneration) { settingsBtn.click(); return; } // stopped meanwhile: close the menu we opened and leave
         const root = menuRoot();
         const qualityItem = root.querySelector('[data-a-target="player-settings-menu-item-quality"]') ||
           [...root.querySelectorAll('button, [role="menuitem"]')].find((el) => /quality|คุณภาพ/i.test(el.textContent || ""));
         if (qualityItem) {
           qualityItem.click();
           setTimeout(() => {
+            if (gen !== runGeneration) { settingsBtn.click(); return; }
             const options = [...menuRoot().querySelectorAll('input[type="radio"], [role="menuitemradio"]')];
             if (options.length > 0) {
               const lowest = options[options.length - 1]; // Twitch lists Auto first, lowest last
@@ -1194,7 +1207,11 @@
   // scan on a channel page sent junk progress), the new page gets its own.
   let activePageKey = null;
   let navIntervalId = null;
-  const pageKey = () => location.pathname + (location.pathname === "/search" ? location.search : "");
+  // bumped by every start() and stop(): a callback that awaited (the 10 s re-check of a channel problem, the
+  // scroll-back, the quality-menu timers) checks it is still the same run before acting - a quick off/on
+  // toggle left the old run's timers alive and able to bounce the channel
+  let runGeneration = 0;
+  const pageKey = () => location.pathname.toLowerCase() + (location.pathname === "/search" ? location.search : ""); // a path rewritten to lower case is not another page
   function checkNavigation() {
     if (!running || pageKey() === activePageKey) return;
     log("page changed:", activePageKey, "->", pageKey(), "- restarting");
@@ -1205,6 +1222,7 @@
   function start() {
     if (running) return; // avoid stacking duplicate timers when toggled ON/OFF rapidly
     running = true;
+    runGeneration++;
     activePageKey = pageKey();
 
     // ---- MutationObserver: catch claim buttons as soon as they appear ------
@@ -1220,8 +1238,9 @@
       inventoryIntervalId = setInterval(() => {
         const y = window.scrollY;
         window.scrollTo(0, document.body.scrollHeight);
+        const gen = runGeneration;
         setTimeout(() => {
-          if (!enabled) return;
+          if (!enabled || gen !== runGeneration) return;
           clickClaims("post-scroll");
           window.scrollTo(0, y);
         }, 1_500);
@@ -1375,8 +1394,10 @@
 
       channelWatchIntervalId = setInterval(async () => {
         if (!enabled || handled) return;
+        const gen = runGeneration;
 
         const wt = await getWatchTabInfo();
+        if (gen !== runGeneration) return; // stopped / restarted while asking
         if (!wt.isWatchTab) return; // not our tab - never touch the user's own viewing
 
         if (!qualityApplied) qualityApplied = applyLowQuality();
@@ -1389,7 +1410,7 @@
         // raid/host: Twitch navigated this tab away from the channel we picked.
         // A pinned channel goes back to itself (that's the one the user
         // explicitly asked for), never into the raid target or a directory.
-        if (initialChannel && currentChannel && currentChannel !== initialChannel) {
+        if (initialChannel && currentChannel && currentChannel.toLowerCase() !== initialChannel.toLowerCase()) {
           handled = true;
           log("redirected away from", initialChannel, "to", currentChannel);
           browser.runtime.sendMessage({ type: "channelRedirected", slug: expectedSlug }).catch(() => {});
@@ -1470,7 +1491,7 @@
         const first = channelProblem(baselineGame, seenLive);
         if (!first) return;
         await new Promise((r) => setTimeout(r, CHANNEL_PROBLEM_RECHECK_MS));
-        if (!enabled || channelProblem(baselineGame, seenLive) !== first) return;
+        if (!enabled || gen !== runGeneration || channelProblem(baselineGame, seenLive) !== first) return;
 
         handled = true;
         log("channel", initialChannel, "no longer usable:", first, "- back to the directory");
@@ -1490,6 +1511,7 @@
   function stop() {
     if (!running) return;
     running = false;
+    runGeneration++;
 
     if (observer) observer.disconnect();
     observer = null;
@@ -1520,6 +1542,7 @@
     refusedPending.clear();
     notLinkedSeen.clear();
     unmatchedClicks.length = 0;
+    claimKeyBySeq.clear();
 
     log("stopped");
   }
