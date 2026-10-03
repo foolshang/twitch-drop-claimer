@@ -3008,3 +3008,27 @@ Signed to the UNLISTED channel on 2026-10-03 (`npm run submit`, no
 (`BUILD_MARKER` `2026-10-03-r2`); the version is in the local, git-ignored
 `.amo-submitted-versions.json`. Not submitted to the listed channel; the listed
 release will be 0.6.24 (manifest + `BUILD_MARKER` bump only).
+
+## After 0.6.23 (not yet signed): the extension's own inventory tab was never reloaded
+
+**Report:** the @Blooprint and @GEEGA rows stayed at 0/1 until the user refreshed the inventory
+page by hand, then showed "1/1 done" at once. So the done logic is right; the inventory data was
+stale.
+
+**Cause (the `tab.active` check):** both inventory reload paths - the 15-minute alarm and the
+refresh after "a drop was claimed" (`handleDropClaimed`) - skipped any inventory tab whose
+`tab.active` was true, meant to leave the user's own foreground inventory page alone. The
+extension's own inventory tab lives in the watch window, where it can be that window's active
+(selected) tab; skipped for being "active", it was never reloaded again.
+
+**Fix:** one function, `reloadInventoryTabs`, used by both paths: only an active tab that is NOT
+in the extension's own (tagged / created) window is skipped - the user's foreground page is still
+left alone, everything else (inactive tabs, the watch window's active inventory tab) is reloaded;
+the log line says when it was the watch window's active tab. New `inventory-reload.test.js` (3
+cases; the first fails on the previous background.js). `BUILD_MARKER` -> `2026-10-03-r3`; the
+manifest version is raised when it is signed.
+
+**Not done in this entry (details not available to me):** the second-layer "isClaimed from the
+Inventory GQL" evidence and the "no slot for a game with no drops" change for DisguisedToast were
+referred to as already agreed, but the earlier discussion is not part of what I have - waiting for
+the specifics.

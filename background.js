@@ -1019,15 +1019,29 @@ async function handleClaimResult(msg) {
   });
 }
 
+// Which open inventory tabs may be reloaded. A tab the user is looking at (the active tab of
+// THEIR window) is left alone. The extension's own inventory tab lives in the watch window,
+// where it can be that window's active tab (the window's selected tab - nobody is looking at
+// it): skipping it for being "active" meant it was never reloaded again, the inventory data
+// (rewards, "done" counts) went stale and rows stayed at 0/1 until the user refreshed the
+// page by hand (real report, 0.6.23). So: skip only an active tab that is NOT in our window.
+async function reloadInventoryTabs(logEach) {
+  const tabs = await browser.tabs.query({ url: "*://www.twitch.tv/drops/inventory*" });
+  const reloaded = [];
+  for (const tab of tabs) {
+    if (tab.active && !(await windowIsOurs(tab.windowId))) continue; // the user is on it
+    browser.tabs.reload(tab.id);
+    reloaded.push(tab.id);
+    if (logEach) log("reloaded inventory tab", tab.id, tab.active ? "(the active tab of the watch window)" : "");
+  }
+  return { found: tabs.length, reloaded };
+}
+
 let dropClaimedDebounce = null;
 async function handleDropClaimed() {
   if (dropClaimedDebounce) return;
   dropClaimedDebounce = setTimeout(() => { dropClaimedDebounce = null; }, 60_000);
-
-  const tabs = await browser.tabs.query({ url: "*://www.twitch.tv/drops/inventory*" });
-  for (const tab of tabs) {
-    if (!tab.active) browser.tabs.reload(tab.id);
-  }
+  await reloadInventoryTabs(false);
 }
 
 // ============================================================================
@@ -2589,17 +2603,8 @@ browser.alarms.onAlarm.addListener(async (alarm) => {
 
   if (alarm.name === RELOAD_ALARM) {
     try {
-      const tabs = await browser.tabs.query({ url: "*://www.twitch.tv/drops/inventory*" });
-      if (tabs.length === 0) {
-        await serialized(openInventoryIfMissing);
-        return;
-      }
-      for (const tab of tabs) {
-        if (!tab.active) {
-          browser.tabs.reload(tab.id);
-          log("reloaded inventory tab", tab.id);
-        }
-      }
+      const { found } = await reloadInventoryTabs(true);
+      if (found === 0) await serialized(openInventoryIfMissing);
     } catch (e) {
       log("reload failed:", e);
     }
