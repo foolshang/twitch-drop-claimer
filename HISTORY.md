@@ -3086,3 +3086,104 @@ Signed to the UNLISTED channel on 2026-10-03 (`npm run submit`, no
 (`BUILD_MARKER` `2026-10-03-r4`); the version is in the local, git-ignored
 `.amo-submitted-versions.json`. Not submitted to the listed channel; the listed
 release will be 0.6.25 (manifest + `BUILD_MARKER` bump only).
+
+## 0.6.25 - the full code review of 0.6.24 (A: severe, B: medium, C: low, D: server/scripts)
+
+Every item was proven first (read the code, then a test that FAILS on the 0.6.24 sources) before it was
+fixed; an item that is not a real bug is marked "not real". One commit per group (A, B, C, D). No live
+tests (README rule). Tests: `review-a.test.js`, `review-b-background.test.js`, `review-b-content.test.js`,
+`review-b-popup.test.js`, `review-c.test.js`, `submit-amo.test.js`, `report-service.test.js` (runs
+`report-service/test_main.py`), shared fixtures in `world-helpers.js`; two existing tests were adjusted
+because they enshrined the old behaviour (C10, the claim-key format of B3).
+
+### A - severe (all real)
+- **A1 fresh install never ran the scheduler.** Startup and the popup read a missing `enabled` as ON, but
+  autoWatchTick, the alarm listener, checkAutoOff, getPinnedGameForTab, isWatchTab and the openInventory
+  grace job used `!cfg.enabled`; the popup's Save never writes it. Now `enabled:true` is written at startup /
+  `runtime.onInstalled` when missing and every check is `enabled === false` = off.
+- **A2 the claim tier was the wrapper of all tiers** when the other tiers had no button (claimed/unfinished):
+  the first tier's name became the reward name (wrong key, baseline, Last claimed; retro-success never matched).
+  `tierOf` is now the biggest ancestor of the button below the card holding exactly ONE progress bar (the
+  old "one claim button" rule only when there is no progress-bar markup).
+- **A3 any button in a drops toast was clickable** (`div[data-test-selector="drops-notification"] button` had
+  no text check): the close "X" was clicked, vanished, and read as a successful claim. Only the two selectors
+  that are claim buttons by definition (`...claim-button`, `drops-claim-button`) skip the claim-text check.
+  Trade-off: a toast in a UI language whose word is not in the list is no longer clicked via that selector.
+- **A4 popup Save started game entries from scratch**, losing the resolved slug/displayName/gameId/campaign (and
+  with the slug gone background pruned its `gameWaitUntil` / `invalidSlugs`). An entry whose input - or display
+  name, which is what the textarea shows - is unchanged keeps everything.
+- **A5 a temporarily blocked slug counted as done**: `isGameDone` returned true while `invalidSlugs[slug]` was in
+  the future and `anyWaiting` ignored it -> finishAllDone + auto-off could switch the extension off for good.
+  `isGameBlocked` is a separate condition: not eligible, counted as waiting.
+
+### B - medium (all real)
+- **B1** teardown now runs through the task queue (a running tick finishes, then its tabs are closed); `createWatchTab`
+  / `openInventoryIfMissing` open nothing while `enabled === false`.
+- **B2** SPA navigation: `start()` records the page; a change of page (lower-cased path; the search term on /search)
+  restarts it (`stop()` + `start()`) so the inventory timers stop on other pages and a channel reached by navigation
+  gets its monitor; a claim verdict whose page changed is dropped (released, no success, no failure).
+- **B3** a button outside a card gets a key per button element (`claim:<label>#e<n>`, WeakMap) - label + position was
+  shared by all toasts and shifted when one disappeared (verdicts flipped). Not persistent across page loads.
+- **B4** `extractTierDurationMin`: hours + minutes added, decimals read, Thai units, scoped to the tier's own element
+  (`tierRootOfBar`), no `.tw-tower` wrapper.
+- **B5** other UI languages: the progress line is skipped by structure (next to the bar) and by a leading `%`, not only
+  by English words; viewer counts (`1,2K` = 1200, a line that is only the count wins over a title's number, Thai
+  `ผู้ชม`, unreadable = left out, nothing readable = no pick instead of the MOST viewed card); `applyLowQuality` returns
+  false while the settings button is missing (retry, give up after 5) and looks inside the player's own settings menu
+  (`data-a-target="player-settings-menu"` / `...-item-quality`, text only as a fallback) - those two selectors are from
+  memory of Twitch's markup, NOT verified here; `\bends?\b` and day-first dates ("26 Aug").
+- **B6** unsaved textarea edits are never overwritten by background's list rewrites (dirty flag); the status rows are
+  rebuilt only when something visible changed and never while a "watch from" calendar is open or a time is being typed
+  (deferred until it closes).
+- **B7** accents are folded (`Pokémon UNITE` = `pokemon-unite`, `normalizeGameName` too); a game line nothing a slug can
+  be built from (only non-Latin letters) is reported in the popup preview (9 languages) instead of dropped silently.
+  Such a game still cannot be watched by that name - the English name has to be typed.
+- **B8** per-tab state goes with the tab: a stale `watchMeta`/`dropSignals` (verify baseline) is removed when the tab is
+  gone or replaced, and a `tabs.onRemoved` listener clears watchTabs/watchMeta/dropSignals/idlePinned and the in-memory
+  per-tab maps.
+- **B9** `flashPinnedTabOnceLive` returns whether it flashed; the live session is recorded as flashed only then.
+- **B10** one queue (`claimQueued`) for every writer of claimHealth / claimNotLinked / claimLinkReminders (and the
+  integrity flag clearing them); the `invalidSlugs` / `gameWaitUntil` pruning of a list change runs through the task queue.
+
+### C - low (all real)
+- **C1** a replay of the last scan for a new Inventory GQL (`replay`) no longer counts as another missing scan.
+- **C2** expired `blockedChannels` are removed at each tick; `campaignProgress` of an entry removed from the list is
+  pruned; the per-tab maps are cleared by the `onRemoved` listener.
+- **C3** channel names compare case-insensitively and the page key is lower-cased (a path rewritten to lower case was
+  taken for a raid).
+- **C4** `pinnedLineOf`: `@name`, a twitch.tv channel URL (with/without `@`, with/without scheme) become pinned
+  channels; `@@x`, `@ a b`, other sites' URLs, non-channel twitch.tv URLs are not turned into broken entries and are
+  listed as invalid in the preview.
+- **C5** (in the popup file) `24:00` means 00:00 of the NEXT day, the end of the chosen day.
+- **C6** a generation counter (`runGeneration`) stops the 10 s problem re-check, the scroll-back and the quality-menu
+  timers of a run that was stopped/restarted meanwhile.
+- **C7** inject.js reads `fetch(Request)` (body from a clone made before the native fetch), `fetch(URL, init)` and XHR
+  responses of type json / blob / arraybuffer (`responseText` throws for them).
+- **C8** the retroactive-success check reads the Claimed list at most every 5 s.
+- **C9** a click and its claim request pair only within 3 s (was 10), `claimKeyBySeq` is capped and cleared per verdict.
+- **C10** `tabs.update(id, { active: false })` does nothing in Firefox (its implementation has no answer to "which tab
+  then"; known behaviour of the API - not run live here): after a flash the flashed tab stayed the window's active tab
+  for good. The tab that was active is activated again. The old test modelled `{active:false}` as working; its fake tabs
+  API now has Firefox's semantics.
+
+### D - relay and scripts (separate from the extension - the relay needs DEPLOYING by hand)
+- **D1 real.** Limits were global (20/hour), counted BEFORE validation, and `X-Client` is public. Now per client (10
+  valid reports/hour; the client is the peer, or the first `X-Forwarded-For` only when the peer is the local proxy), a
+  global backstop of 60, malformed requests counted separately (120/hour), and a multi-part report
+  (`=== bug report <id> - part i/n ===`) counts once (max 20 parts per id).
+- **D2 real, mention escape not real.** `version` / `lang` must be short plain tokens, else `?`; the fence is longer than
+  any backtick run in the log. Mentions inside a fenced block do not notify on GitHub and the fields outside it are
+  validated tokens, so no `@` escaping was added (the log keeps `@channel` names faithfully).
+- **D3 real.** JSON that is not an object (`[]`, `3`, `null`) raised an AttributeError in the handler (no answer): 400.
+- **D4 real.** `Handler.timeout` (10 s per read), a 15 s deadline for the whole body, a cap of 32 concurrent connections
+  (503 beyond it).
+- **D5 real (all three).** `scripts/submit-amo.js`: the version check follows every page and asks for
+  `filter=all_with_unlisted` (only follows links to addons.mozilla.org: the JWT goes with every request); output
+  redaction holds back the last (longest secret - 1) characters across chunks; web-ext runs as `node
+  node_modules/web-ext/bin/web-ext.js` with an argument array - no shell. The script is importable (`main()` only as the
+  entry point). The `deleted` versions are covered by the local ledger, not by the API filter (it needs reviewer rights).
+- **Deploy the relay:** copy `report-service/main.py` to `/opt/report-service/main.py` on the VM and
+  `sudo systemctl restart report-service`; check `curl https://35-188-24-245.sslip.io/` answers
+  `{"ok": true, ...}`. Caddy already sets `X-Forwarded-For`. Nothing else changes (same env file, same port).
+
+`BUILD_MARKER` -> `2026-10-03-r5`, `manifest.json` -> 0.6.25 (the listed release will be 0.6.26).

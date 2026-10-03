@@ -10,7 +10,9 @@ watch-time drops accrue without you having to sit and watch.
 
 **Claiming.** A content script checks twitch.tv every 15 seconds and clicks
 **drop claim buttons only**: Twitch's own selectors for the drop-notification
-button and the chat callout (on any twitch.tv page), and, on the Drops
+button and the chat callout (on any twitch.tv page; apart from the `drops-claim-button`
+itself a button there must also carry the claim text - the toast's close "X" is never
+clicked), and, on the Drops
 inventory page, a claim-labelled button that sits inside a campaign card
 (a card whose title links to `/drops/campaigns?dropID=...` and whose reward
 tier shows its progress). Nothing else is ever clicked: there is no longer a
@@ -37,7 +39,8 @@ queue up. A game's tab closes itself the moment that game is fully claimed,
 its campaign expires, or the game is invalid/removed, without touching the
 other tabs.
 
-A list line starting with `@` (e.g. `@somestreamer`) pins that exact
+A list line starting with `@` (e.g. `@somestreamer`) - or a pasted twitch.tv channel
+URL, with or without the `@` - pins that exact
 channel instead of a game - its tab goes straight to that channel (never
 the directory's auto-pick), waits for it to go live rather than rotating to
 another channel if it's offline, and is never rotated/blocklisted for
