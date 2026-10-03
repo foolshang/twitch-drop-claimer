@@ -3187,3 +3187,11 @@ because they enshrined the old behaviour (C10, the claim-key format of B3).
   `{"ok": true, ...}`. Caddy already sets `X-Forwarded-For`. Nothing else changes (same env file, same port).
 
 `BUILD_MARKER` -> `2026-10-03-r5`, `manifest.json` -> 0.6.25 (the listed release will be 0.6.26).
+
+Signed to the UNLISTED channel on 2026-10-03 (`npm run submit`, no
+`--listed`) for testing in the user's real Firefox:
+`web-ext-artifacts/33d37586a96d443fa884-0.6.25.xpi`, built from `ddfe52e`
+(`BUILD_MARKER` `2026-10-03-r5`); the version is in the local, git-ignored
+`.amo-submitted-versions.json`. Not submitted to the listed channel; the listed
+release will be 0.6.26 (manifest + `BUILD_MARKER` bump only). The relay
+(`report-service/main.py`) is NOT part of the .xpi and still has to be deployed by hand.
