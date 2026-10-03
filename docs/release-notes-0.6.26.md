@@ -26,7 +26,7 @@ NEW
 - A pinned channel that goes live while its tab still shows the offline page (Twitch shows a "Live Now" card there instead of the player) is now caught: the tab is reloaded into the player and started.
 - A pinned channel that matches no campaign and plays a game without drops no longer holds a slot, and a pinned channel playing a different game than its campaign shows "playing another game - not earning drops". A row shows the game a channel is playing only while it really is playing it ("last seen: ..." otherwise).
 - The popup says when Twitch accepted a claim but your game account is not linked yet (the reward is yours on Twitch; link the account to get it in-game), instead of treating it as a failure. Warnings show "game - reward", never internal ids.
-- The popup tells you when Twitch is rejecting Drops for your session (clear the twitch.tv cookies and log in again), and when a game account is not connected, instead of retrying claims forever.
+- The popup tells you when Twitch is rejecting Drops for your session (clear the twitch.tv cookies and log in again), instead of retrying claims forever.
 - The popup warns about watch-list lines that cannot be used (for example a game name with no Latin letters - type its English name).
 
 FIXED
@@ -37,9 +37,9 @@ FIXED
 - The inventory tab of the extension is reloaded reliably (rows no longer stay stuck until you refresh the page by hand).
 - A single failed "integrity check" answer from Twitch that recovers a second later is ignored; the session is only treated as flagged when it keeps failing.
 - A temporarily blocked game name is no longer counted as "finished" (it could switch the extension off for good).
-- Settings: Save keeps what the extension had worked out for your games; background updates no longer overwrite what you are typing or close the "watch from" calendar; "24:00" means the end of the day; accented names (for example Pokemon) match their campaign.
-- Switching the extension off while it is opening a tab no longer leaves a tab playing; moving between Twitch pages is handled; many smaller fixes for other UI languages (progress lines, viewer counts, the quality menu, dates) and for stale per-tab state.
-- Far fewer automatic page reloads for offline pinned channels (they back off 3, 6, 10, then 15 minutes), and the debug log is much shorter and always includes the window events that explain where a tab was opened.
+- Settings: Save keeps what the extension had worked out for your games; background updates no longer overwrite what you are typing or close the "watch from" calendar; "24:00" means the end of the day; accented names (for example Pokémon) match their campaign.
+- Switching the extension off while it is opening a tab no longer leaves a tab playing, and offline pinned channels are reloaded far less often (3, 6, 10, then every 15 minutes).
+- Many smaller fixes (moving between Twitch pages, other UI languages, stale state, a shorter debug log).
 
 BUG REPORTS
-- The "send bug report" button now also works behind a stricter reporting service (per-client limits; one report always counts once even when sent in parts). It still sends only the debug log text, the version and the UI language.
+- The "send bug report" button sends only the debug log text, the extension version and the UI language - never your Twitch login, session or tokens.
