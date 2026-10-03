@@ -51,10 +51,11 @@ const ARTIFACTS_DIR = path.join(ROOT, "web-ext-artifacts");
 const AMO_METADATA_PATH = path.join(ROOT, "scripts", "amo-metadata.json");
 
 function parseArgs(argv) {
-  const args = { bump: null, listed: false, skipVersionCheck: false, dryRun: false };
+  const args = { bump: null, listed: false, skipVersionCheck: false, dryRun: false, releaseNotes: null };
   for (const a of argv) {
     if (a.startsWith("--bump=")) args.bump = a.split("=")[1];
     else if (a === "--listed") args.listed = true;
+    else if (a.startsWith("--release-notes=")) args.releaseNotes = a.slice("--release-notes=".length);
     else if (a === "--skip-version-check") args.skipVersionCheck = true;
     else if (a === "--dry-run") args.dryRun = true;
     else if (a === "--help" || a === "-h") { printHelp(); process.exit(0); }
@@ -73,6 +74,8 @@ submit-amo.js - bump -> lint -> build -> sign
 
   --bump=patch|minor|major   bump manifest.json version before building (default: no bump)
   --listed                   sign to the public "listed" channel (default: unlisted)
+  --release-notes=FILE       (with --listed) the version's release notes: the text of FILE after its first line
+                             of dashes ("-----") goes into the AMO metadata as the en-US release notes
   --skip-version-check       skip the pre-flight "already submitted?" check (use with care)
   --dry-run                  run bump/lint/build only, never calls web-ext sign
 
@@ -343,6 +346,22 @@ async function assertVersionNotAlreadySubmitted(version, issuer, secret, { ledge
   safeLog(`AMO version-history check passed (${existing.length} versions on record, ${version} not among them).`);
 }
 
+// The listed version's AMO metadata: the fixed part (scripts/amo-metadata.json) plus, when a notes file is
+// given, version.release_notes (en-US) = the file's text after its first line of dashes (the part above it is
+// instructions for the person pasting it).
+function buildListedMetadata(notesPath) {
+  const meta = JSON.parse(fs.readFileSync(AMO_METADATA_PATH, "utf8"));
+  if (!notesPath) return { path: AMO_METADATA_PATH, meta };
+  const raw = fs.readFileSync(path.resolve(notesPath), "utf8").split(String.fromCharCode(13)).join("");
+  const m = raw.match(/^-{5,}\s*$/m);
+  const notes = (m ? raw.slice(m.index + m[0].length) : raw).trim();
+  if (!notes) throw new Error(`The release notes file is empty: ${notesPath}`);
+  meta.version = { ...(meta.version || {}), release_notes: { "en-US": notes } };
+  const out = path.join(os.tmpdir(), "twitch-drop-claimer-amo-metadata.json");
+  fs.writeFileSync(out, JSON.stringify(meta, null, 2));
+  return { path: out, meta };
+}
+
 function recordLedger(version, channel, extra = {}) {
   const ledger = fs.existsSync(LEDGER_PATH) ? JSON.parse(fs.readFileSync(LEDGER_PATH, "utf8")) : [];
   ledger.push({ version, channel, at: new Date().toISOString(), ...extra });
@@ -397,7 +416,7 @@ async function main() {
   // AMO requires a license on a listed add-on's first version - not needed
   // for unlisted, so only attach it when actually signing to listed.
   if (args.listed) {
-    signArgs.push("--amo-metadata", AMO_METADATA_PATH);
+    signArgs.push("--amo-metadata", buildListedMetadata(args.releaseNotes).path);
   }
   const { code, combined } = await runWebExtCaptured(signArgs);
 
@@ -428,4 +447,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { makeStreamRedactor, redactWith, webExtCommand, fetchAllAmoVersions, assertVersionNotAlreadySubmitted, AMO_VERSIONS_FILTER };
+module.exports = { buildListedMetadata, makeStreamRedactor, redactWith, webExtCommand, fetchAllAmoVersions, assertVersionNotAlreadySubmitted, AMO_VERSIONS_FILTER };

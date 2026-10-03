@@ -107,9 +107,21 @@ async function testTheVersionCheckReadsEveryPageAndUnlisted() {
   console.log("  OK  D5: the version check follows every page, includes unlisted versions and keeps the JWT on addons.mozilla.org");
 }
 
+function testReleaseNotesGoIntoTheListedMetadata() {
+  const f = path.join(os.tmpdir(), "notes-test.md");
+  fs.writeFileSync(f, ["Release notes for X - paste into the field.", "", "-".repeat(40), "", "0.6.26", "", "FIXED", "- a thing", ""].join("\n"));
+  const { meta, path: out } = amo.buildListedMetadata(f);
+  assert.strictEqual(meta.version.release_notes["en-US"], "0.6.26\n\nFIXED\n- a thing", "the part above the dashes is not part of the notes");
+  assert.strictEqual(meta.version.license, "MPL-2.0", "the fixed metadata is kept");
+  assert.strictEqual(JSON.parse(fs.readFileSync(out, "utf8")).version.release_notes["en-US"], meta.version.release_notes["en-US"]);
+  assert.strictEqual(amo.buildListedMetadata(null).meta.version.release_notes, undefined, "no notes file = unchanged metadata");
+  console.log("  OK  release notes file -> version.release_notes (en-US) in the AMO metadata");
+}
+
 (async () => {
   console.log("Running submit-amo tests...\n");
   try {
+    testReleaseNotesGoIntoTheListedMetadata();
     testRedactionAcrossChunks();
     testNoShellAndArgumentsStayIntact();
     await testTheVersionCheckReadsEveryPageAndUnlisted();
