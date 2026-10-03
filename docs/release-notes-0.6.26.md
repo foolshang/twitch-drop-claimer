@@ -21,25 +21,15 @@ If you decline: Firefox keeps the previous version of the extension and leaves t
 Full details: https://github.com/foolshang/twitch-drop-claimer#the-sessions-permission
 
 NEW
-- Pinned channels ("@streamer" lines, or just paste a twitch.tv channel link): a channel can sit next to a game entry for the same game (for example "Rust" and "@streamer"), each with its own tab and its own progress. Progress is tracked per campaign.
-- A pinned channel that is offline keeps its tab but no longer takes up a tab slot, so games that can earn drops use the slots meanwhile (at most 5 such tabs). When it goes live it takes a slot - after it has been live for 2 minutes, and without flapping back and forth. The popup says "offline - waiting to go live", "live - waiting for a free tab slot" or "checking the channel...".
-- A pinned channel that goes live while its tab still shows the offline page (Twitch shows a "Live Now" card there instead of the player) is now caught: the tab is reloaded into the player and started.
-- A pinned channel that matches no campaign and plays a game without drops no longer holds a slot, and a pinned channel playing a different game than its campaign shows "playing another game - not earning drops". A row shows the game a channel is playing only while it really is playing it ("last seen: ..." otherwise).
-- The popup says when Twitch accepted a claim but your game account is not linked yet (the reward is yours on Twitch; link the account to get it in-game), instead of treating it as a failure. Warnings show "game - reward", never internal ids.
-- The popup tells you when Twitch is rejecting Drops for your session (clear the twitch.tv cookies and log in again), instead of retrying claims forever.
-- The popup warns about watch-list lines that cannot be used (for example a game name with no Latin letters - type its English name).
+- Pinned channels ("@streamer" lines or a pasted twitch.tv link) can sit next to a game entry for the same game, each with its own tab and progress. Offline ones keep their tab but take no tab slot; one that goes live behind its offline page (Twitch's "Live Now" card) is reloaded into the player.
+- The popup tells you when Twitch accepted a claim but your game account is not linked (link it to get the reward in-game), and when Twitch rejects Drops for your session (clear the twitch.tv cookies and log in again).
 
 FIXED
-- Fresh install: the extension now really starts (a missing "on" setting was read as off in several places).
-- The extension's watch tabs could end up in your own Firefox window, and after an unclean shutdown it could mistake one of YOUR windows for its own. It now only ever uses its own tagged window and leaves yours alone.
-- A fully claimed campaign could show "done" with 4/5; it now reads 5/5 and is marked done only when the Claimed list (or Twitch's own data) confirms it.
-- Auto-claim: each reward has its own claim state, so one reward Twitch refuses no longer holds up the others; the channel-points "Claim Bonus" chest is never clicked (this extension is for drops only); the close button of a drop notification is never clicked; "Last claimed" shows the reward's name.
-- The inventory tab of the extension is reloaded reliably (rows no longer stay stuck until you refresh the page by hand).
-- A single failed "integrity check" answer from Twitch that recovers a second later is ignored; the session is only treated as flagged when it keeps failing.
-- A temporarily blocked game name is no longer counted as "finished" (it could switch the extension off for good).
-- Settings: Save keeps what the extension had worked out for your games; background updates no longer overwrite what you are typing or close the "watch from" calendar; "24:00" means the end of the day; accented names (for example Pokémon) match their campaign.
-- Switching the extension off while it is opening a tab no longer leaves a tab playing, and offline pinned channels are reloaded far less often (3, 6, 10, then every 15 minutes).
-- Many smaller fixes (moving between Twitch pages, other UI languages, stale state, a shorter debug log).
+- A fresh install now really starts; watch tabs no longer end up in your own window.
+- Campaigns show 5/5 when fully claimed, confirmed by Twitch's own data too.
+- Auto-claim: per-reward state; the "Claim Bonus" chest and notification close buttons are never clicked; the inventory tab reloads reliably.
+- Settings keep resolved game info and are not overwritten while you type; accented names (Pokémon) match.
+- Many smaller fixes (fewer reloads of offline channels, page navigation, other UI languages, a shorter debug log).
 
 BUG REPORTS
-- The "send bug report" button sends only the debug log text, the extension version and the UI language - never your Twitch login, session or tokens.
+- The "send bug report" button sends only the debug log, the version and the UI language - never your Twitch login or tokens.

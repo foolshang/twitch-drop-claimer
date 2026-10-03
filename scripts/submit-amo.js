@@ -356,6 +356,7 @@ function buildListedMetadata(notesPath) {
   const m = raw.match(/^-{5,}\s*$/m);
   const notes = (m ? raw.slice(m.index + m[0].length) : raw).trim();
   if (!notes) throw new Error(`The release notes file is empty: ${notesPath}`);
+  if (notes.length > 3000) throw new Error(`AMO release notes are limited to 3000 characters; ${notesPath} has ${notes.length}.`);
   meta.version = { ...(meta.version || {}), release_notes: { "en-US": notes } };
   const out = path.join(os.tmpdir(), "twitch-drop-claimer-amo-metadata.json");
   fs.writeFileSync(out, JSON.stringify(meta, null, 2));
